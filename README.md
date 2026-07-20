@@ -1,9 +1,10 @@
 # Options Toolkit
 
 A small set of options-analytics tools: Black-Scholes pricing with the full
-Greeks, a real-data implied-volatility skew scanner, static no-arbitrage checks,
-and a delta-hedged options **market-making simulator**. Built to explore how
-options markets price risk and where that pricing breaks down.
+Greeks, a real-data implied-volatility skew scanner, an **arbitrage-free SVI/SSVI
+vol surface**, static no-arbitrage checks, and a delta-hedged options
+**market-making simulator**. Built to explore how options markets price risk and
+where that pricing breaks down.
 
 ## Contents
 
@@ -19,7 +20,20 @@ options markets price risk and where that pricing breaks down.
 - **`main.py`** - A no-network smoke driver: prices a call/put, checks put-call
   parity, prints the Greeks, and runs an implied-vol round-trip
   (price -> implied vol -> price). Run `python main.py` from this folder.
-- `Skew_surface_example.png` - sample output of `skew_surface()`.
+- **`vol_surface.py`** - a real **arbitrage-free** IV surface: fits SVI per
+  expiry and a global SSVI (Gatheral-Jacquier), and *proves* no butterfly
+  arbitrage (Durrleman `g(k) >= 0`, i.e. non-negative density) and no calendar
+  arbitrage (total variance rising with maturity). Demonstrates that a naive
+  spline through noisy quotes admits butterfly arbitrage that SSVI removes.
+  Builds surfaces from prices via its own Brent IV inverter, not yfinance's IV
+  field. See `pricing_and_vol_surface/VOL_SURFACE.md` for the write-up and
+  figures. `Skew_surface_example.png` shows the older single-snapshot
+  `skew_surface()` plot, kept for contrast.
+
+```bash
+python pricing_and_vol_surface/vol_surface.py    # fit, prove arb-free, write figures/
+python -m pytest tests/test_vol_surface.py -q
+```
 
 ### `skew_bubble_indicator/`
 `IV_skew.py` scans a large set of US names across market segments, fetches option
@@ -70,9 +84,10 @@ pip install -r requirements.txt
 ```
 
 ## Known limitations
-- **The vol surface is not arbitrage-free.** `skew_surface()` is a single-snapshot
-  `griddata` interpolation of market IVs, not a fitted (SVI/SABR),
-  calendar/butterfly-arbitrage-free surface.
+- **`skew_surface()` (in `black.py`) is not arbitrage-free** - it is a
+  single-snapshot `griddata` interpolation of market IVs. Use `vol_surface.py`
+  for the fitted, butterfly/calendar-arbitrage-free SVI/SSVI surface;
+  `skew_surface()` is kept only as the naive-interpolation contrast.
 - **`IV_skew.py` uses yfinance's own `impliedVolatility`** field rather than this
   repo's Newton-Raphson solver, and its skew thresholds are unvalidated
   heuristics. A delta-target config exists but is not yet wired in.
@@ -82,9 +97,8 @@ pip install -r requirements.txt
   teaching/diagnostic tool, not a live signal.
 
 ## Planned
-- A fitted **arbitrage-free vol surface** (SVI/SABR) using this repo's own IV
-  solver (Phase 3).
 - Adverse-selection / toxic-flow modelling in the market-making simulator.
+- Liquidity/vega-weighted calibration of the vol surface to bid-ask, not mids.
 
 ## Note
 Research and learning code - not investment advice. Data is pulled live from

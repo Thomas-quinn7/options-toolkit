@@ -1,0 +1,113 @@
+"""Tests for the arbitrage-free vol surface (SVI / SSVI).
+
+The load-bearing tests are the no-arbitrage ones: the fitted SSVI surface has a
+non-negative implied density everywhere (Durrleman g >= 0) and total variance
+non-decreasing in maturity, and the check correctly flags a surface that
+violates them.
+
+Run:  python -m pytest tests/test_vol_surface.py -q
+"""
+
+import os
+import sys
+
+import numpy as np
+import pytest
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "pricing_and_vol_surface"))
+
+import vol_surface as V  # noqa: E402
+
+
+# --------------------------------------------------------------------------- #
+# SVI geometry                                                                #
+# --------------------------------------------------------------------------- #
+def test_svi_derivatives_match_finite_difference():
+    p = V.SVIParams(a=0.02, b=0.1, rho=-0.4, m=0.0, sigma=0.1)
+    k = np.linspace(-0.5, 0.5, 50)
+    w, wp, wpp = V.svi_derivatives(k, p)
+    h = 1e-5
+    fd1 = (V.svi_w(k + h, p) - V.svi_w(k - h, p)) / (2 * h)
+    fd2 = (V.svi_w(k + h, p) - 2 * V.svi_w(k, p) + V.svi_w(k - h, p)) / h**2
+    assert np.allclose(wp, fd1, atol=1e-4)
+    assert np.allclose(wpp, fd2, atol=1e-3)
+
+
+def test_svi_recovers_known_slice():
+    p = V.SVIParams(a=0.02, b=0.15, rho=-0.3, m=0.05, sigma=0.12)
+    k = np.linspace(-0.5, 0.4, 25)
+    w = V.svi_w(k, p)
+    fit = V.fit_svi_slice(k, w)
+    assert np.sqrt(np.mean((V.svi_w(k, fit) - w) ** 2)) < 1e-4
+
+
+# --------------------------------------------------------------------------- #
+# SSVI recovery and arbitrage-freeness - the core guarantees                  #
+# --------------------------------------------------------------------------- #
+def test_ssvi_recovers_and_is_arbitrage_free():
+    mats, ks, ivs, true, thetas = V.synthetic_surface(seed=1, noise=0.002)
+    ws = [iv**2 * T for iv, T in zip(ivs, mats)]
+    theta_fit = np.array([float(np.interp(0.0, k, w)) for k, w in zip(ks, ws)])
+    p = V.fit_ssvi(ks, ws, theta_fit)
+
+    # parameter recovery
+    assert abs(p.rho - true.rho) < 0.1
+    assert abs(p.gamma - true.gamma) < 0.15
+
+    # no butterfly arbitrage: density >= 0 everywhere
+    k_grid = np.linspace(-0.8, 0.6, 400)
+    assert V.min_butterfly_g_ssvi(theta_fit, p, k_grid) >= 0.0
+    # no calendar arbitrage: total variance non-decreasing in maturity
+    assert V.calendar_min_gap(theta_fit, p, k_grid) >= 0.0
+
+
+def test_butterfly_check_flags_bad_surface():
+    """An extreme SSVI must be caught by both the parametric and density checks."""
+    bad = V.SSVIParams(rho=-0.9, eta=5.0, gamma=0.4)
+    thetas = np.array([0.02, 0.04, 0.08])
+    k_grid = np.linspace(-0.8, 0.6, 400)
+    ok, slack = V.ssvi_butterfly_conditions(thetas, bad)
+    assert not ok and slack < 0
+    assert V.min_butterfly_g_ssvi(thetas, bad, k_grid) < 0.0
+
+
+def test_calendar_check_flags_decreasing_variance():
+    p = V.SSVIParams(rho=-0.3, eta=1.0, gamma=0.4)
+    thetas = np.array([0.08, 0.04, 0.02])  # DEcreasing -> calendar arbitrage
+    k_grid = np.linspace(-0.5, 0.5, 200)
+    assert V.calendar_min_gap(thetas, p, k_grid) < 0.0
+
+
+def test_naive_interpolation_admits_arbitrage():
+    """The demonstration is real: a cubic spline through noisy quotes has g<0."""
+    from scipy.interpolate import CubicSpline
+
+    mats, ks, ivs, true, thetas = V.synthetic_surface(seed=0)
+    mid = len(mats) // 2
+    k, iv, T = ks[mid], ivs[mid], mats[mid]
+    w = iv**2 * T
+    o = np.argsort(k)
+    sp = CubicSpline(k[o], w[o])
+    kk = np.linspace(k.min(), k.max(), 400)
+    g = V.durrleman_g_from_w(kk, sp(kk), sp(kk, 1), sp(kk, 2))
+    assert g.min() < 0.0  # butterfly arbitrage the SSVI surface would remove
+
+
+# --------------------------------------------------------------------------- #
+# IV inversion                                                                #
+# --------------------------------------------------------------------------- #
+def test_iv_from_price_roundtrip():
+    S, K, T, r, sigma = 100.0, 105.0, 0.5, 0.02, 0.25
+    price = V.bs_call(S, K, T, r, sigma)
+    assert abs(V.iv_from_price(price, S, K, T, r) - sigma) < 1e-4
+    # put side via parity
+    put = price - S + K * np.exp(-r * T)
+    assert abs(V.iv_from_price(put, S, K, T, r, otype="put") - sigma) < 1e-4
+
+
+def test_cross_check_black_py():
+    pytest.importorskip("jax")
+    import black  # noqa: E402
+
+    for S, K, T, r, sigma in [(100, 100, 0.5, 0.02, 0.2), (95, 110, 0.25, 0.0, 0.35)]:
+        assert np.isclose(V.bs_call(S, K, T, r, sigma), float(black.black_scholes(S, K, T, r, sigma)), atol=1e-6)

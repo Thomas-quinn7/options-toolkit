@@ -70,6 +70,29 @@ into the red arbitrage region repeatedly. `tests/test_vol_surface.py` asserts
 both facts — SSVI is arbitrage-free, the naive spline is not — so neither claim
 can rot.
 
+## Vega / liquidity-weighted calibration
+
+Real quotes are not equally trustworthy: ATM options are liquid and tightly
+quoted, deep wings are illiquid, wide, and noisy. Unweighted least squares treats
+them alike, so a few noisy wing quotes can drag the whole fit around.
+`fit_svi_slice` / `fit_ssvi` accept `weights`, and `vega_spread_weights()` builds
+them as **vega / bid-ask-spread** — an ATM quote is weighted up (high vega, tight
+market), a deep-wing quote down (low vega, wide market).
+
+On a slice with noisy, wide-spread wings and tight ATM quotes:
+
+```
+ATM total-variance error : unweighted=1.39e-03  weighted=8.61e-04
+liquid-region |k|<=0.2   : unweighted=1.02e-03  weighted=9.63e-04
+```
+
+![weighted calibration](figures/weighted_calibration.png)
+
+Weighting nails the liquid, high-vega region — **where you actually price and
+hedge** — by deliberately not chasing the wings. It is an honest trade: the
+equal-weighted wing fit gets worse; the numbers that matter get better.
+`tests/test_vol_surface.py` asserts the ATM improvement over repeated draws.
+
 ## Talking points
 
 * Total-variance space is the right coordinate system: no-arbitrage is a
@@ -86,5 +109,5 @@ can rot.
   exactly. Per-slice SVI is more flexible but must be checked (and, if needed,
   constrained) slice by slice — both are provided.
 * No smoothing of the ATM term structure `theta(T)`; it is read from the quotes.
-* Calibration is unweighted least squares; a real desk would weight by quote
-  liquidity / vega and fit to bid-ask, not mids.
+* Calibration supports vega/liquidity weighting (above); a further step is to
+  fit to the full bid-ask band rather than a weighted mid.

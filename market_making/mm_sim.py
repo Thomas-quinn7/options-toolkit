@@ -33,7 +33,7 @@ Design notes
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 import numpy as np
 from scipy.stats import norm
@@ -121,6 +121,10 @@ class MMParams:
     flow_imbalance: float = 0.0     # >0 => clients net buyers (lift our ask)
     max_inventory: int = 25         # hard cap on |inventory|
 
+    # adverse selection
+    toxicity: float = 0.0           # fraction of flow that is informed (0..1)
+    hedge_lag: int = 0              # 0 = hedge before the move; 1 = hedge after it
+
     # hedging
     tc_underlying: float = 0.0      # per-share hedge cost as fraction of notional
 
@@ -179,6 +183,10 @@ def simulate_paths(
         tau = p.T - t * dt
         theo = bs_price(S, p.K, tau, p.r, p.sigma_impl, p.q, p.otype)
 
+        # Draw this step's underlying shock up front so informed ("toxic") flow
+        # can arrive on the side the imminent move will favour.
+        z = rng.standard_normal(n_sims)
+
         if quoting:
             reservation = theo - p.skew_coef * q_inv
             bid = reservation - p.half_spread
@@ -191,36 +199,53 @@ def simulate_paths(
             prob_bid = np.clip(1.0 - np.exp(-lam_bid * dt), 0.0, 1.0)
             prob_ask = np.clip(1.0 - np.exp(-lam_ask * dt), 0.0, 1.0)
 
-            fill_bid = rng.random(n_sims) < prob_bid   # we BUY 1 @ bid
-            fill_ask = rng.random(n_sims) < prob_ask   # we SELL 1 @ ask
-            # respect the inventory cap
+            tox = p.toxicity
+            # Uninformed flow: direction independent of the coming move.
+            u_bid = rng.random(n_sims) < (1.0 - tox) * prob_bid
+            u_ask = rng.random(n_sims) < (1.0 - tox) * prob_ask
+            # Informed flow: buys (lifts our ask) when the underlying is about to
+            # rise, sells (hits our bid) when it is about to fall.
+            up = z > 0.0
+            i_ask = up & (rng.random(n_sims) < tox * prob_ask)
+            i_bid = (~up) & (rng.random(n_sims) < tox * prob_bid)
+
+            fill_bid = u_bid | i_bid    # we BUY 1 @ bid
+            fill_ask = u_ask | i_ask    # we SELL 1 @ ask
             fill_bid &= q_inv < p.max_inventory
             fill_ask &= q_inv > -p.max_inventory
 
-            # buy on bid
             q_inv += fill_bid
             cash -= fill_bid * bid * m
             spread_capture += fill_bid * (theo - bid) * m
-            # sell on ask
             q_inv -= fill_ask
             cash += fill_ask * ask * m
             spread_capture += fill_ask * (ask - theo) * m
             fills += fill_bid + fill_ask
 
-        # delta-hedge at the implied-vol delta (every step)
-        delta_opt = bs_delta(S, p.K, tau, p.r, p.sigma_impl, p.q, p.otype)
-        H_target = -q_inv * delta_opt * m
-        dH = H_target - H
-        cash -= dH * S + p.tc_underlying * np.abs(dH) * S
-        H = H_target
+        # Hedge BEFORE the move (delta-neutral into it) unless a hedge lag is set,
+        # in which case newly-acquired inventory rides the move unhedged - the
+        # channel through which informed flow actually costs a hedged desk.
+        if p.hedge_lag == 0:
+            delta_opt = bs_delta(S, p.K, tau, p.r, p.sigma_impl, p.q, p.otype)
+            H_target = -q_inv * delta_opt * m
+            dH = H_target - H
+            cash -= dH * S + p.tc_underlying * np.abs(dH) * S
+            H = H_target
 
         # analytic gamma P&L accrued over [t, t+dt] on the carried inventory
         gamma_opt = bs_gamma(S, p.K, tau, p.r, p.sigma_impl, p.q)
         vol_theory += 0.5 * q_inv * gamma_opt * S**2 * (sigma_real**2 - p.sigma_impl**2) * dt * m
 
-        # evolve the underlying with the REALISED vol
-        z = rng.standard_normal(n_sims)
+        # evolve the underlying with the REALISED vol using the pre-drawn shock
         S = S * np.exp((p.r - p.q - 0.5 * sigma_real**2) * dt + sigma_real * sqrt_dt * z)
+
+        # Hedge AFTER the move if a lag is configured (adverse-selection channel).
+        if p.hedge_lag == 1:
+            delta_opt = bs_delta(S, p.K, tau, p.r, p.sigma_impl, p.q, p.otype)
+            H_target = -q_inv * delta_opt * m
+            dH = H_target - H
+            cash -= dH * S + p.tc_underlying * np.abs(dH) * S
+            H = H_target
 
         inv_track[t + 1] = q_inv.mean()
         S_track[t + 1] = S[0]
@@ -309,6 +334,50 @@ def experiment_mm_vol_sweep(params: MMParams, sigma_reals, n_sims, seed=1):
 
 
 # --------------------------------------------------------------------------- #
+# Experiment C - adverse selection (toxic flow) and the hedge-latency channel  #
+# --------------------------------------------------------------------------- #
+def experiment_adverse_selection(base: MMParams, toxicities, n_sims, seed=2):
+    """Sweep flow toxicity at realised == implied vol, symmetric base flow.
+
+    Runs each toxicity twice: hedging BEFORE the move (lag 0, ~instantaneous)
+    and AFTER it (lag 1, a realistic hedge latency). Delta-hedging neutralises
+    the *direction* of informed flow, so at lag 0 toxicity mostly just costs
+    round-trips (less spread capture); the adverse-selection loss proper shows
+    up in the lag-1 residual (total minus spread), i.e. the inventory that rode
+    the informed move unhedged.
+    """
+    rows = []
+    for tox in toxicities:
+        r0 = simulate_paths(replace(base, toxicity=tox, hedge_lag=0),
+                            base.sigma_impl, n_sims, np.random.default_rng(seed), quoting=True)
+        r1 = simulate_paths(replace(base, toxicity=tox, hedge_lag=1),
+                            base.sigma_impl, n_sims, np.random.default_rng(seed), quoting=True)
+        rows.append({
+            "toxicity": tox,
+            "avg_fills": float(r1["fills"].mean()),
+            "lag0_total": _summ(r0["total_pnl"])[0],
+            "lag0_resid": _summ(r0["vol_hedge_pnl"])[0],
+            "lag1_total": _summ(r1["total_pnl"])[0],
+            "lag1_spread": _summ(r1["spread_capture"])[0],
+            "lag1_resid": _summ(r1["vol_hedge_pnl"])[0],   # ~ adverse-selection cost
+        })
+    return rows
+
+
+def experiment_toxic_spread(base: MMParams, toxicities, half_spreads, n_sims, seed=3):
+    """At a realistic hedge lag, does a wider quoted spread survive toxic flow?"""
+    grid = {}
+    for hs in half_spreads:
+        totals = []
+        for tox in toxicities:
+            r = simulate_paths(replace(base, toxicity=tox, hedge_lag=1, half_spread=hs),
+                               base.sigma_impl, n_sims, np.random.default_rng(seed), quoting=True)
+            totals.append(_summ(r["total_pnl"])[0])
+        grid[hs] = totals
+    return grid
+
+
+# --------------------------------------------------------------------------- #
 # Plotting (guarded - matplotlib optional) and CLI                            #
 # --------------------------------------------------------------------------- #
 def _try_matplotlib():
@@ -386,6 +455,37 @@ def _plot_sweep(sweep, params, plt, outdir):
     plt.close(fig)
 
 
+def _plot_adverse_selection(adv_rows, spread_grid, params, plt, outdir):
+    tox = [r["toxicity"] for r in adv_rows]
+    lag0 = np.array([r["lag0_total"] for r in adv_rows])
+    lag1 = np.array([r["lag1_total"] for r in adv_rows])
+
+    fig, (axA, axB) = plt.subplots(1, 2, figsize=(13, 5))
+
+    # Panel A: instantaneous vs lagged hedging; the gap is adverse selection
+    axA.plot(tox, lag0, "-o", color="C2", label="hedge before move (instant)")
+    axA.plot(tox, lag1, "-o", color="C3", label="hedge after move (latency)")
+    axA.fill_between(tox, lag0, lag1, color="C3", alpha=0.15, label="adverse-selection cost")
+    axA.axhline(0, color="k", lw=0.6)
+    axA.set_xlabel("flow toxicity (informed fraction)")
+    axA.set_ylabel("mean total P&L per option")
+    axA.set_title("Toxic flow: cost is realised through hedge latency")
+    axA.legend(fontsize=8)
+
+    # Panel B: a wider spread buys tolerance to toxicity
+    for hs, totals in spread_grid.items():
+        axB.plot(tox, totals, "-o", ms=4, label=f"half-spread = {hs:.2f}")
+    axB.axhline(0, color="k", lw=0.6)
+    axB.set_xlabel("flow toxicity (informed fraction)")
+    axB.set_ylabel("mean total P&L per option (hedge latency)")
+    axB.set_title("Widening the quote buys tolerance to toxic flow")
+    axB.legend(fontsize=8)
+
+    fig.tight_layout()
+    fig.savefig(f"{outdir}/adverse_selection.png", dpi=130)
+    plt.close(fig)
+
+
 def _print_table(title, rows, cols, fmts):
     print(f"\n{title}")
     print("  " + "".join(f"{c:>16}" for c in cols))
@@ -421,14 +521,30 @@ def main():
          "spread_mean": lambda x: f"{x:+.3f}", "vol_mean": lambda x: f"{x:+.3f}",
          "avg_fills": lambda x: f"{x:.1f}", "avg_final_inv": lambda x: f"{x:+.2f}"})
 
+    # Experiment C - adverse selection / toxic flow
+    adv_base = MMParams(flow_imbalance=0.0)  # symmetric flow, realised == implied
+    tox_grid = [0.0, 0.15, 0.30, 0.45, 0.60, 0.75]
+    adv_rows = experiment_adverse_selection(adv_base, tox_grid, n_sims, seed=2)
+    _print_table(
+        "Experiment C - adverse selection (realised = implied vol, symmetric flow)",
+        adv_rows, ["toxicity", "avg_fills", "lag1_spread", "lag1_resid", "lag0_total", "lag1_total"],
+        {"toxicity": lambda x: f"{x:.2f}", "avg_fills": lambda x: f"{x:.1f}",
+         "lag1_spread": lambda x: f"{x:+.3f}", "lag1_resid": lambda x: f"{x:+.3f}",
+         "lag0_total": lambda x: f"{x:+.3f}", "lag1_total": lambda x: f"{x:+.3f}"})
+    print("  lag1_resid ~ the adverse-selection cost: ~0 with no toxicity, strongly")
+    print("  negative as informed flow rises. lag0 (instant hedge) avoids it.")
+    spread_grid = experiment_toxic_spread(adv_base, tox_grid, [0.10, 0.15, 0.25], n_sims, seed=3)
+
     plt = _try_matplotlib()
     if plt is None:
         print("\n[matplotlib not available - skipped figures; numeric tables above are the result]")
     else:
         _plot_validation(val, params, plt, outdir)
         _plot_sweep(sweep, params, plt, outdir)
+        _plot_adverse_selection(adv_rows, spread_grid, params, plt, outdir)
         print(f"\nFigures written to {outdir}/:")
-        print("  hedging_validation.png, mm_pnl_vs_vol.png, sample_inventory_path.png")
+        print("  hedging_validation.png, mm_pnl_vs_vol.png, sample_inventory_path.png,")
+        print("  adverse_selection.png")
 
 
 if __name__ == "__main__":

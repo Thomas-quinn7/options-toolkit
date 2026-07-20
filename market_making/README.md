@@ -90,6 +90,31 @@ spread has to be wide enough to pay for the vol risk of the inventory the flow
 forces onto the book.** A representative inventory path (net short, mean-reverted
 by the skew) is in `figures/sample_inventory_path.png`.
 
+## Adverse selection / toxic flow (Experiment C)
+
+Real flow is not uninformed. A `toxicity` parameter makes a fraction of orders
+**informed** - they lift the desk's offer just before the underlying rises and
+hit its bid just before it falls. Sweeping toxicity at realised = implied vol:
+
+![adverse selection](figures/adverse_selection.png)
+
+The result is subtle and correct. **Delta-hedging neutralises the *direction* of
+informed flow**, so if the desk could hedge instantaneously (green, hedge before
+the move) toxic flow costs it little beyond fewer round-trips. The
+adverse-selection loss proper appears only with a **hedge latency** (red, hedge
+after the move): the inventory an informed trade leaves behind rides the move
+unhedged, and that cost grows straight through zero as toxicity rises. The gap
+between the two lines is the adverse-selection cost, and it is exactly the
+lag-1 residual in the table `mm_sim.py` prints (~0 with no toxicity, strongly
+negative with it).
+
+The desk's defence is the second panel: **a wider quoted spread buys tolerance to
+toxic flow.** Too tight and toxic flow turns the book negative; too wide and the
+desk leaves money on the table in benign flow - the lines cross, so the optimal
+spread depends on how toxic the flow is. That is why market-makers widen in fast,
+informed markets. `tests/test_mm.py` asserts both facts: the cost needs a hedge
+lag, and a wider spread survives more toxicity.
+
 ## Talking points
 
 * Delta-hedging removes direction and leaves a gamma / vega bet on realised vs
@@ -98,14 +123,18 @@ by the skew) is in `figures/sample_inventory_path.png`.
   quotes to mean-revert the book toward flat.
 * Spread width is a risk decision, not a preference — it is the premium charged
   for warehousing gamma against one-sided flow.
+* For a delta-hedged desk, directional adverse selection is a *hedge-latency*
+  cost: hedge instantly and it nearly vanishes, hedge with a lag and informed
+  flow picks you off in the unhedged window.
 
 ## Limitations and next steps
 
 * One option, constant implied vol, Gaussian GBM — no vol surface, no jumps, no
   stochastic vol, so no vanna/volga or skew dynamics.
-* Order flow is exogenous and uninformed; a real book faces adverse selection
-  (informed flow that predicts the next move). Adding a signal-driven toxic-flow
-  component is the most valuable extension.
+* Toxic flow here is *directional* (informed about the next move), whose cost to
+  a delta-hedged desk runs through hedge latency (Experiment C). A further
+  extension is *vol*-informed flow - traders who buy options precisely when
+  realised vol will exceed implied - which bites the gamma book directly.
 * Hedging is calendar-based; a band / cost-aware hedging policy would trade off
   hedge error against transaction cost.
 * Pricing is a vectorised closed-form BS for Monte-Carlo speed; the repo's

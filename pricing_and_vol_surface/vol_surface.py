@@ -81,19 +81,22 @@ def durrleman_g_from_w(k_grid, w, wp, wpp):
     return (1.0 - k_grid * wp / (2.0 * w)) ** 2 - (wp**2) / 4.0 * (1.0 / w + 0.25) + wpp / 2.0
 
 
-def fit_svi_slice(k, w_market, butterfly_penalty: float = 0.0) -> SVIParams:
+def fit_svi_slice(k, w_market, weights=None, butterfly_penalty: float = 0.0) -> SVIParams:
     """Least-squares fit of a raw-SVI slice to (k, w_market) points.
 
-    If butterfly_penalty > 0, negative Durrleman g is penalised so the fit is
+    ``weights`` (per point) scale the residuals - pass vega/bid-ask weights to
+    let liquid, reliable quotes dominate noisy illiquid wings. If
+    butterfly_penalty > 0, negative Durrleman g is penalised so the fit is
     pushed into the no-arbitrage region.
     """
     k = np.asarray(k, dtype=float)
     w_market = np.asarray(w_market, dtype=float)
+    weights = np.ones_like(k) if weights is None else np.asarray(weights, dtype=float)
     k_grid = np.linspace(k.min() - 0.1, k.max() + 0.1, 120)
 
     def resid(theta):
         p = SVIParams(*theta)
-        r = svi_w(k, p) - w_market
+        r = weights * (svi_w(k, p) - w_market)
         if butterfly_penalty > 0:
             g = _min_durrleman_g_svi(p, k_grid)
             if g < 0:
@@ -160,20 +163,24 @@ def ssvi_butterfly_conditions(theta_grid, p: SSVIParams) -> Tuple[bool, float]:
 
 
 def fit_ssvi(ks: Sequence[np.ndarray], ws: Sequence[np.ndarray], thetas: Sequence[float],
+             weights: Optional[Sequence[np.ndarray]] = None,
              butterfly_penalty: float = 50.0) -> SSVIParams:
     """Fit global SSVI (rho, eta, gamma) to per-maturity (k, w) data.
 
     thetas are the ATM total variances per maturity (theta_T = w(0, T)).
+    ``weights`` is an optional list of per-slice weight arrays (e.g. vega/bid-ask).
     Negative-density (butterfly) violations are penalised.
     """
     thetas = np.asarray(thetas, dtype=float)
     theta_dense = np.linspace(thetas.min(), thetas.max(), 40)
+    if weights is None:
+        weights = [np.ones_like(k) for k in ks]
 
     def resid(x):
         p = SSVIParams(rho=x[0], eta=x[1], gamma=x[2])
         parts = []
-        for k, w, th in zip(ks, ws, thetas):
-            parts.append(ssvi_w(k, th, p) - w)
+        for k, w, th, wt in zip(ks, ws, thetas, weights):
+            parts.append(wt * (ssvi_w(k, th, p) - w))
         r = np.concatenate(parts)
         ok, slack = ssvi_butterfly_conditions(theta_dense, p)
         if slack < 0:
@@ -231,6 +238,27 @@ def bs_call(S, K, T, r, sigma, q=0.0):
     return S * np.exp(-q * T) * norm.cdf(d1) - K * np.exp(-r * T) * norm.cdf(d2)
 
 
+def bs_vega(S, K, T, r, sigma, q=0.0):
+    """Black-Scholes vega (per unit vol). Largest at the money."""
+    S = np.asarray(S, dtype=float)
+    d1 = (np.log(S / K) + (r - q + 0.5 * sigma**2) * T) / (sigma * np.sqrt(T))
+    return S * np.exp(-q * T) * norm.pdf(d1) * np.sqrt(T)
+
+
+def vega_spread_weights(k, iv, T, spread_iv, S=100.0, r=0.0, q=0.0):
+    """Calibration weights = vega / bid-ask-spread, normalised to mean 1.
+
+    Reliable quotes get more weight two ways: vega (an ATM quote carries far more
+    information about the smile than a deep-wing one) and 1/spread (a tight
+    market is a more trustworthy price than a wide, illiquid one).
+    """
+    k = np.asarray(k, dtype=float)
+    K = S * np.exp(k)
+    vega = bs_vega(S, K, T, r, np.asarray(iv, dtype=float), q)
+    w = vega / np.maximum(np.asarray(spread_iv, dtype=float), 1e-6)
+    return w / w.mean()
+
+
 def iv_from_price(price, S, K, T, r, q=0.0, otype="call"):
     """Brent-invert a European price to Black-Scholes implied vol.
 
@@ -274,6 +302,49 @@ def synthetic_surface(seed=0, noise=0.006, n_strikes=25):
         ks.append(k)
         ivs.append(iv)
     return maturities, ks, ivs, true, thetas
+
+
+def heteroskedastic_slice(seed=0, T=0.5, n=25, atm_vol=0.20):
+    """One smile with realistic quote quality: tight, reliable near the money;
+    noisy and wide (illiquid) in the wings. Returns the truth plus the quotes.
+    """
+    rng = np.random.default_rng(seed)
+    true = SSVIParams(rho=-0.4, eta=1.0, gamma=0.4)
+    theta = atm_vol**2 * T
+    k = np.linspace(-0.6, 0.4, n)
+    w_true = ssvi_w(k, theta, true)
+    iv_true = np.sqrt(w_true / T)
+    sd = 0.003 + 0.05 * np.abs(k)     # per-quote IV error grows into the wings
+    iv_obs = iv_true + rng.normal(0.0, sd)
+    spread_iv = 2.0 * sd              # bid-ask (in vol) wider in the wings
+    return {"k": k, "T": T, "theta": theta, "w_true": w_true, "iv_true": iv_true,
+            "iv_obs": iv_obs, "spread_iv": spread_iv}
+
+
+def fit_weighted_vs_unweighted(slice_data):
+    """Fit an SVI slice to noisy quotes with and without vega/spread weights.
+
+    Weighting sacrifices the noisy wings to nail the liquid, high-vega region -
+    which is where you actually price and hedge - so it wins on ATM and
+    liquid-region accuracy while (by design) giving up equal-weighted wing fit.
+    """
+    s = slice_data
+    w_obs = s["iv_obs"] ** 2 * s["T"]
+    wts = vega_spread_weights(s["k"], s["iv_obs"], s["T"], s["spread_iv"])
+    p_unw = fit_svi_slice(s["k"], w_obs)
+    p_wt = fit_svi_slice(s["k"], w_obs, weights=wts)
+
+    def rms(x):
+        return float(np.sqrt(np.mean(x**2)))
+
+    liq = np.abs(s["k"]) <= 0.2
+    return {
+        "p_unw": p_unw, "p_wt": p_wt, "weights": wts,
+        "atm_err_unw": abs(float(svi_w(0.0, p_unw)) - s["theta"]),
+        "atm_err_wt": abs(float(svi_w(0.0, p_wt)) - s["theta"]),
+        "liq_rms_unw": rms(svi_w(s["k"][liq], p_unw) - s["w_true"][liq]),
+        "liq_rms_wt": rms(svi_w(s["k"][liq], p_wt) - s["w_true"][liq]),
+    }
 
 
 # --------------------------------------------------------------------------- #
@@ -341,6 +412,15 @@ def main():
     print(f"\n  Naive cubic-spline interpolation of the noisy quotes (T={mats[mid]}):")
     print(f"    min Durrleman g = {g_naive.min():+.4f}  -> {'butterfly ARBITRAGE (g<0)' if g_naive.min() < 0 else 'no violation this draw'}")
 
+    # Vega/liquidity-weighted calibration under heteroskedastic quote noise
+    sl = heteroskedastic_slice(seed=0)
+    wcal = fit_weighted_vs_unweighted(sl)
+    print("\n  Vega/liquidity-weighted calibration (noisy wide-spread wings, tight ATM):")
+    print(f"    ATM total-variance error : unweighted={wcal['atm_err_unw']:.2e}  weighted={wcal['atm_err_wt']:.2e}")
+    print(f"    liquid-region |k|<=0.2   : unweighted={wcal['liq_rms_unw']:.2e}  weighted={wcal['liq_rms_wt']:.2e}")
+    print("    weighting nails the liquid/high-vega region (where you price and hedge)")
+    print("    by not chasing the noisy wings.")
+
     plt = _try_plt()
     if plt is None:
         print("\n[matplotlib not available - numeric results above are the proof]")
@@ -382,8 +462,23 @@ def main():
     ax.legend()
     fig.tight_layout(); fig.savefig(f"{outdir}/density_check.png", dpi=130); plt.close(fig)
 
+    # Figure 4: vega/liquidity-weighted vs unweighted calibration
+    fig, ax = plt.subplots(figsize=(7.5, 5))
+    kk2 = np.linspace(sl["k"].min(), sl["k"].max(), 200)
+    ax.errorbar(sl["k"], sl["iv_obs"], yerr=sl["spread_iv"], fmt="o", ms=4, color="crimson",
+                ecolor="grey", elinewidth=1, capsize=2, alpha=0.8, label="market quotes (bid-ask)")
+    ax.plot(kk2, np.sqrt(ssvi_w(kk2, sl["theta"], SSVIParams(-0.4, 1.0, 0.4)) / sl["T"]),
+            "k-", lw=1.5, label="true smile")
+    ax.plot(kk2, np.sqrt(svi_w(kk2, wcal["p_unw"]) / sl["T"]), "--", color="C0", label="unweighted fit")
+    ax.plot(kk2, np.sqrt(svi_w(kk2, wcal["p_wt"]) / sl["T"]), "-", color="C2", label="vega/spread-weighted fit")
+    ax.axvspan(-0.2, 0.2, color="green", alpha=0.07, label="liquid region")
+    ax.set_xlabel("log-moneyness k"); ax.set_ylabel("implied vol")
+    ax.set_title("Weighted calibration hugs the reliable ATM quotes")
+    ax.legend(fontsize=8)
+    fig.tight_layout(); fig.savefig(f"{outdir}/weighted_calibration.png", dpi=130); plt.close(fig)
+
     print(f"\nFigures written to {os.path.normpath(outdir)}/:")
-    print("  ssvi_surface.png, slice_fit.png, density_check.png")
+    print("  ssvi_surface.png, slice_fit.png, density_check.png, weighted_calibration.png")
 
 
 if __name__ == "__main__":

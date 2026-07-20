@@ -25,7 +25,9 @@ where that pricing breaks down.
   arbitrage (Durrleman `g(k) >= 0`, i.e. non-negative density) and no calendar
   arbitrage (total variance rising with maturity). Demonstrates that a naive
   spline through noisy quotes admits butterfly arbitrage that SSVI removes.
-  Builds surfaces from prices via its own Brent IV inverter, not yfinance's IV
+  Supports **vega/liquidity-weighted calibration** so noisy illiquid wings don't
+  drag the fit off the reliable ATM quotes. Builds surfaces from prices via its
+  own Brent IV inverter, not yfinance's IV
   field. See `pricing_and_vol_surface/VOL_SURFACE.md` for the write-up and
   figures. `Skew_surface_example.png` shows the older single-snapshot
   `skew_surface()` plot, kept for contrast.
@@ -69,7 +71,9 @@ decomposes P&L into **spread capture** vs **vol / hedging P&L**. It shows that a
 net-short desk's total P&L falls as realised vol rises above the implied vol it
 quoted — the spread has to pay for the vol risk of the inventory taken on. The
 hedging engine is validated against the closed-form Black-Scholes gamma-P&L
-identity. See `market_making/README.md` for the write-up and figures.
+identity. It also models **adverse selection / toxic flow**: informed flow costs
+a delta-hedged desk through hedge latency, and a wider quoted spread buys
+tolerance to it. See `market_making/README.md` for the write-up and figures.
 
 ```bash
 python market_making/mm_sim.py          # prints tables, writes figures/
@@ -97,8 +101,8 @@ pip install -r requirements.txt
   teaching/diagnostic tool, not a live signal.
 
 ## Planned
-- Adverse-selection / toxic-flow modelling in the market-making simulator.
-- Liquidity/vega-weighted calibration of the vol surface to bid-ask, not mids.
+- Vol-informed (not just directional) toxic flow in the market-making simulator.
+- Fitting the vol surface to the full bid-ask band rather than a weighted mid.
 
 ## Note
 Research and learning code - not investment advice. Data is pulled live from

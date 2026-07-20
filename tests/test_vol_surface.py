@@ -96,6 +96,25 @@ def test_naive_interpolation_admits_arbitrage():
 # --------------------------------------------------------------------------- #
 # IV inversion                                                                #
 # --------------------------------------------------------------------------- #
+def test_vega_spread_weights_favour_atm():
+    k = np.linspace(-0.6, 0.4, 25)
+    iv = 0.2 * np.ones_like(k)
+    spread = 0.006 + 0.1 * np.abs(k)   # wider in the wings
+    w = V.vega_spread_weights(k, iv, 0.5, spread)
+    atm = int(np.argmin(np.abs(k)))
+    assert w[atm] > w[0] and w[atm] > w[-1]
+
+
+def test_weighted_calibration_improves_atm_accuracy():
+    """Averaged over draws, vega/spread weighting fits ATM better than OLS."""
+    atm_u, atm_w = [], []
+    for seed in range(15):
+        res = V.fit_weighted_vs_unweighted(V.heteroskedastic_slice(seed=seed))
+        atm_u.append(res["atm_err_unw"])
+        atm_w.append(res["atm_err_wt"])
+    assert np.mean(atm_w) < np.mean(atm_u)
+
+
 def test_iv_from_price_roundtrip():
     S, K, T, r, sigma = 100.0, 105.0, 0.5, 0.02, 0.25
     price = V.bs_call(S, K, T, r, sigma)

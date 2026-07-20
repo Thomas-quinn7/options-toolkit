@@ -20,8 +20,10 @@ from mm_sim import (  # noqa: E402
     bs_delta,
     bs_gamma,
     bs_price,
+    experiment_adverse_selection,
     experiment_hedging_validation,
     experiment_mm_vol_sweep,
+    experiment_toxic_spread,
 )
 
 
@@ -93,6 +95,30 @@ def test_spread_flat_vol_slopes_down():
     # a net-short desk's vol P&L and total P&L fall as realised vol rises
     assert vols[0] > vols[-1]
     assert totals[0] > totals[-1]
+
+
+# --------------------------------------------------------------------------- #
+# Adverse selection / toxic flow                                              #
+# --------------------------------------------------------------------------- #
+def test_adverse_selection_needs_hedge_lag():
+    """At realised==implied vol: delta-hedging before the move neutralises the
+    direction of informed flow (lag0 residual ~ 0 at any toxicity); the cost
+    appears only when hedging lags the move (lag1 residual << 0 with toxicity)."""
+    base = MMParams(flow_imbalance=0.0)
+    rows = experiment_adverse_selection(base, [0.0, 0.6], n_sims=3000, seed=2)
+    no_tox, toxic = rows[0], rows[1]
+    # hedging before the move: no systematic residual, with or without toxicity
+    assert abs(no_tox["lag0_resid"]) < 0.2
+    assert abs(toxic["lag0_resid"]) < 0.2
+    # hedging after the move: ~0 without toxicity, strongly negative with it
+    assert abs(no_tox["lag1_resid"]) < 0.25
+    assert toxic["lag1_resid"] < -1.0
+
+
+def test_wider_spread_survives_toxic_flow():
+    base = MMParams(flow_imbalance=0.0)
+    grid = experiment_toxic_spread(base, [0.6], [0.10, 0.25], n_sims=3000, seed=3)
+    assert grid[0.25][0] > grid[0.10][0]
 
 
 # --------------------------------------------------------------------------- #

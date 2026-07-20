@@ -3,8 +3,6 @@ pandas
 scipy
 matplotlib
 seaborn
-statsmodels
 yfinance
 jax
 jaxlib
-requests

@@ -74,14 +74,18 @@ def diff_function(S, K, T, r, sigma_est, price, q=0, otype="call"):
 
 
 def implied_volatility(
-    stock, K, sigma_est, price, T=1, q=0, otype="call", E=0.01, iter=40
+    S, K, sigma_est, price, r=0.045, T=1, q=0, otype="call", E=0.01, max_iter=40
 ):
-    S = stock_data(stock)
-    r = get_riskfree_rate()
+    """Newton-Raphson implied vol solver.
+
+    Spot (S) and the risk-free rate (r) are passed in as parameters rather than
+    fetched over the network, so this stays a pure numerical routine. Use
+    stock_data() / get_riskfree_rate() at the call site to source live inputs.
+    """
     iterations = 0
     diff = diff_function(S, K, T, r, sigma_est, price, q, otype)
     loss_grad = grad(diff_function, argnums=4)
-    while abs(diff) > E and iterations < iter:
+    while abs(diff) > E and iterations < max_iter:
         diff = diff_function(S, K, T, r, sigma_est, price, q, otype)
         diff_grad = loss_grad(S, K, T, r, sigma_est, price, q, otype)
         if diff_grad == 0:
@@ -275,4 +279,8 @@ def skew_surface(ticker, otype="call"):
     plt.show()
     return T, K
 
-d=skew_surface("AAPL")
+
+if __name__ == "__main__":
+    # Demonstration only - fires a live download and a matplotlib window.
+    # Kept behind the guard so importing this module has no side effects.
+    skew_surface("AAPL")

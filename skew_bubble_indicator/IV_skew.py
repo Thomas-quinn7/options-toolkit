@@ -150,7 +150,7 @@ def validate_expiry_date(expiry_str: str) -> Tuple[bool, int]:
         
         is_valid = MIN_DTE <= dte <= MAX_DTE
         return is_valid, dte
-    except:
+    except (ValueError, TypeError):
         return False, 0
 
 
@@ -205,9 +205,9 @@ def compute_data_quality_score(
             quality_score += 0.25
         
         quality_metrics["quality_score"] = quality_score
-        
+
         return quality_metrics
-    except:
+    except (KeyError, ValueError, TypeError):
         return {"quality_score": 0.0}
 
 

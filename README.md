@@ -1,9 +1,9 @@
 # Options Toolkit
 
 A small set of options-analytics tools: Black-Scholes pricing with the full
-Greeks, a real-data implied-volatility skew scanner, and static no-arbitrage
-checks. Built to explore how options markets price risk and where that pricing
-breaks down.
+Greeks, a real-data implied-volatility skew scanner, static no-arbitrage checks,
+and a delta-hedged options **market-making simulator**. Built to explore how
+options markets price risk and where that pricing breaks down.
 
 ## Contents
 
@@ -47,6 +47,21 @@ python arbitrage/arb_scan.py AAPL MSFT            # institutional mode
 python arbitrage/arb_scan.py AAPL --retail        # no short selling
 ```
 
+### `market_making/`
+`mm_sim.py` is a delta-hedged options market-making simulator. It quotes a
+two-sided market around Black-Scholes fair value with Avellaneda-Stoikov-style
+fill intensities and inventory skew, delta-hedges the resulting book, and
+decomposes P&L into **spread capture** vs **vol / hedging P&L**. It shows that a
+net-short desk's total P&L falls as realised vol rises above the implied vol it
+quoted — the spread has to pay for the vol risk of the inventory taken on. The
+hedging engine is validated against the closed-form Black-Scholes gamma-P&L
+identity. See `market_making/README.md` for the write-up and figures.
+
+```bash
+python market_making/mm_sim.py          # prints tables, writes figures/
+python -m pytest tests/test_mm.py -q    # validates the hedging engine
+```
+
 ## Setup
 
 ```bash
@@ -67,9 +82,9 @@ pip install -r requirements.txt
   teaching/diagnostic tool, not a live signal.
 
 ## Planned
-- A quoting + inventory-skew + delta-hedge **market-making simulator** (Phase 2).
-- A fitted **arbitrage-free vol surface** using this repo's own IV solver
-  (Phase 3).
+- A fitted **arbitrage-free vol surface** (SVI/SABR) using this repo's own IV
+  solver (Phase 3).
+- Adverse-selection / toxic-flow modelling in the market-making simulator.
 
 ## Note
 Research and learning code - not investment advice. Data is pulled live from

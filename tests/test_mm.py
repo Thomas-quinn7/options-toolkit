@@ -1,0 +1,110 @@
+"""Tests for the options market-making simulator.
+
+The load-bearing test is ``test_hedging_identity``: it checks the simulated
+delta-hedged P&L against the closed-form Black-Scholes gamma-P&L, which is what
+makes the simulator's vol P&L trustworthy rather than just plausible.
+
+Run:  python -m pytest tests/test_mm.py -q
+"""
+
+import os
+import sys
+
+import numpy as np
+import pytest
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "market_making"))
+
+from mm_sim import (  # noqa: E402
+    MMParams,
+    bs_delta,
+    bs_gamma,
+    bs_price,
+    experiment_hedging_validation,
+    experiment_mm_vol_sweep,
+)
+
+
+# --------------------------------------------------------------------------- #
+# Closed-form Black-Scholes sanity                                            #
+# --------------------------------------------------------------------------- #
+def test_put_call_parity():
+    S, K, tau, r, sigma = 100.0, 105.0, 0.5, 0.03, 0.2
+    call = bs_price(S, K, tau, r, sigma, otype="call")
+    put = bs_price(S, K, tau, r, sigma, otype="put")
+    assert np.isclose(call - put, S - K * np.exp(-r * tau), atol=1e-10)
+
+
+def test_delta_matches_finite_difference():
+    S, K, tau, r, sigma = 100.0, 100.0, 0.4, 0.01, 0.25
+    h = 1e-4
+    fd = (bs_price(S + h, K, tau, r, sigma) - bs_price(S - h, K, tau, r, sigma)) / (2 * h)
+    assert np.isclose(bs_delta(S, K, tau, r, sigma), fd, atol=1e-5)
+
+
+def test_gamma_matches_finite_difference():
+    S, K, tau, r, sigma = 100.0, 100.0, 0.4, 0.01, 0.25
+    h = 1e-3
+    fd = (bs_delta(S + h, K, tau, r, sigma) - bs_delta(S - h, K, tau, r, sigma)) / (2 * h)
+    assert np.isclose(bs_gamma(S, K, tau, r, sigma), fd, atol=1e-5)
+
+
+def test_expiry_intrinsic():
+    assert np.isclose(bs_price(110.0, 100.0, 0.0, 0.0, 0.2, otype="call"), 10.0)
+    assert np.isclose(bs_price(90.0, 100.0, 0.0, 0.0, 0.2, otype="call"), 0.0)
+    assert np.isclose(bs_delta(110.0, 100.0, 0.0, 0.0, 0.2, otype="call"), 1.0)
+    assert np.isclose(bs_gamma(110.0, 100.0, 0.0, 0.0, 0.2), 0.0)
+
+
+# --------------------------------------------------------------------------- #
+# The hedging identity - the core correctness guarantee                       #
+# --------------------------------------------------------------------------- #
+def test_hedging_identity():
+    """Simulated hedged P&L must match the BS gamma-P&L theory within noise."""
+    params = MMParams(n_steps=126)
+    grid = np.array([0.14, 0.20, 0.26])
+    val = experiment_hedging_validation(params, grid, n_sims=3000, seed=7)
+    for row in val["rows"]:
+        err = abs(row["sim_mean"] - row["theory_mean"])
+        assert err < 6 * row["sim_se"] + 1e-3, row  # within Monte-Carlo error
+
+
+def test_short_is_long_vol_downside():
+    """A hedged short option makes money when realised < implied, loses when >."""
+    params = MMParams()
+    grid = np.array([0.14, 0.26])
+    val = experiment_hedging_validation(params, grid, n_sims=3000, seed=3)
+    below, above = val["rows"][0], val["rows"][1]
+    assert below["sim_mean"] > 0 > above["sim_mean"]
+
+
+# --------------------------------------------------------------------------- #
+# The MM decomposition behaves as a market-maker's book should                #
+# --------------------------------------------------------------------------- #
+def test_spread_flat_vol_slopes_down():
+    params = MMParams(flow_imbalance=0.30)
+    grid = np.linspace(0.14, 0.28, 5)
+    sweep = experiment_mm_vol_sweep(params, grid, n_sims=2500, seed=1)
+    spreads = np.array([r["spread_mean"] for r in sweep["rows"]])
+    vols = np.array([r["vol_mean"] for r in sweep["rows"]])
+    totals = np.array([r["total_mean"] for r in sweep["rows"]])
+    # spread capture does not depend on realised vol (flat within a few %)
+    assert spreads.std() / spreads.mean() < 0.05
+    # a net-short desk's vol P&L and total P&L fall as realised vol rises
+    assert vols[0] > vols[-1]
+    assert totals[0] > totals[-1]
+
+
+# --------------------------------------------------------------------------- #
+# Cross-check the vectorised BS against the repo's autodiff pricer (black.py)  #
+# --------------------------------------------------------------------------- #
+def test_cross_check_black_py():
+    pytest.importorskip("jax")
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "pricing_and_vol_surface"))
+    import black  # noqa: E402
+
+    for S, K, tau, r, sigma in [(100, 100, 0.5, 0.02, 0.2), (95, 105, 0.25, 0.0, 0.35)]:
+        assert np.isclose(bs_price(S, K, tau, r, sigma), float(black.black_scholes(S, K, tau, r, sigma)), atol=1e-6)
+        d, g, *_ = black.greeks(S, K, tau, r, sigma)
+        assert np.isclose(bs_delta(S, K, tau, r, sigma), float(d), atol=1e-6)
+        assert np.isclose(bs_gamma(S, K, tau, r, sigma), float(g), atol=1e-6)

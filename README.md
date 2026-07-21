@@ -44,9 +44,14 @@ python -m pytest tests/test_vol_surface.py -q
 `IV_skew.py` scans a large set of US names across market segments, fetches option
 chains concurrently, applies data-quality gates (volume, open interest, bid-ask
 spread, IV sanity, DTE window), and computes the OTM put-minus-call IV skew per
-name. Inverted skew (calls richer than puts) across enough names is flagged as a
+name. Implied vols are **inverted from bid-ask mid prices by the repo's own
+Brent solver** (`vol_surface.iv_from_price`); yfinance's `impliedVolatility`
+field is kept only as a diagnostic column, and a mid outside the no-arbitrage
+price bounds fails inversion and drops out — a free data-quality gate. Inverted
+skew (calls richer than puts) across enough names is flagged as a
 speculative-froth signal. Snapshots are appended to CSV
-(`daily_IV_skew_snapshot.csv`, `bubble_summary.csv`).
+(`daily_IV_skew_snapshot.csv`, `bubble_summary.csv`). The pipeline's IV logic is
+unit-tested offline on synthetic chains (`tests/test_iv_skew.py`).
 
 ```bash
 python skew_bubble_indicator/IV_skew.py --workers 5 --plot
@@ -79,10 +84,14 @@ identity. It also models **adverse selection / toxic flow** in both kinds:
 (so speed fixes it), while **vol-informed (vega-toxic) flow** — clients who buy
 options precisely on the paths that will realise high vol — survives instant
 hedging entirely and must be priced via a vol-space markup, which has an
-interior optimum because it trades vega edge against volume. The desk can also
-**estimate directional toxicity online** from its own fill markouts
-(bias-corrected EWMA) and widen adaptively — beating both fixed quoting
-policies when toxicity switches regime mid-session. See
+interior optimum because it trades vega edge against volume. The desk also
+**estimates both toxicity kinds online from its own fills**: a directional
+markout (bias-corrected EWMA) drives adaptive spread widening that beats both
+fixed policies when toxicity switches regime, and a vega-space markout (fills
+scored against the next bars' realised variance, marked up only above a
+calibrated null threshold) detects vol-informed flow — cleanly, though one
+book's vega markout is noisy enough that per-book repricing recovers only part
+of the oracle markup's edge, the honest asymmetry between the two kinds. See
 `market_making/README.md` for the write-up and figures. Charts across the repo
 share one colorblind-validated style (`plotstyle.py`).
 
@@ -103,20 +112,19 @@ pip install -r requirements.txt
   single-snapshot `griddata` interpolation of market IVs. Use `vol_surface.py`
   for the fitted, butterfly/calendar-arbitrage-free SVI/SSVI surface;
   `skew_surface()` is kept only as the naive-interpolation contrast.
-- **`IV_skew.py` uses yfinance's own `impliedVolatility`** field rather than this
-  repo's Newton-Raphson solver, and its skew thresholds are unvalidated
-  heuristics. A delta-target config exists but is not yet wired in.
+- **`IV_skew.py`'s skew/inversion thresholds are unvalidated heuristics** (the
+  IVs themselves now come from the repo's own price inverter). A delta-target
+  config exists but is not yet wired in.
 - **The arbitrage checks apply European relationships** (parity, box) to American
   yfinance options with **no dividend term**, so flagged trades can be spurious;
   realised edge is typically small relative to transaction costs. This is a
   teaching/diagnostic tool, not a live signal.
 
 ## Planned
-- A vega-space markout estimator so the desk can detect *vol*-informed flow
-  online and adapt its `vol_spread` the way it already adapts to directional
-  toxicity.
-- Rebuilding `IV_skew.py` on the repo's own IV solver (it still trusts
-  yfinance's `impliedVolatility` field).
+- Pooling toxicity markouts across books/instruments in the MM simulator —
+  the step that makes per-book-noisy vega toxicity actionable.
+- Wiring `IV_skew.py`'s delta-target config in, and validating its inversion
+  thresholds against the historical snapshots it has been accumulating.
 
 ## Note
 Research and learning code - not investment advice. Data is pulled live from

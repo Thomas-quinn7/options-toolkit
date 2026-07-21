@@ -1,3 +1,21 @@
+"""IV-skew bubble scanner.
+
+Scans option chains across market segments and computes the OTM put-minus-call
+IV skew per name; widespread *inverted* skew (calls richer than puts) is
+flagged as a speculative-froth signal.
+
+Implied vols are computed by THIS repo's Brent inverter
+(``pricing_and_vol_surface.vol_surface.iv_from_price``) from bid-ask mid
+prices - yfinance's own ``impliedVolatility`` field is kept only as a
+diagnostic column (``yf_iv``) and never used in the skew. Besides removing
+the dependence on a black-box vendor calculation, inverting from prices is a
+free no-arbitrage gate: a mid outside the European price bounds cannot be
+inverted and drops out as data-quality failure.
+"""
+
+import os
+import sys
+
 import numpy as np
 import pandas as pd
 import yfinance as yf
@@ -9,6 +27,10 @@ from datetime import datetime
 from pathlib import Path
 from typing import Tuple, Optional, List, Dict
 from collections import namedtuple
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..",
+                                "pricing_and_vol_surface"))
+from vol_surface import iv_from_price  # noqa: E402
 
 warnings.filterwarnings("ignore", category=RuntimeWarning)
 
@@ -107,37 +129,85 @@ MAX_IV = 3.0
 MIN_DTE = 7
 MAX_DTE = 60
 
+DEFAULT_RISK_FREE = 0.04
+_RISK_FREE_CACHE: Dict[str, float] = {}
+
+
+def get_risk_free_rate() -> float:
+    """13-week T-bill yield (^IRX) as a decimal, with an offline fallback."""
+    if "r" not in _RISK_FREE_CACHE:
+        r = DEFAULT_RISK_FREE
+        try:
+            hist = yf.Ticker("^IRX").history(period="5d")["Close"].dropna()
+            if len(hist):
+                r = float(hist.iloc[-1]) / 100.0
+        except Exception:
+            pass
+        _RISK_FREE_CACHE["r"] = r
+    return _RISK_FREE_CACHE["r"]
+
+
 # ============== DATA VALIDATION FUNCTIONS ==============
 
-def validate_option_data(options_df: pd.DataFrame) -> pd.DataFrame:
-    """Filter options data to ensure quality and reliability."""
+def add_own_iv(options_df: pd.DataFrame, spot: float, T: float, r: float,
+               otype: str) -> pd.DataFrame:
+    """Recompute implied vol from bid-ask mid prices with the repo's inverter.
+
+    yfinance's ``impliedVolatility`` is preserved as ``yf_iv`` for diagnostics;
+    the ``impliedVolatility`` column is OVERWRITTEN with the repo's own
+    Brent-inverted IV so every downstream consumer uses it. Quotes without a
+    usable two-sided market (bid<=0 or crossed) and mids outside the European
+    no-arbitrage price bounds invert to NaN and fall out in validation.
+    """
+    df = options_df.copy()
+    df["yf_iv"] = df.get("impliedVolatility", np.nan)
+    bid = df.get("bid", pd.Series(np.nan, index=df.index)).astype(float)
+    ask = df.get("ask", pd.Series(np.nan, index=df.index)).astype(float)
+    usable = (bid > 0) & (ask >= bid)
+    mid = np.where(usable, 0.5 * (bid + ask), np.nan)
+    own = np.full(len(df), np.nan)
+    for i, (px, K) in enumerate(zip(mid, df["strike"].astype(float).values)):
+        if np.isfinite(px) and K > 0 and T > 0:
+            own[i] = iv_from_price(px, spot, K, T, r, otype=otype)
+    df["impliedVolatility"] = own
+    return df
+
+
+def validate_option_data(options_df: pd.DataFrame, spot: float, T: float,
+                         r: float, otype: str) -> pd.DataFrame:
+    """Filter options data to ensure quality, then recompute IV from prices."""
     if options_df.empty:
         return options_df
-    
+
     df = options_df.copy()
-    
+
     # Filter 1: Volume and Open Interest
     df = df[
-        (df["volume"] >= MIN_VOLUME) & 
+        (df["volume"] >= MIN_VOLUME) &
         (df["openInterest"] >= MIN_OPEN_INTEREST)
     ]
-    
+
     # Filter 2: Bid-Ask Spread (if available)
     if "bid" in df.columns and "ask" in df.columns:
         df["mid"] = (df["bid"] + df["ask"]) / 2
         df["spread_pct"] = ((df["ask"] - df["bid"]) / df["mid"]) * 100
         df = df[df["spread_pct"] <= MAX_BID_ASK_SPREAD_PCT]
-    
-    # Filter 3: IV Sanity Checks
+
+    # Filter 3: Remove zero or negative strikes
+    df = df[df["strike"] > 0]
+
+    # Recompute IV from mid prices with the repo's own inverter (yfinance's
+    # value is retained as yf_iv but takes no further part in the analysis).
+    df = add_own_iv(df, spot, T, r, otype)
+
+    # Filter 4: IV sanity checks - on OUR IV. NaN here includes quotes whose
+    # mid violated the no-arbitrage price bounds.
     df = df[
-        (df["impliedVolatility"] >= MIN_IV) & 
+        (df["impliedVolatility"] >= MIN_IV) &
         (df["impliedVolatility"] <= MAX_IV) &
         (df["impliedVolatility"].notna())
     ]
-    
-    # Filter 4: Remove zero or negative strikes
-    df = df[df["strike"] > 0]
-    
+
     return df
 
 
@@ -256,15 +326,19 @@ def fetch_option_chain(ticker: str, max_retries: int = 3) -> Tuple[str, Optional
                 return ticker, None, None, {}
             
             chain = tk.option_chain(best_expiry)
-            
+
             # Validate option data quality
             spot_price = get_current_spot_price(ticker)
             if np.isnan(spot_price):
                 return ticker, None, None, {}
-            
-            # Apply data quality filters
-            validated_puts = validate_option_data(chain.puts)
-            validated_calls = validate_option_data(chain.calls)
+
+            # Apply data quality filters and recompute IVs from mid prices
+            # with the repo's own Brent inverter (see add_own_iv).
+            _, dte = validate_expiry_date(best_expiry)
+            T = max(dte, 1) / 365.0
+            r = get_risk_free_rate()
+            validated_puts = validate_option_data(chain.puts, spot_price, T, r, "put")
+            validated_calls = validate_option_data(chain.calls, spot_price, T, r, "call")
             
             # Check if we have enough data
             if len(validated_puts) < 3 or len(validated_calls) < 3:
@@ -761,26 +835,30 @@ def save_bubble_summary_by_index(df: pd.DataFrame) -> None:
 
 
 def plot_global_iv_skew(df: pd.DataFrame) -> None:
-    """Visualize IV skew metrics by index."""
+    """Visualize IV skew metrics by index (repo chart style; inverted skew is
+    a genuine bad-state, so the bars wear status colors, not series colors)."""
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+    import plotstyle as ps
+    ps.apply_style()
+
     indices = df["index"].unique()
-    
+
     fig, axes = plt.subplots(len(indices), 1, figsize=(14, 4 * len(indices)))
     if len(indices) == 1:
         axes = [axes]
-    
+
     for idx, index_key in enumerate(indices):
         index_df = df[df["index"] == index_key].sort_values("iv_skew")
         index_name = index_df["index_name"].iloc[0]
-        
-        colors = ['red' if x < 0 else 'green' for x in index_df["iv_skew"]]
-        
-        axes[idx].bar(index_df["ticker"], index_df["iv_skew"], color=colors, alpha=0.7, edgecolor='black', linewidth=0.5)
-        axes[idx].axhline(0, color="black", linestyle="--", linewidth=1, alpha=0.5)
-        axes[idx].set_title(f"{index_name}", fontsize=12, fontweight='bold')
-        axes[idx].set_ylabel("IV Skew", fontsize=10)
-        axes[idx].grid(axis='y', alpha=0.3, linestyle='--')
+
+        colors = [ps.CRITICAL if x < 0 else ps.GOOD for x in index_df["iv_skew"]]
+
+        axes[idx].bar(index_df["ticker"], index_df["iv_skew"], color=colors, alpha=0.85)
+        axes[idx].axhline(0, color=ps.BASELINE, linestyle="--", linewidth=1)
+        axes[idx].set_title(f"{index_name} (red = inverted skew)")
+        axes[idx].set_ylabel("IV skew (OTM put - call)")
         axes[idx].tick_params(axis='x', rotation=45)
-    
+
     plt.tight_layout()
     plt.show()
 

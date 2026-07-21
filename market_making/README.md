@@ -171,6 +171,42 @@ gives up a little to the static one in permanently clean flow.
 `tests/test_mm.py` asserts the estimator's convergence, its regime tracking,
 and all three desk-comparison facts.
 
+## Online vol-toxicity estimation (Experiment F)
+
+Experiment E's markout estimator is blind to vol-informed flow (its fills
+agree with the next move only half the time), so Experiment F adds the
+vega-space analogue: each net client fill is scored against the **realised
+variance of the next few bars** relative to implied — did the market get
+wilder right after clients bought options? A single squared return is
+chi-square noisy, so the markout uses a K-bar window (ring-buffered: the
+observation lands K bars after the fill, late but causal), and the desk marks
+up its quoted vol only on the estimate's **excess over a calibrated null
+threshold** — the clipped EWMA has a positive noise floor even on clean flow,
+and without that deadband the desk taxes clean flow for phantom toxicity.
+
+Two structural points the experiment surfaces:
+
+* **Identifiability needs regime variation.** With one fixed vol regime per
+  path, a clean desk that happens to sit in the high-vol regime is
+  statistically indistinguishable from a vega-picked-off one. Vol regimes
+  here redraw every ~2 months within each book, and that is what makes the
+  flow-vs-variance correlation learnable at all.
+* **Detection is cheap; per-book repricing is not.** The estimator separates
+  vol-toxic from clean and from direction-toxic flow cleanly (and `tox_hat`
+  separates the directional kind right back — the two estimators partition
+  the two toxicity types). But one book's vega markout is noisy enough that
+  the adaptive markup recovers only part of the fixed oracle markup's edge in
+  stationary toxic flow — while skipping the oracle's clean-flow tax and
+  beating it when toxicity switches regime. This is the honest asymmetry
+  against the directional case, where ~30 clean binary markouts per book were
+  enough to nearly match the oracle: acting on vega toxicity at scale needs
+  pooling across books, which a single-option simulator cannot show.
+
+![online vol toxicity](figures/online_vol_toxicity.png)
+
+`tests/test_mm.py` asserts the discrimination (both directions), the
+gamma-P&L identity under full vol paths, and the three desk-comparison facts.
+
 ## Talking points
 
 * Delta-hedging removes direction and leaves a gamma / vega bet on realised vs
@@ -192,10 +228,10 @@ and all three desk-comparison facts.
 
 * One option, constant implied vol, Gaussian GBM — no vol surface, no jumps, no
   stochastic vol, so no vanna/volga or skew dynamics.
-* Directional toxicity is now estimated online and defended adaptively
-  (Experiment E), but the *vol*-informed kind is not: a vega-space markout
-  estimator (did realised vol pick up after clients bought options?) with an
-  adaptive `vol_spread` is the natural next step.
+* Both toxicity kinds are now estimated online (Experiments E and F), but
+  each book learns only from its own fills. The realistic next step is
+  pooling markouts across books/instruments, which is where per-book-noisy
+  vega toxicity becomes actionable.
 * Hedging is calendar-based; a band / cost-aware hedging policy would trade off
   hedge error against transaction cost.
 * Pricing is a vectorised closed-form BS for Monte-Carlo speed; the repo's

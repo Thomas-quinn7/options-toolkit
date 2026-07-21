@@ -23,6 +23,7 @@ from mm_sim import (  # noqa: E402
     experiment_adverse_selection,
     experiment_hedging_validation,
     experiment_mm_vol_sweep,
+    experiment_online_toxicity,
     experiment_toxic_spread,
     experiment_vol_informed_flow,
     experiment_vol_spread_defence,
@@ -176,6 +177,50 @@ def test_flow_fractions_validated():
     with pytest.raises(ValueError):
         simulate_paths(MMParams(toxicity=0.7, vol_toxicity=0.6), 0.2, 10,
                        np.random.default_rng(0))
+
+
+# --------------------------------------------------------------------------- #
+# Online toxicity estimation and adaptive quoting                             #
+# --------------------------------------------------------------------------- #
+def test_toxicity_estimator_converges():
+    """The markout EWMA must land near the true informed fraction - and near
+    zero when the flow is clean."""
+    toxic = simulate_paths(MMParams(toxicity=0.6), 0.2, 2000,
+                           np.random.default_rng(8), quoting=True)
+    clean = simulate_paths(MMParams(toxicity=0.0), 0.2, 2000,
+                           np.random.default_rng(8), quoting=True)
+    assert abs(float(toxic["tox_hat_final"].mean()) - 0.6) < 0.15
+    assert float(clean["tox_hat_final"].mean()) < 0.15
+
+
+def test_adaptive_spread_defends_without_overpaying():
+    """Under toxic flow the adaptive desk must beat the static one; under
+    clean flow it must beat the permanently-wide (oracle-for-toxic) desk,
+    because it only widens when its estimator sees toxicity."""
+    online = experiment_online_toxicity(MMParams(flow_imbalance=0.0),
+                                        tox_hi=0.6, spread_slope=0.25,
+                                        n_sims=2500, seed=6)
+    t = online["totals"]
+    assert t[("toxic", "adaptive")] > t[("toxic", "static")] + 0.3
+    assert t[("clean", "adaptive")] > t[("clean", "oracle-wide")] + 0.3
+    # when toxicity is time-varying, adapting beats BOTH fixed policies -
+    # static is too tight in the toxic half, oracle-wide too wide in the clean
+    assert t[("regime switch", "adaptive")] > t[("regime switch", "static")] + 0.2
+    assert t[("regime switch", "adaptive")] > t[("regime switch", "oracle-wide")] + 0.2
+
+
+def test_toxicity_estimator_tracks_regime_switch():
+    """After a mid-sim switch from clean to toxic, the running estimate must
+    rise materially above its clean-half level."""
+    online = experiment_online_toxicity(MMParams(flow_imbalance=0.0),
+                                        tox_hi=0.6, spread_slope=0.25,
+                                        n_sims=2500, seed=6)
+    track = online["tracks"]["regime switch"]
+    n = len(track)
+    clean_half = float(np.mean(track[n // 4: n // 2]))
+    toxic_tail = float(np.mean(track[-n // 5:]))
+    assert clean_half < 0.2
+    assert toxic_tail > clean_half + 0.15
 
 
 # --------------------------------------------------------------------------- #

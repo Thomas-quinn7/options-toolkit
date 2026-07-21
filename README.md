@@ -27,7 +27,8 @@ where that pricing breaks down.
   spline through noisy quotes admits butterfly arbitrage that SSVI removes.
   Supports **vega/liquidity-weighted calibration** so noisy illiquid wings don't
   drag the fit off the reliable ATM quotes, and **bid-ask band calibration**
-  (`fit_svi_slice_band`) that fits the quoted interval instead of a point mid —
+  (`fit_svi_slice_band` per slice, `fit_ssvi_band` for the global surface) that
+  fits the quoted interval instead of a point mid —
   the quote structure itself does the weighting. Builds surfaces from prices via
   its own Brent IV inverter, not yfinance's IV
   field. See `pricing_and_vol_surface/VOL_SURFACE.md` for the write-up and
@@ -78,8 +79,12 @@ identity. It also models **adverse selection / toxic flow** in both kinds:
 (so speed fixes it), while **vol-informed (vega-toxic) flow** — clients who buy
 options precisely on the paths that will realise high vol — survives instant
 hedging entirely and must be priced via a vol-space markup, which has an
-interior optimum because it trades vega edge against volume. See
-`market_making/README.md` for the write-up and figures.
+interior optimum because it trades vega edge against volume. The desk can also
+**estimate directional toxicity online** from its own fill markouts
+(bias-corrected EWMA) and widen adaptively — beating both fixed quoting
+policies when toxicity switches regime mid-session. See
+`market_making/README.md` for the write-up and figures. Charts across the repo
+share one colorblind-validated style (`plotstyle.py`).
 
 ```bash
 python market_making/mm_sim.py          # prints tables, writes figures/
@@ -107,10 +112,11 @@ pip install -r requirements.txt
   teaching/diagnostic tool, not a live signal.
 
 ## Planned
-- Online toxicity estimation in the market-making simulator: infer the informed
-  fraction from the desk's own fill stream and adapt the spread/markup.
-- Wiring the bid-ask band residual into the global SSVI fit (it is per-slice
-  today).
+- A vega-space markout estimator so the desk can detect *vol*-informed flow
+  online and adapt its `vol_spread` the way it already adapts to directional
+  toxicity.
+- Rebuilding `IV_skew.py` on the repo's own IV solver (it still trusts
+  yfinance's `impliedVolatility` field).
 
 ## Note
 Research and learning code - not investment advice. Data is pulled live from

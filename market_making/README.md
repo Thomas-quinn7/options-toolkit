@@ -144,6 +144,33 @@ optimum is *interior* (a modest markup beats none), and against clean flow any
 markup is pure cost. There is no free defence; the markup is worth exactly as
 much as the flow is toxic. `tests/test_mm.py` asserts all three facts.
 
+## Online toxicity estimation (Experiment E)
+
+Experiments C and D treat the informed fraction as known. A real desk has to
+**infer it from its own fills**. The estimator is a one-bar markout: a fill
+"agrees" when the underlying moves the client's way on the next bar. Informed
+flow trades one side only, so the informed share of *fills* is
+`f = tox/(2-tox)`; the agreement rate is `0.5 + f/2`, and inverting gives
+`tox_hat`. The running estimate is a bias-corrected EWMA (the remaining weight
+of the 0.5 prior is divided out, Adam-style, then the estimate is shrunk by
+its evidence weight so early noise cannot rectify into phantom toxicity).
+With `adaptive_spread` on, the desk widens its quote by `spread_slope *
+tox_hat` — using only information available at quote time.
+
+![online toxicity](figures/online_toxicity.png)
+
+Three desks (static, oracle-wide — permanently sized for the toxic regime —
+and adaptive) run through clean, toxic, and regime-switching flow, all with
+hedge latency. The adaptive desk defends like the oracle in toxic flow without
+paying the oracle's volume cost in clean flow, and on the **regime switch it
+beats both fixed policies** — adapting is worth most exactly when toxicity is
+time-varying. The estimator is honestly imperfect: it carries a detection lag
+after the switch (left panel — it is still converging at expiry) and a small
+phantom-toxicity floor from markout noise, which is why the adaptive desk
+gives up a little to the static one in permanently clean flow.
+`tests/test_mm.py` asserts the estimator's convergence, its regime tracking,
+and all three desk-comparison facts.
+
 ## Talking points
 
 * Delta-hedging removes direction and leaves a gamma / vega bet on realised vs
@@ -165,10 +192,10 @@ much as the flow is toxic. `tests/test_mm.py` asserts all three facts.
 
 * One option, constant implied vol, Gaussian GBM — no vol surface, no jumps, no
   stochastic vol, so no vanna/volga or skew dynamics.
-* Toxicity is modelled two ways - directional (Experiment C) and vol-informed
-  (Experiment D) - but the informed fraction is exogenous and constant. A
-  further extension is estimating it *online* from the desk's own fill stream
-  and adapting the spread/markup in response.
+* Directional toxicity is now estimated online and defended adaptively
+  (Experiment E), but the *vol*-informed kind is not: a vega-space markout
+  estimator (did realised vol pick up after clients bought options?) with an
+  adaptive `vol_spread` is the natural next step.
 * Hedging is calendar-based; a band / cost-aware hedging policy would trade off
   hedge error against transaction cost.
 * Pricing is a vectorised closed-form BS for Monte-Carlo speed; the repo's

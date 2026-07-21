@@ -122,6 +122,16 @@ also beats the mid fit at ATM and across the liquid region, and with the
 butterfly penalty on, the band-fitted slice is pushed into the no-arbitrage
 region like any other slice (`test_band_fit_can_be_pushed_arbitrage_free`).
 
+The same residual also drives the **global** surface: `fit_ssvi_band()` fits
+SSVI's `(rho, eta, gamma)` to the bands of every maturity at once, with the
+Gatheral-Jacquier butterfly conditions penalised as usual. On banded quotes of
+the synthetic surface it recovers the true shape parameters markedly better
+than the mid fit — `rho -0.419 / gamma 0.445` vs the mid fit's
+`-0.375 / 0.342` against a truth of `-0.4 / 0.4` — and the fitted surface
+passes both numerical no-arbitrage checks. Tight ATM bands at every maturity
+pin the global smile shape; the wide wings, where the mid is mostly noise,
+barely constrain it.
+
 ## Talking points
 
 * Total-variance space is the right coordinate system: no-arbitrage is a
@@ -137,7 +147,8 @@ region like any other slice (`test_band_fit_can_be_pushed_arbitrage_free`).
 * SSVI is a *global* two-and-a-half parameter form; it cannot fit every smile
   exactly. Per-slice SVI is more flexible but must be checked (and, if needed,
   constrained) slice by slice — both are provided.
-* No smoothing of the ATM term structure `theta(T)`; it is read from the quotes.
-* Calibration supports vega/liquidity weighting and bid-ask band fitting
-  (above) per slice; wiring the band residual into the *global* SSVI fit is
-  the natural next step.
+* No smoothing of the ATM term structure `theta(T)`; it is read from the
+  quotes (and the band fit still takes `theta` from the mid — a band-implied
+  `theta` interval is a further refinement).
+* Calibration supports vega/liquidity weighting and bid-ask band fitting, per
+  slice (`fit_svi_slice_band`) and globally (`fit_ssvi_band`).

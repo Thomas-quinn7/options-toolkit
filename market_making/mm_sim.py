@@ -34,6 +34,7 @@ Design notes
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
+from typing import Optional
 
 import numpy as np
 from scipy.stats import norm
@@ -131,6 +132,22 @@ class MMParams:
     # so the quote automatically charges more vega edge where vega is high.
     vol_spread: float = 0.0
 
+    # online toxicity estimation: the desk watches its own fill markouts (did
+    # the underlying move with the client on the next bar?) and keeps an EWMA
+    # of the agreement rate. Informed flow trades one side only, so the
+    # informed share of FILLS is f = tox/(2-tox); the agreement rate is
+    # 0.5 + f/2, giving tox_hat = 2*f_hat/(1+f_hat) with f_hat = 2*agree - 1.
+    # With adaptive_spread on, the desk widens its quote by
+    # spread_slope * tox_hat - using only information available at quote time.
+    adaptive_spread: bool = False
+    tox_ewma_alpha: float = 0.08    # EWMA step per fill observation
+    spread_slope: float = 0.0       # extra half-spread at tox_hat = 1
+
+    # optional per-step DIRECTIONAL toxicity schedule (length n_steps); when
+    # set it overrides the scalar `toxicity`, letting toxicity switch regime
+    # mid-simulation.
+    toxicity_schedule: Optional[np.ndarray] = None
+
     # hedging
     tc_underlying: float = 0.0      # per-share hedge cost as fraction of notional
 
@@ -156,8 +173,12 @@ def simulate_paths(
     representative time series for plotting a single path.
     """
     p = params
-    if p.toxicity + p.vol_toxicity > 1.0:
+    max_tox = (float(np.max(p.toxicity_schedule)) if p.toxicity_schedule is not None
+               else p.toxicity)
+    if max_tox + p.vol_toxicity > 1.0:
         raise ValueError("toxicity + vol_toxicity must be <= 1 (they partition the flow)")
+    if p.toxicity_schedule is not None and len(p.toxicity_schedule) != p.n_steps:
+        raise ValueError("toxicity_schedule must have length n_steps")
     m = p.contract_multiplier
     dt = p.T / p.n_steps
     sqrt_dt = np.sqrt(dt)
@@ -191,6 +212,25 @@ def simulate_paths(
     S_track[0] = S[0]
     inv_sample[0] = q_inv[0]
 
+    # Online toxicity estimator state (per path): EWMA of fill/move agreement,
+    # with the remaining weight of the 0.5 prior tracked in ``ewma_decay`` so
+    # the estimate can be bias-corrected (Adam-style) - otherwise the warm-up
+    # drags every estimate toward "clean" for most of a 126-step book.
+    agree = np.full(n_sims, 0.5)
+    ewma_decay = np.ones(n_sims)             # (1-step)^(#observations), per path
+    tox_hat_track = np.zeros(p.n_steps)      # mean tox_hat across paths, per step
+
+    def _tox_hat_from_state():
+        # Bias-corrected agreement, then estimate x confidence: with few
+        # observations the corrected estimate is noisy and the clip at zero
+        # rectifies that noise into phantom toxicity, so it is shrunk by the
+        # evidence weight (1 - remaining prior mass).
+        conf = 1.0 - ewma_decay
+        denom = np.maximum(conf, 1e-12)
+        a_hat = np.where(conf > 0.0, (agree - 0.5 * ewma_decay) / denom, 0.5)
+        f_hat = conf * np.clip(2.0 * a_hat - 1.0, 0.0, 1.0)
+        return 2.0 * f_hat / (1.0 + f_hat)
+
     var_gap = p.sigma_impl**2 - sigma_real**2
 
     for t in range(p.n_steps):
@@ -211,9 +251,16 @@ def simulate_paths(
                                     p.q, p.otype)
             else:
                 ask_base = bid_base = theo
+
+            # Online toxicity estimate (causal: uses fills/moves up to t-1).
+            tox_hat = _tox_hat_from_state()
+            tox_hat_track[t] = float(tox_hat.mean())
+            half_spread = p.half_spread + (p.spread_slope * tox_hat
+                                           if p.adaptive_spread else 0.0)
+
             skew_shift = p.skew_coef * q_inv
-            bid = bid_base - skew_shift - p.half_spread
-            ask = ask_base - skew_shift + p.half_spread
+            bid = bid_base - skew_shift - half_spread
+            ask = ask_base - skew_shift + half_spread
             d_bid = theo - bid          # distance from fair (drives fill intensity)
             d_ask = ask - theo
 
@@ -222,7 +269,8 @@ def simulate_paths(
             prob_bid = np.clip(1.0 - np.exp(-lam_bid * dt), 0.0, 1.0)
             prob_ask = np.clip(1.0 - np.exp(-lam_ask * dt), 0.0, 1.0)
 
-            tox = p.toxicity
+            tox = (float(p.toxicity_schedule[t]) if p.toxicity_schedule is not None
+                   else p.toxicity)
             vtox = p.vol_toxicity
             # Uninformed flow: direction independent of the coming move.
             u_bid = rng.random(n_sims) < (1.0 - tox - vtox) * prob_bid
@@ -271,6 +319,19 @@ def simulate_paths(
         # evolve the underlying with the REALISED vol using the pre-drawn shock
         S = S * np.exp((p.r - p.q - 0.5 * sigma_real**2) * dt + sigma_real * sqrt_dt * z)
 
+        # Update the online toxicity estimate from this step's fills and the
+        # move that just resolved (a one-bar markout): a fill "agrees" when the
+        # underlying moved the client's way. Only now is the move observable,
+        # so the estimate used for quoting next step remains causal.
+        if quoting:
+            n_fills_step = fill_bid.astype(float) + fill_ask.astype(float)
+            agree_count = (fill_ask & up).astype(float) + (fill_bid & ~up).astype(float)
+            has_fill = n_fills_step > 0
+            obs = np.where(has_fill, agree_count / np.maximum(n_fills_step, 1.0), 0.0)
+            step_sz = np.clip(p.tox_ewma_alpha * n_fills_step, 0.0, 1.0)
+            agree = np.where(has_fill, agree + step_sz * (obs - agree), agree)
+            ewma_decay = np.where(has_fill, ewma_decay * (1.0 - step_sz), ewma_decay)
+
         # Hedge AFTER the move if a lag is configured (adverse-selection channel).
         if p.hedge_lag == 1:
             delta_opt = bs_delta(S, p.K, tau, p.r, p.sigma_impl, p.q, p.otype)
@@ -305,6 +366,8 @@ def simulate_paths(
         "S_track": S_track,
         "inv_sample": inv_sample,
         "var_gap": var_gap,
+        "tox_hat_track": tox_hat_track,
+        "tox_hat_final": _tox_hat_from_state(),
     }
 
 
@@ -486,36 +549,87 @@ def experiment_vol_spread_defence(base: MMParams, vol_spreads, tox=0.5,
 
 
 # --------------------------------------------------------------------------- #
+# Experiment E - online toxicity estimation and adaptive quoting               #
+# --------------------------------------------------------------------------- #
+def experiment_online_toxicity(base: MMParams, tox_hi=0.6, spread_slope=0.25,
+                               n_sims=4000, seed=6):
+    """Can the desk INFER toxicity from its own fills and defend itself?
+
+    Three desks - static (base spread), oracle-wide (base + slope*tox_hi,
+    i.e. permanently sized for the toxic regime), and adaptive (widens by
+    slope * tox_hat, where tox_hat comes from the online markout estimator) -
+    each run through three flows: clean, toxic, and a regime switch (clean
+    first half, toxic second). All hedge with a one-bar lag, where directional
+    toxicity actually costs. The adaptive desk should track the truth closely
+    enough to defend in the toxic regimes without paying the oracle-wide
+    desk's volume cost in the clean one.
+    """
+    n = base.n_steps
+    schedules = {
+        "clean": np.zeros(n),
+        "toxic": np.full(n, tox_hi),
+        "regime switch": np.where(np.arange(n) < n // 2, 0.0, tox_hi),
+    }
+    desks = {
+        "static": dict(adaptive_spread=False),
+        "oracle-wide": dict(adaptive_spread=False,
+                            half_spread=base.half_spread + spread_slope * tox_hi),
+        "adaptive": dict(adaptive_spread=True, spread_slope=spread_slope),
+    }
+    totals = {}
+    tracks = {}
+    for sname, sched in schedules.items():
+        for dname, kw in desks.items():
+            p = replace(base, toxicity_schedule=sched, hedge_lag=1, **kw)
+            r = simulate_paths(p, base.sigma_impl, n_sims,
+                               np.random.default_rng(seed), quoting=True)
+            totals[(sname, dname)] = _summ(r["total_pnl"])[0]
+            if dname == "adaptive":
+                tracks[sname] = r["tox_hat_track"]
+    return {"totals": totals, "tracks": tracks, "schedules": schedules,
+            "tox_hi": tox_hi}
+
+
+# --------------------------------------------------------------------------- #
 # Plotting (guarded - matplotlib optional) and CLI                            #
 # --------------------------------------------------------------------------- #
 def _try_matplotlib():
+    """Return (plt, plotstyle) with the repo's shared chart style applied, or None."""
     try:
+        import os
+        import sys
+
         import matplotlib
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
-        return plt
+
+        sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+        import plotstyle as ps
+        ps.apply_style()
+        return plt, ps
     except Exception:
         return None
 
 
-def _plot_validation(val, params, plt, outdir):
+def _plot_validation(val, params, plt, ps, outdir):
     rows = val["rows"]
     sr = [r["sigma_real"] for r in rows]
     sim = [r["sim_mean"] for r in rows]
     sim_se = [r["sim_se"] for r in rows]
     th = [r["theory_mean"] for r in rows]
     fig, ax = plt.subplots(1, 2, figsize=(12, 4.5))
-    ax[0].errorbar(sr, sim, yerr=sim_se, fmt="o", label="simulated hedged P&L", capsize=3)
-    ax[0].plot(sr, th, "-", label="BS gamma-P&L theory")
-    ax[0].axvline(params.sigma_impl, color="grey", ls="--", lw=1, label="implied vol")
-    ax[0].axhline(0, color="k", lw=0.6)
+    ax[0].errorbar(sr, sim, yerr=sim_se, fmt="o", color=ps.series_color(0),
+                   label="simulated hedged P&L", capsize=3)
+    ax[0].plot(sr, th, "-", color=ps.series_color(1), label="BS gamma-P&L theory")
+    ax[0].axvline(params.sigma_impl, color=ps.MUTED, ls="--", lw=1, label="implied vol")
+    ax[0].axhline(0, color=ps.BASELINE, lw=0.8)
     ax[0].set_xlabel("realised vol"); ax[0].set_ylabel("P&L (short 1 option, hedged)")
     ax[0].set_title("Static short, delta-hedged: sim vs theory"); ax[0].legend(fontsize=8)
     if len(val["scatter_sim"]):
         s, t = val["scatter_theory"], val["scatter_sim"]
-        ax[1].scatter(s, t, s=6, alpha=0.25)
+        ax[1].scatter(s, t, s=6, alpha=0.25, color=ps.series_color(0))
         lo, hi = min(s.min(), t.min()), max(s.max(), t.max())
-        ax[1].plot([lo, hi], [lo, hi], "r-", lw=1, label="y = x")
+        ax[1].plot([lo, hi], [lo, hi], color=ps.INK, lw=1, label="y = x")
         ax[1].set_xlabel("analytic gamma P&L (per path)")
         ax[1].set_ylabel("simulated P&L (per path)")
         ax[1].set_title("Per-path identity (discrete-hedge noise)"); ax[1].legend(fontsize=8)
@@ -524,7 +638,7 @@ def _plot_validation(val, params, plt, outdir):
     plt.close(fig)
 
 
-def _plot_sweep(sweep, params, plt, outdir):
+def _plot_sweep(sweep, params, plt, ps, outdir):
     rows = sweep["rows"]
     gap = [r["sigma_real"] - params.sigma_impl for r in rows]
     tot = np.array([r["total_mean"] for r in rows]); tot_se = np.array([r["total_se"] for r in rows])
@@ -532,13 +646,13 @@ def _plot_sweep(sweep, params, plt, outdir):
     vh = np.array([r["vol_mean"] for r in rows]); vh_se = np.array([r["vol_se"] for r in rows])
 
     fig, ax = plt.subplots(figsize=(7.5, 5))
-    for y, ye, lab, c in [(tot, tot_se, "total P&L", "C0"),
-                          (sp, sp_se, "spread capture", "C2"),
-                          (vh, vh_se, "vol / hedging P&L", "C3")]:
+    for y, ye, lab, c in [(tot, tot_se, "total P&L", ps.series_color(0)),
+                          (sp, sp_se, "spread capture", ps.series_color(2)),
+                          (vh, vh_se, "vol / hedging P&L", ps.series_color(1))]:
         ax.plot(gap, y, "-o", color=c, label=lab, ms=4)
         ax.fill_between(gap, y - ye, y + ye, color=c, alpha=0.2)
-    ax.axvline(0, color="grey", ls="--", lw=1)
-    ax.axhline(0, color="k", lw=0.6)
+    ax.axvline(0, color=ps.MUTED, ls="--", lw=1)
+    ax.axhline(0, color=ps.BASELINE, lw=0.8)
     ax.set_xlabel("realised vol  -  implied vol")
     ax.set_ylabel("mean P&L per option (across paths)")
     ax.set_title("Market-maker P&L vs realised-implied vol\n(net-short desk absorbing client buy flow)")
@@ -547,23 +661,27 @@ def _plot_sweep(sweep, params, plt, outdir):
     fig.savefig(f"{outdir}/mm_pnl_vs_vol.png", dpi=130)
     plt.close(fig)
 
-    # sample path: inventory + underlying
+    # sample path: inventory and underlying as stacked panels sharing the time
+    # axis (one measure per axis - never a twin/dual axis).
     s = sweep["sample"]
-    fig, ax1 = plt.subplots(figsize=(7.5, 4.5))
     steps = np.arange(len(s["inv_sample"]))
-    ax1.plot(steps, s["inv_sample"], color="C1", label="inventory (one path)")
-    ax1.axhline(0, color="k", lw=0.6); ax1.set_ylabel("option inventory (contracts)", color="C1")
-    ax1.set_xlabel("hedge step")
-    ax2 = ax1.twinx()
-    ax2.plot(steps, s["S_track"], color="C4", alpha=0.7, label="underlying (one path)")
-    ax2.set_ylabel("underlying price", color="C4")
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(7.5, 6), sharex=True)
+    ax1.step(steps, s["inv_sample"], where="post", color=ps.series_color(6),
+             label="inventory (one path)")
+    ax1.axhline(0, color=ps.BASELINE, lw=0.8)
+    ax1.set_ylabel("option inventory (contracts)")
     ax1.set_title("Sample path: inventory vs underlying")
+    ax1.legend(fontsize=8)
+    ax2.plot(steps, s["S_track"], color=ps.series_color(0), label="underlying (same path)")
+    ax2.set_ylabel("underlying price")
+    ax2.set_xlabel("hedge step")
+    ax2.legend(fontsize=8)
     fig.tight_layout()
     fig.savefig(f"{outdir}/sample_inventory_path.png", dpi=130)
     plt.close(fig)
 
 
-def _plot_adverse_selection(adv_rows, spread_grid, params, plt, outdir):
+def _plot_adverse_selection(adv_rows, spread_grid, params, plt, ps, outdir):
     tox = [r["toxicity"] for r in adv_rows]
     lag0 = np.array([r["lag0_total"] for r in adv_rows])
     lag1 = np.array([r["lag1_total"] for r in adv_rows])
@@ -571,19 +689,21 @@ def _plot_adverse_selection(adv_rows, spread_grid, params, plt, outdir):
     fig, (axA, axB) = plt.subplots(1, 2, figsize=(13, 5))
 
     # Panel A: instantaneous vs lagged hedging; the gap is adverse selection
-    axA.plot(tox, lag0, "-o", color="C2", label="hedge before move (instant)")
-    axA.plot(tox, lag1, "-o", color="C3", label="hedge after move (latency)")
-    axA.fill_between(tox, lag0, lag1, color="C3", alpha=0.15, label="adverse-selection cost")
-    axA.axhline(0, color="k", lw=0.6)
+    axA.plot(tox, lag0, "-o", color=ps.series_color(0), label="hedge before move (instant)")
+    axA.plot(tox, lag1, "-o", color=ps.series_color(1), label="hedge after move (latency)")
+    axA.fill_between(tox, lag0, lag1, color=ps.CRITICAL, alpha=0.12,
+                     label="adverse-selection cost")
+    axA.axhline(0, color=ps.BASELINE, lw=0.8)
     axA.set_xlabel("flow toxicity (informed fraction)")
     axA.set_ylabel("mean total P&L per option")
     axA.set_title("Toxic flow: cost is realised through hedge latency")
     axA.legend(fontsize=8)
 
     # Panel B: a wider spread buys tolerance to toxicity
-    for hs, totals in spread_grid.items():
-        axB.plot(tox, totals, "-o", ms=4, label=f"half-spread = {hs:.2f}")
-    axB.axhline(0, color="k", lw=0.6)
+    for i, (hs, totals) in enumerate(spread_grid.items()):
+        axB.plot(tox, totals, "-o", ms=4, color=ps.series_color(i),
+                 label=f"half-spread = {hs:.2f}")
+    axB.axhline(0, color=ps.BASELINE, lw=0.8)
     axB.set_xlabel("flow toxicity (informed fraction)")
     axB.set_ylabel("mean total P&L per option (hedge latency)")
     axB.set_title("Widening the quote buys tolerance to toxic flow")
@@ -594,7 +714,7 @@ def _plot_adverse_selection(adv_rows, spread_grid, params, plt, outdir):
     plt.close(fig)
 
 
-def _plot_vol_informed(vi_rows, defence_rows, plt, outdir):
+def _plot_vol_informed(vi_rows, defence_rows, plt, ps, outdir):
     tox = [r["toxicity"] for r in vi_rows]
     dir_tot = np.array([r["dir_total"] for r in vi_rows])
     vol_tot = np.array([r["vol_total"] for r in vi_rows])
@@ -603,11 +723,13 @@ def _plot_vol_informed(vi_rows, defence_rows, plt, outdir):
 
     # Panel A: with instant hedging, direction-informed flow costs ~nothing;
     # vol-informed flow still bleeds - the unhedgeable kind of toxicity.
-    axA.plot(tox, dir_tot, "-o", color="C2", label="direction-informed flow (hedged instantly)")
-    axA.plot(tox, vol_tot, "-o", color="C3", label="vol-informed flow (hedged instantly)")
-    axA.fill_between(tox, dir_tot, vol_tot, color="C3", alpha=0.15,
+    axA.plot(tox, dir_tot, "-o", color=ps.series_color(0),
+             label="direction-informed flow (hedged instantly)")
+    axA.plot(tox, vol_tot, "-o", color=ps.series_color(1),
+             label="vol-informed flow (hedged instantly)")
+    axA.fill_between(tox, dir_tot, vol_tot, color=ps.CRITICAL, alpha=0.12,
                      label="unhedgeable vega adverse selection")
-    axA.axhline(0, color="k", lw=0.6)
+    axA.axhline(0, color=ps.BASELINE, lw=0.8)
     axA.set_xlabel("informed fraction of flow")
     axA.set_ylabel("mean total P&L per option")
     axA.set_title("Instant hedging kills directional toxicity;\nvol toxicity survives it")
@@ -616,13 +738,13 @@ def _plot_vol_informed(vi_rows, defence_rows, plt, outdir):
     # Panel B: the defence is priced in vol space - it removes the vega loss
     # (residual -> 0) but costs volume, so it only pays against toxic flow.
     vs = [r["vol_spread"] for r in defence_rows]
-    axB.plot(vs, [r["total"] for r in defence_rows], "-o", color="C0",
+    axB.plot(vs, [r["total"] for r in defence_rows], "-o", color=ps.series_color(0),
              label="total P&L (vol-toxic flow)")
-    axB.plot(vs, [r["clean_total"] for r in defence_rows], "-o", color="C2", ms=4,
-             label="total P&L (uninformed flow)")
-    axB.plot(vs, [r["resid"] for r in defence_rows], "--o", color="C3", ms=4,
-             label="vega adverse-selection residual")
-    axB.axhline(0, color="k", lw=0.6)
+    axB.plot(vs, [r["clean_total"] for r in defence_rows], "-o", color=ps.series_color(2),
+             ms=4, label="total P&L (uninformed flow)")
+    axB.plot(vs, [r["resid"] for r in defence_rows], "--o", color=ps.series_color(1),
+             ms=4, label="vega adverse-selection residual")
+    axB.axhline(0, color=ps.BASELINE, lw=0.8)
     axB.set_xlabel("quoted half-spread in vol space")
     axB.set_ylabel("mean P&L per option")
     axB.set_title("The vol markup removes the vega loss but costs volume:\n"
@@ -631,6 +753,43 @@ def _plot_vol_informed(vi_rows, defence_rows, plt, outdir):
 
     fig.tight_layout()
     fig.savefig(f"{outdir}/vol_informed_flow.png", dpi=130)
+    plt.close(fig)
+
+
+def _plot_online_toxicity(online, params, plt, ps, outdir):
+    fig, (axA, axB) = plt.subplots(1, 2, figsize=(13, 5))
+
+    # Panel A: the estimator tracking a regime switch, causally.
+    track = online["tracks"]["regime switch"]
+    sched = online["schedules"]["regime switch"]
+    steps = np.arange(len(track))
+    axA.plot(steps, sched, color=ps.INK, ls="--", lw=1.5, label="true toxicity")
+    axA.plot(steps, track, color=ps.series_color(0), lw=2,
+             label="online estimate (mean tox_hat)")
+    axA.set_xlabel("quote/hedge step")
+    axA.set_ylabel("directional toxicity")
+    axA.set_ylim(-0.05, 1.0)
+    axA.set_title("The markout estimator tracks a toxicity\nregime switch it was never told about")
+    axA.legend(fontsize=8)
+
+    # Panel B: desk comparison across flow scenarios (grouped bars).
+    scenarios = list(online["schedules"].keys())
+    desks = ["static", "oracle-wide", "adaptive"]
+    x = np.arange(len(scenarios))
+    width = 0.26
+    for i, d in enumerate(desks):
+        vals = [online["totals"][(s, d)] for s in scenarios]
+        bars = axB.bar(x + (i - 1) * width, vals, width * 0.92,
+                       color=ps.series_color(i), label=d)
+        axB.bar_label(bars, fmt="%+.1f", fontsize=8, color=ps.INK_2, padding=2)
+    axB.axhline(0, color=ps.BASELINE, lw=0.8)
+    axB.set_xticks(x); axB.set_xticklabels(scenarios)
+    axB.set_ylabel("mean total P&L per option (hedge latency)")
+    axB.set_title("Adaptive quoting defends when toxic\nwithout paying the wide quote when clean")
+    axB.legend(fontsize=8)
+
+    fig.tight_layout()
+    fig.savefig(f"{outdir}/online_toxicity.png", dpi=130)
     plt.close(fig)
 
 
@@ -707,17 +866,32 @@ def main():
     print("  The markup shrinks the vega loss (resid -> 0) but costs volume: against")
     print("  toxic flow the optimum is interior; against clean flow it is pure cost.")
 
-    plt = _try_matplotlib()
-    if plt is None:
+    # Experiment E - online toxicity estimation and adaptive quoting
+    online = experiment_online_toxicity(adv_base, tox_hi=0.6, spread_slope=0.25,
+                                        n_sims=n_sims, seed=6)
+    print("\nExperiment E - online toxicity estimation (markout EWMA), hedge latency on")
+    print(f"  {'scenario':>16} {'static':>10} {'oracle-wide':>12} {'adaptive':>10}")
+    for s in online["schedules"]:
+        print(f"  {s:>16} {online['totals'][(s, 'static')]:>+10.3f} "
+              f"{online['totals'][(s, 'oracle-wide')]:>+12.3f} "
+              f"{online['totals'][(s, 'adaptive')]:>+10.3f}")
+    print("  The adaptive desk infers toxicity from its own fill markouts: it defends")
+    print("  like the oracle-wide desk in toxic flow without paying that desk's volume")
+    print("  cost in clean flow, and it re-widens on a mid-sim regime switch unaided.")
+
+    res = _try_matplotlib()
+    if res is None:
         print("\n[matplotlib not available - skipped figures; numeric tables above are the result]")
     else:
-        _plot_validation(val, params, plt, outdir)
-        _plot_sweep(sweep, params, plt, outdir)
-        _plot_adverse_selection(adv_rows, spread_grid, params, plt, outdir)
-        _plot_vol_informed(vi_rows, defence_rows, plt, outdir)
+        plt, ps = res
+        _plot_validation(val, params, plt, ps, outdir)
+        _plot_sweep(sweep, params, plt, ps, outdir)
+        _plot_adverse_selection(adv_rows, spread_grid, params, plt, ps, outdir)
+        _plot_vol_informed(vi_rows, defence_rows, plt, ps, outdir)
+        _plot_online_toxicity(online, params, plt, ps, outdir)
         print(f"\nFigures written to {outdir}/:")
         print("  hedging_validation.png, mm_pnl_vs_vol.png, sample_inventory_path.png,")
-        print("  adverse_selection.png, vol_informed_flow.png")
+        print("  adverse_selection.png, vol_informed_flow.png, online_toxicity.png")
 
 
 if __name__ == "__main__":

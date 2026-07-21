@@ -148,6 +148,29 @@ class MMParams:
     # mid-simulation.
     toxicity_schedule: Optional[np.ndarray] = None
 
+    # online VOL-toxicity estimation: a vega-space markout. After clients buy
+    # options, did the next bar realise more variance than implied predicts?
+    # Per fill the observation is side * (r^2/(sigma_impl^2 dt) - 1), side=+1
+    # when the client bought. Uninformed flow nets to ~0 (both sides trade in
+    # both regimes); vol-informed flow buys exactly before high realised
+    # variance, so the EWMA of this markout measures the vega edge the flow is
+    # extracting per fill, in relative-variance units. With
+    # adaptive_vol_spread on, the desk quotes vol_spread_slope * max(EWMA, 0)
+    # (capped) of vol-space markup - the estimate is clipped at zero so noise
+    # cannot rectify into phantom markup faster than evidence accumulates.
+    adaptive_vol_spread: bool = False
+    volmark_ewma_alpha: float = 0.08
+    volmark_horizon: int = 5        # markout window: bars of realised var per fill
+    vol_spread_slope: float = 0.0   # vol markup per unit of markout excess
+    vol_spread_cap: float = 0.008   # ceiling on the adaptive vol markup
+    # Null threshold: the clipped markout EWMA has a positive noise floor even
+    # on clean flow (zero-mean noise rectified by the clip). Only the excess
+    # above this floor triggers markup, so clean flow is not taxed by phantom
+    # toxicity. A real desk calibrates it from its own null - e.g. bootstrap
+    # the same statistic with fill sides shuffled.
+    volmark_deadband: float = 0.10
+    vol_toxicity_schedule: Optional[np.ndarray] = None  # per-step vol toxicity
+
     # hedging
     tc_underlying: float = 0.0      # per-share hedge cost as fraction of notional
 
@@ -164,10 +187,12 @@ def simulate_paths(
 ):
     """Vectorised Monte-Carlo over ``n_sims`` paths.
 
-    ``sigma_real`` may be a scalar (one realised vol for all paths) or an array
-    of shape (n_sims,) giving each path its own realised vol - the latter is
-    what makes vol-informed ("vega-toxic") flow expressible: informed clients
-    can condition on which vol regime their path is in.
+    ``sigma_real`` may be a scalar (one realised vol for all paths), an array
+    of shape (n_sims,) giving each path its own realised vol, or a matrix of
+    shape (n_sims, n_steps) giving each path a vol *path* (regimes that switch
+    mid-simulation). Per-path/per-step vols are what make vol-informed
+    ("vega-toxic") flow expressible: informed clients condition on the vol
+    regime currently in force.
 
     Returns a dict of per-path arrays (shape (n_sims,)) plus a couple of
     representative time series for plotting a single path.
@@ -175,14 +200,24 @@ def simulate_paths(
     p = params
     max_tox = (float(np.max(p.toxicity_schedule)) if p.toxicity_schedule is not None
                else p.toxicity)
-    if max_tox + p.vol_toxicity > 1.0:
+    max_vtox = (float(np.max(p.vol_toxicity_schedule))
+                if p.vol_toxicity_schedule is not None else p.vol_toxicity)
+    if max_tox + max_vtox > 1.0:
         raise ValueError("toxicity + vol_toxicity must be <= 1 (they partition the flow)")
-    if p.toxicity_schedule is not None and len(p.toxicity_schedule) != p.n_steps:
-        raise ValueError("toxicity_schedule must have length n_steps")
+    for sched in (p.toxicity_schedule, p.vol_toxicity_schedule):
+        if sched is not None and len(sched) != p.n_steps:
+            raise ValueError("toxicity schedules must have length n_steps")
     m = p.contract_multiplier
     dt = p.T / p.n_steps
     sqrt_dt = np.sqrt(dt)
-    sigma_real = np.broadcast_to(np.asarray(sigma_real, dtype=float), (n_sims,))
+    sigma_real = np.asarray(sigma_real, dtype=float)
+    if sigma_real.ndim <= 1:
+        SR = np.broadcast_to(sigma_real.reshape(-1, 1) if sigma_real.ndim == 1
+                             else sigma_real, (n_sims, p.n_steps))
+    else:
+        if sigma_real.shape != (n_sims, p.n_steps):
+            raise ValueError("2-D sigma_real must have shape (n_sims, n_steps)")
+        SR = sigma_real
 
     S = np.full(n_sims, p.S0, dtype=float)
     q_inv = np.full(n_sims, init_position, dtype=float)   # option inventory (contracts)
@@ -220,6 +255,19 @@ def simulate_paths(
     ewma_decay = np.ones(n_sims)             # (1-step)^(#observations), per path
     tox_hat_track = np.zeros(p.n_steps)      # mean tox_hat across paths, per step
 
+    # Vega-markout estimator state (per path). Zero-initialised, so clipping
+    # at zero is itself the conservative prior - no debiasing needed. Each
+    # fill is scored against the realised variance of the next
+    # ``volmark_horizon`` bars (a single squared return is chi-square noisy;
+    # a K-bar window cuts the noise by ~sqrt(K)), via ring buffers so the
+    # observation arrives K bars after the fill - late, but causal.
+    K_mark = max(int(p.volmark_horizon), 1)
+    volmark = np.zeros(n_sims)
+    side_buf = np.zeros((n_sims, K_mark))
+    vr_buf = np.zeros((n_sims, K_mark))
+    vr_sum = np.zeros(n_sims)
+    volmark_track = np.zeros(p.n_steps)      # mean clipped estimate, per step
+
     def _tox_hat_from_state():
         # Bias-corrected agreement, then estimate x confidence: with few
         # observations the corrected estimate is noisy and the clip at zero
@@ -231,9 +279,10 @@ def simulate_paths(
         f_hat = conf * np.clip(2.0 * a_hat - 1.0, 0.0, 1.0)
         return 2.0 * f_hat / (1.0 + f_hat)
 
-    var_gap = p.sigma_impl**2 - sigma_real**2
+    var_gap = p.sigma_impl**2 - SR[:, 0]**2
 
     for t in range(p.n_steps):
+        sig_t = SR[:, t]
         tau = p.T - t * dt
         theo = bs_price(S, p.K, tau, p.r, p.sigma_impl, p.q, p.otype)
 
@@ -244,11 +293,20 @@ def simulate_paths(
         if quoting:
             # Optional vol-space half-spread: price the ask at a marked-up vol
             # and the bid at a marked-down vol. Near expiry vega -> 0 and the
-            # vol spread collapses naturally, as it should.
-            if p.vol_spread > 0.0:
-                ask_base = bs_price(S, p.K, tau, p.r, p.sigma_impl + p.vol_spread, p.q, p.otype)
-                bid_base = bs_price(S, p.K, tau, p.r, max(p.sigma_impl - p.vol_spread, 1e-4),
-                                    p.q, p.otype)
+            # vol spread collapses naturally, as it should. With
+            # adaptive_vol_spread on, the markup follows the (causal, clipped)
+            # vega-markout estimate per path.
+            volmark_hat = np.maximum(volmark, 0.0)
+            volmark_track[t] = float(volmark_hat.mean())
+            vs_eff = p.vol_spread
+            if p.adaptive_vol_spread:
+                excess = np.maximum(volmark_hat - p.volmark_deadband, 0.0)
+                vs_eff = vs_eff + np.minimum(p.vol_spread_slope * excess,
+                                             p.vol_spread_cap)
+            if p.adaptive_vol_spread or p.vol_spread > 0.0:
+                ask_base = bs_price(S, p.K, tau, p.r, p.sigma_impl + vs_eff, p.q, p.otype)
+                bid_base = bs_price(S, p.K, tau, p.r,
+                                    np.maximum(p.sigma_impl - vs_eff, 1e-4), p.q, p.otype)
             else:
                 ask_base = bid_base = theo
 
@@ -271,7 +329,8 @@ def simulate_paths(
 
             tox = (float(p.toxicity_schedule[t]) if p.toxicity_schedule is not None
                    else p.toxicity)
-            vtox = p.vol_toxicity
+            vtox = (float(p.vol_toxicity_schedule[t])
+                    if p.vol_toxicity_schedule is not None else p.vol_toxicity)
             # Uninformed flow: direction independent of the coming move.
             u_bid = rng.random(n_sims) < (1.0 - tox - vtox) * prob_bid
             u_ask = rng.random(n_sims) < (1.0 - tox - vtox) * prob_ask
@@ -285,7 +344,7 @@ def simulate_paths(
             # implied they pay, and sell options to us on low-vol paths.
             # Delta-hedging cannot neutralise this - it selects which vol
             # regime each side of our book rides.
-            hi_vol = sigma_real > p.sigma_impl
+            hi_vol = sig_t > p.sigma_impl
             v_ask = hi_vol & (rng.random(n_sims) < vtox * prob_ask)
             v_bid = (~hi_vol) & (rng.random(n_sims) < vtox * prob_bid)
 
@@ -314,16 +373,17 @@ def simulate_paths(
 
         # analytic gamma P&L accrued over [t, t+dt] on the carried inventory
         gamma_opt = bs_gamma(S, p.K, tau, p.r, p.sigma_impl, p.q)
-        vol_theory += 0.5 * q_inv * gamma_opt * S**2 * (sigma_real**2 - p.sigma_impl**2) * dt * m
+        vol_theory += 0.5 * q_inv * gamma_opt * S**2 * (sig_t**2 - p.sigma_impl**2) * dt * m
 
         # evolve the underlying with the REALISED vol using the pre-drawn shock
-        S = S * np.exp((p.r - p.q - 0.5 * sigma_real**2) * dt + sigma_real * sqrt_dt * z)
+        log_ret = (p.r - p.q - 0.5 * sig_t**2) * dt + sig_t * sqrt_dt * z
+        S = S * np.exp(log_ret)
 
-        # Update the online toxicity estimate from this step's fills and the
-        # move that just resolved (a one-bar markout): a fill "agrees" when the
-        # underlying moved the client's way. Only now is the move observable,
-        # so the estimate used for quoting next step remains causal.
+        # Update the online toxicity estimates from this step's fills and the
+        # move that just resolved (one-bar markouts). Only now is the move
+        # observable, so the estimates used for quoting next step stay causal.
         if quoting:
+            # Directional: did the underlying move the client's way?
             n_fills_step = fill_bid.astype(float) + fill_ask.astype(float)
             agree_count = (fill_ask & up).astype(float) + (fill_bid & ~up).astype(float)
             has_fill = n_fills_step > 0
@@ -331,6 +391,25 @@ def simulate_paths(
             step_sz = np.clip(p.tox_ewma_alpha * n_fills_step, 0.0, 1.0)
             agree = np.where(has_fill, agree + step_sz * (obs - agree), agree)
             ewma_decay = np.where(has_fill, ewma_decay * (1.0 - step_sz), ewma_decay)
+
+            # Vega-space: did realised variance beat implied over the K bars
+            # after a net client buy (and undershoot after a net sell)?
+            # Netted per step so a both-sides print (no information)
+            # contributes nothing. The fill K bars ago is scored against the
+            # variance window that just completed.
+            side_net = fill_ask.astype(float) - fill_bid.astype(float)
+            var_ratio = log_ret**2 / (p.sigma_impl**2 * dt)
+            slot = t % K_mark
+            vr_sum = vr_sum + var_ratio - vr_buf[:, slot]
+            if t >= K_mark - 1:
+                side_old = side_buf[:, (t - K_mark + 1) % K_mark] if K_mark > 1 else side_net
+                has_side = side_old != 0.0
+                vobs = side_old * (vr_sum / K_mark - 1.0)
+                volmark = np.where(has_side,
+                                   volmark + p.volmark_ewma_alpha * (vobs - volmark),
+                                   volmark)
+            vr_buf[:, slot] = var_ratio
+            side_buf[:, slot] = side_net
 
         # Hedge AFTER the move if a lag is configured (adverse-selection channel).
         if p.hedge_lag == 1:
@@ -368,6 +447,8 @@ def simulate_paths(
         "var_gap": var_gap,
         "tox_hat_track": tox_hat_track,
         "tox_hat_final": _tox_hat_from_state(),
+        "volmark_track": volmark_track,
+        "volmark_final": np.maximum(volmark, 0.0),
     }
 
 
@@ -591,6 +672,68 @@ def experiment_online_toxicity(base: MMParams, tox_hi=0.6, spread_slope=0.25,
 
 
 # --------------------------------------------------------------------------- #
+# Experiment F - online VOL-toxicity estimation and adaptive vol markup        #
+# --------------------------------------------------------------------------- #
+def _regime_vol_paths(base: MMParams, vol_shock: float, n_sims: int,
+                      block: int = 42, seed: int = 0) -> np.ndarray:
+    """Per-path vol PATHS: hi/lo regimes (sigma_impl +/- vol_shock, p=1/2 each)
+    redrawn every ``block`` steps.
+
+    Regime *variation within a path* is what makes online vol-toxicity
+    inference possible at all: with one fixed regime per path, a clean desk
+    that happens to sit in the high-vol regime is statistically identical to
+    a vega-picked-off one, and no estimator can tell them apart. With
+    regimes that turn over (~monthly here), informed flow re-aligns with each
+    new regime while uninformed flow stays symmetric, and the flow-vs-realised
+    -variance markout becomes identifiable.
+    """
+    rng = np.random.default_rng(seed)
+    n_blocks = -(-base.n_steps // block)
+    hi = rng.random((n_sims, n_blocks)) < 0.5
+    sig = np.where(hi, base.sigma_impl + vol_shock, base.sigma_impl - vol_shock)
+    return np.repeat(sig, block, axis=1)[:, :base.n_steps]
+
+
+def experiment_online_vol_toxicity(base: MMParams, vtox_hi=0.6, vol_shock=0.06,
+                                   vol_spread_slope=0.06, oracle_vol_spread=0.005,
+                                   n_sims=4000, seed=7):
+    """Close the loop on Experiment D: detect vega-toxic flow online and price
+    the vol markup adaptively.
+
+    Three desks - static (no markup), oracle-markup (a fixed vol_spread sized
+    for the toxic regime), adaptive (vol_spread_slope * clipped vega-markout
+    EWMA) - run through clean, vol-toxic, and regime-switching flow. All hedge
+    instantly (lag 0), so every P&L difference is vega adverse selection and
+    quote width, never hedge latency. Vol regimes redraw every ~21 bars (see
+    _regime_vol_paths - the identifiability requirement).
+    """
+    n = base.n_steps
+    schedules = {
+        "clean": np.zeros(n),
+        "vol-toxic": np.full(n, vtox_hi),
+        "regime switch": np.where(np.arange(n) < n // 2, 0.0, vtox_hi),
+    }
+    desks = {
+        "static": dict(adaptive_vol_spread=False),
+        "oracle-markup": dict(adaptive_vol_spread=False, vol_spread=oracle_vol_spread),
+        "adaptive": dict(adaptive_vol_spread=True, vol_spread_slope=vol_spread_slope),
+    }
+    totals = {}
+    tracks = {}
+    sig_paths = _regime_vol_paths(base, vol_shock, n_sims, seed=seed)
+    for sname, sched in schedules.items():
+        for dname, kw in desks.items():
+            p = replace(base, vol_toxicity_schedule=sched, hedge_lag=0, **kw)
+            r = simulate_paths(p, sig_paths, n_sims,
+                               np.random.default_rng(seed + 1), quoting=True)
+            totals[(sname, dname)] = _summ(r["total_pnl"])[0]
+            if dname == "adaptive":
+                tracks[sname] = r["volmark_track"]
+    return {"totals": totals, "tracks": tracks, "schedules": schedules,
+            "vtox_hi": vtox_hi, "vol_shock": vol_shock}
+
+
+# --------------------------------------------------------------------------- #
 # Plotting (guarded - matplotlib optional) and CLI                            #
 # --------------------------------------------------------------------------- #
 def _try_matplotlib():
@@ -793,6 +936,47 @@ def _plot_online_toxicity(online, params, plt, ps, outdir):
     plt.close(fig)
 
 
+def _plot_online_vol_toxicity(online, params, plt, ps, outdir):
+    fig, (axA, axB) = plt.subplots(1, 2, figsize=(13, 5))
+
+    # Panel A: the vega-markout estimate under the vol-toxicity regime switch.
+    track = online["tracks"]["regime switch"]
+    steps = np.arange(len(track))
+    n = len(track)
+    axA.axvline(n // 2, color=ps.INK, ls="--", lw=1.2,
+                label="vol-toxic flow switches on")
+    axA.plot(steps, track, color=ps.series_color(0), lw=2,
+             label="vega markout estimate (mean)")
+    axA.axhline(0.10, color=ps.MUTED, ls=":", lw=1.2,
+                label="calibrated null threshold")
+    axA.set_xlabel("quote/hedge step")
+    axA.set_ylabel("vega markout (relative-variance units)")
+    axA.set_title("The vega-markout estimator detects vol-toxic flow\n"
+                  "(noisier and slower than the directional markout - honestly so)")
+    axA.legend(fontsize=8)
+
+    # Panel B: desk comparison across flow scenarios (grouped bars).
+    scenarios = list(online["schedules"].keys())
+    desks = ["static", "oracle-markup", "adaptive"]
+    x = np.arange(len(scenarios))
+    width = 0.26
+    for i, d in enumerate(desks):
+        vals = [online["totals"][(s, d)] for s in scenarios]
+        bars = axB.bar(x + (i - 1) * width, vals, width * 0.92,
+                       color=ps.series_color(i), label=d)
+        axB.bar_label(bars, fmt="%+.2f", fontsize=8, color=ps.INK_2, padding=2)
+    axB.axhline(0, color=ps.BASELINE, lw=0.8)
+    axB.set_xticks(x); axB.set_xticklabels(scenarios)
+    axB.set_ylabel("mean total P&L per option (instant hedging)")
+    axB.set_title("Adaptive vol markup: near-static when clean, part of the\n"
+                  "oracle's edge when toxic - one book's markout is noisy")
+    axB.legend(fontsize=8)
+
+    fig.tight_layout()
+    fig.savefig(f"{outdir}/online_vol_toxicity.png", dpi=130)
+    plt.close(fig)
+
+
 def _print_table(title, rows, cols, fmts):
     print(f"\n{title}")
     print("  " + "".join(f"{c:>16}" for c in cols))
@@ -879,6 +1063,22 @@ def main():
     print("  like the oracle-wide desk in toxic flow without paying that desk's volume")
     print("  cost in clean flow, and it re-widens on a mid-sim regime switch unaided.")
 
+    # Experiment F - online VOL-toxicity estimation and adaptive vol markup
+    online_v = experiment_online_vol_toxicity(adv_base, n_sims=n_sims, seed=7)
+    print("\nExperiment F - online vol-toxicity estimation (vega markout), instant hedging")
+    print(f"  {'scenario':>16} {'static':>10} {'oracle-markup':>14} {'adaptive':>10}")
+    for s in online_v["schedules"]:
+        print(f"  {s:>16} {online_v['totals'][(s, 'static')]:>+10.3f} "
+              f"{online_v['totals'][(s, 'oracle-markup')]:>+14.3f} "
+              f"{online_v['totals'][(s, 'adaptive')]:>+10.3f}")
+    print("  The vega markout detects vol-toxic flow (fills scored against the next")
+    print("  bars' realised variance) and prices a markup on the excess over its null")
+    print("  threshold. Honest asymmetry vs Experiment E: one book's vega markout is")
+    print("  chi-square noisy, so the adaptive desk recovers only part of the oracle's")
+    print("  edge when toxicity is stationary - but skips the oracle's clean-flow tax")
+    print("  and beats it when toxicity is time-varying. Detection is cheap; per-book")
+    print("  repricing is not.")
+
     res = _try_matplotlib()
     if res is None:
         print("\n[matplotlib not available - skipped figures; numeric tables above are the result]")
@@ -889,9 +1089,11 @@ def main():
         _plot_adverse_selection(adv_rows, spread_grid, params, plt, ps, outdir)
         _plot_vol_informed(vi_rows, defence_rows, plt, ps, outdir)
         _plot_online_toxicity(online, params, plt, ps, outdir)
+        _plot_online_vol_toxicity(online_v, params, plt, ps, outdir)
         print(f"\nFigures written to {outdir}/:")
         print("  hedging_validation.png, mm_pnl_vs_vol.png, sample_inventory_path.png,")
-        print("  adverse_selection.png, vol_informed_flow.png, online_toxicity.png")
+        print("  adverse_selection.png, vol_informed_flow.png, online_toxicity.png,")
+        print("  online_vol_toxicity.png")
 
 
 if __name__ == "__main__":

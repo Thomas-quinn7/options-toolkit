@@ -155,6 +155,45 @@ def test_band_fit_can_be_pushed_arbitrage_free():
     assert V.durrleman_g_from_w(k_grid, w, wp, wpp).min() >= -1e-9
 
 
+def test_ssvi_band_fit_recovers_and_is_arb_free():
+    """The global SSVI band fit must recover the true parameters from banded
+    quotes of every maturity and remain butterfly/calendar arbitrage-free."""
+    mats, ks, ivs, iv_bids, iv_asks, true, _ = V.synthetic_surface_bands(seed=1)
+    w_bids = [iv**2 * T for iv, T in zip(iv_bids, mats)]
+    w_asks = [iv**2 * T for iv, T in zip(iv_asks, mats)]
+    w_mids = [0.5 * (b + a) for b, a in zip(w_bids, w_asks)]
+    thetas = np.array([float(np.interp(0.0, k, w)) for k, w in zip(ks, w_mids)])
+    p = V.fit_ssvi_band(ks, w_bids, w_asks, thetas)
+
+    assert abs(p.rho - true.rho) < 0.15
+    assert abs(p.gamma - true.gamma) < 0.2
+    k_grid = np.linspace(-0.8, 0.6, 400)
+    assert V.min_butterfly_g_ssvi(thetas, p, k_grid) >= 0.0
+    assert V.calendar_min_gap(thetas, p, k_grid) >= 0.0
+
+
+def test_ssvi_band_fit_not_worse_than_mid_against_truth():
+    """Averaged over draws, the band-fitted global surface should be at least
+    as close to the TRUE surface as the mid-fitted one in total-variance RMSE."""
+    def true_rmse(p, mats, ks, true, atm_vol=0.20):
+        errs = []
+        for k, T in zip(ks, mats):
+            th = atm_vol**2 * T
+            errs.append(V.ssvi_w(k, th, p) - V.ssvi_w(k, th, true))
+        return float(np.sqrt(np.mean(np.concatenate(errs) ** 2)))
+
+    rmse_mid, rmse_band = [], []
+    for seed in range(5):
+        mats, ks, ivs, iv_bids, iv_asks, true, _ = V.synthetic_surface_bands(seed=seed)
+        w_bids = [iv**2 * T for iv, T in zip(iv_bids, mats)]
+        w_asks = [iv**2 * T for iv, T in zip(iv_asks, mats)]
+        w_mids = [0.5 * (b + a) for b, a in zip(w_bids, w_asks)]
+        thetas = np.array([float(np.interp(0.0, k, w)) for k, w in zip(ks, w_mids)])
+        rmse_mid.append(true_rmse(V.fit_ssvi(ks, w_mids, thetas), mats, ks, true))
+        rmse_band.append(true_rmse(V.fit_ssvi_band(ks, w_bids, w_asks, thetas), mats, ks, true))
+    assert np.mean(rmse_band) <= np.mean(rmse_mid) * 1.05
+
+
 def test_iv_from_price_roundtrip():
     S, K, T, r, sigma = 100.0, 105.0, 0.5, 0.02, 0.25
     price = V.bs_call(S, K, T, r, sigma)

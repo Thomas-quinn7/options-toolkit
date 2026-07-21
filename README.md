@@ -1,5 +1,7 @@
 # Options Toolkit
 
+![tests](https://github.com/Thomas-quinn7/options-toolkit/actions/workflows/tests.yml/badge.svg)
+
 A small set of options-analytics tools: Black-Scholes pricing with the full
 Greeks, a real-data implied-volatility skew scanner, an **arbitrage-free SVI/SSVI
 vol surface**, static no-arbitrage checks, and a delta-hedged options

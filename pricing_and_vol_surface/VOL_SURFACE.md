@@ -93,6 +93,35 @@ hedge** — by deliberately not chasing the wings. It is an honest trade: the
 equal-weighted wing fit gets worse; the numbers that matter get better.
 `tests/test_vol_surface.py` asserts the ATM improvement over repeated draws.
 
+## Bid-ask band calibration: the quote structure *is* the weighting
+
+The market does not hand you a price — it hands you an **interval**. Any curve
+passing inside `[bid, ask]` is consistent with the quotes, so
+`fit_svi_slice_band()` fits to the band itself: the residual is a hinge, zero
+anywhere inside the band and the distance to the nearer edge outside it,
+**normalised by the band's half-width** — escaping a tight ATM band by a tick
+is a large error; missing a wide illiquid wing band by the same tick barely
+registers. Inside the band the problem is under-determined, so a small pull
+toward the band centre acts as a tiebreak.
+
+This reaches the same destination as vega weighting with no weighting scheme
+at all — the quote structure carries the information:
+
+```
+ATM total-variance error : mid-fit=1.39e-03  band-fit=8.89e-04
+quotes whose band the fit misses: mid-fit=0%  band-fit=0%
+```
+
+![band fit](figures/band_fit.png)
+
+One subtlety the tests make explicit: quote noise can put a band entirely on
+the wrong side of value, so even the **true** smile misses some bands — that
+rate is the irreducible floor, and the band fit sits at it rather than at
+zero (`test_band_fit_respects_the_quotes`). Averaged over draws the band fit
+also beats the mid fit at ATM and across the liquid region, and with the
+butterfly penalty on, the band-fitted slice is pushed into the no-arbitrage
+region like any other slice (`test_band_fit_can_be_pushed_arbitrage_free`).
+
 ## Talking points
 
 * Total-variance space is the right coordinate system: no-arbitrage is a
@@ -109,5 +138,6 @@ equal-weighted wing fit gets worse; the numbers that matter get better.
   exactly. Per-slice SVI is more flexible but must be checked (and, if needed,
   constrained) slice by slice — both are provided.
 * No smoothing of the ATM term structure `theta(T)`; it is read from the quotes.
-* Calibration supports vega/liquidity weighting (above); a further step is to
-  fit to the full bid-ask band rather than a weighted mid.
+* Calibration supports vega/liquidity weighting and bid-ask band fitting
+  (above) per slice; wiring the band residual into the *global* SSVI fit is
+  the natural next step.

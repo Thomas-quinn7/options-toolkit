@@ -115,6 +115,35 @@ spread depends on how toxic the flow is. That is why market-makers widen in fast
 informed markets. `tests/test_mm.py` asserts both facts: the cost needs a hedge
 lag, and a wider spread survives more toxicity.
 
+## Vol-informed flow: the toxicity hedging can't fix (Experiment D)
+
+Directional toxicity is a *speed* problem — Experiment C shows instant hedging
+nearly eliminates it. Experiment D adds the kind it cannot fix: a
+`vol_toxicity` fraction of flow informed about the **vol regime** rather than
+the next move. Each Monte-Carlo path realises `sigma_impl ± vol_shock` with
+equal probability (fair on average, so any loss is pure adverse selection);
+vol-informed clients buy options on the paths that will realise high vol and
+sell options to the desk on the quiet ones.
+
+![vol-informed flow](figures/vol_informed_flow.png)
+
+Left panel — both desks hedge **instantly**. The direction-informed desk's vol
+residual stays ~0 at every toxicity (its total declines only because informed
+flow is one-sided volume). The vol-informed desk bleeds: it is systematically
+short gamma into storms and long gamma into calm, and no hedge frequency
+touches that — the informed side has selected which vol regime each side of
+the book rides. Speed fixes directional toxicity; nothing operational fixes
+vega toxicity.
+
+Right panel — the defence is **price, in the right currency**: a `vol_spread`
+quotes asks at `sigma_impl + vol_spread` and bids at `sigma_impl - vol_spread`,
+charging every option trade a vega edge (which collapses naturally as vega dies
+into expiry). The markup drives the vega adverse-selection residual toward zero
+— but it also widens the quote and kills volume, so against toxic flow the
+optimum is *interior* (a modest markup beats none), and against clean flow any
+markup is pure cost. There is no free defence; the markup is worth exactly as
+much as the flow is toxic. `tests/test_mm.py` asserts all three facts.
+
 ## Talking points
 
 * Delta-hedging removes direction and leaves a gamma / vega bet on realised vs
@@ -126,15 +155,20 @@ lag, and a wider spread survives more toxicity.
 * For a delta-hedged desk, directional adverse selection is a *hedge-latency*
   cost: hedge instantly and it nearly vanishes, hedge with a lag and informed
   flow picks you off in the unhedged window.
+* Vol-informed (vega-toxic) flow is different in kind: it selects which vol
+  regime each side of the book rides, which no hedging policy can undo. The
+  only defences are price (a vol-space markup) or flow discrimination — and
+  the markup has an interior optimum because it trades vega edge against
+  volume.
 
 ## Limitations and next steps
 
 * One option, constant implied vol, Gaussian GBM — no vol surface, no jumps, no
   stochastic vol, so no vanna/volga or skew dynamics.
-* Toxic flow here is *directional* (informed about the next move), whose cost to
-  a delta-hedged desk runs through hedge latency (Experiment C). A further
-  extension is *vol*-informed flow - traders who buy options precisely when
-  realised vol will exceed implied - which bites the gamma book directly.
+* Toxicity is modelled two ways - directional (Experiment C) and vol-informed
+  (Experiment D) - but the informed fraction is exogenous and constant. A
+  further extension is estimating it *online* from the desk's own fill stream
+  and adapting the spread/markup in response.
 * Hedging is calendar-based; a band / cost-aware hedging policy would trade off
   hedge error against transaction cost.
 * Pricing is a vectorised closed-form BS for Monte-Carlo speed; the repo's

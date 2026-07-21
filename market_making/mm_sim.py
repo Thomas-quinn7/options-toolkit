@@ -122,8 +122,14 @@ class MMParams:
     max_inventory: int = 25         # hard cap on |inventory|
 
     # adverse selection
-    toxicity: float = 0.0           # fraction of flow that is informed (0..1)
+    toxicity: float = 0.0           # fraction of flow informed about DIRECTION (0..1)
+    vol_toxicity: float = 0.0       # fraction of flow informed about the VOL REGIME (0..1)
     hedge_lag: int = 0              # 0 = hedge before the move; 1 = hedge after it
+
+    # quoting defence against vol-informed flow: half-spread in VOL space.
+    # Asks are priced at sigma_impl + vol_spread, bids at sigma_impl - vol_spread,
+    # so the quote automatically charges more vega edge where vega is high.
+    vol_spread: float = 0.0
 
     # hedging
     tc_underlying: float = 0.0      # per-share hedge cost as fraction of notional
@@ -139,15 +145,23 @@ def simulate_paths(
     quoting: bool = True,
     init_position: int = 0,
 ):
-    """Vectorised Monte-Carlo over ``n_sims`` paths for one realised vol.
+    """Vectorised Monte-Carlo over ``n_sims`` paths.
+
+    ``sigma_real`` may be a scalar (one realised vol for all paths) or an array
+    of shape (n_sims,) giving each path its own realised vol - the latter is
+    what makes vol-informed ("vega-toxic") flow expressible: informed clients
+    can condition on which vol regime their path is in.
 
     Returns a dict of per-path arrays (shape (n_sims,)) plus a couple of
     representative time series for plotting a single path.
     """
     p = params
+    if p.toxicity + p.vol_toxicity > 1.0:
+        raise ValueError("toxicity + vol_toxicity must be <= 1 (they partition the flow)")
     m = p.contract_multiplier
     dt = p.T / p.n_steps
     sqrt_dt = np.sqrt(dt)
+    sigma_real = np.broadcast_to(np.asarray(sigma_real, dtype=float), (n_sims,))
 
     S = np.full(n_sims, p.S0, dtype=float)
     q_inv = np.full(n_sims, init_position, dtype=float)   # option inventory (contracts)
@@ -188,11 +202,20 @@ def simulate_paths(
         z = rng.standard_normal(n_sims)
 
         if quoting:
-            reservation = theo - p.skew_coef * q_inv
-            bid = reservation - p.half_spread
-            ask = reservation + p.half_spread
-            d_bid = theo - bid          # = half_spread + skew*inv
-            d_ask = ask - theo          # = half_spread - skew*inv
+            # Optional vol-space half-spread: price the ask at a marked-up vol
+            # and the bid at a marked-down vol. Near expiry vega -> 0 and the
+            # vol spread collapses naturally, as it should.
+            if p.vol_spread > 0.0:
+                ask_base = bs_price(S, p.K, tau, p.r, p.sigma_impl + p.vol_spread, p.q, p.otype)
+                bid_base = bs_price(S, p.K, tau, p.r, max(p.sigma_impl - p.vol_spread, 1e-4),
+                                    p.q, p.otype)
+            else:
+                ask_base = bid_base = theo
+            skew_shift = p.skew_coef * q_inv
+            bid = bid_base - skew_shift - p.half_spread
+            ask = ask_base - skew_shift + p.half_spread
+            d_bid = theo - bid          # distance from fair (drives fill intensity)
+            d_ask = ask - theo
 
             lam_bid = A_bid * np.exp(-p.k * d_bid)
             lam_ask = A_ask * np.exp(-p.k * d_ask)
@@ -200,17 +223,26 @@ def simulate_paths(
             prob_ask = np.clip(1.0 - np.exp(-lam_ask * dt), 0.0, 1.0)
 
             tox = p.toxicity
+            vtox = p.vol_toxicity
             # Uninformed flow: direction independent of the coming move.
-            u_bid = rng.random(n_sims) < (1.0 - tox) * prob_bid
-            u_ask = rng.random(n_sims) < (1.0 - tox) * prob_ask
-            # Informed flow: buys (lifts our ask) when the underlying is about to
-            # rise, sells (hits our bid) when it is about to fall.
+            u_bid = rng.random(n_sims) < (1.0 - tox - vtox) * prob_bid
+            u_ask = rng.random(n_sims) < (1.0 - tox - vtox) * prob_ask
+            # Direction-informed flow: buys (lifts our ask) when the underlying
+            # is about to rise, sells (hits our bid) when it is about to fall.
             up = z > 0.0
             i_ask = up & (rng.random(n_sims) < tox * prob_ask)
             i_bid = (~up) & (rng.random(n_sims) < tox * prob_bid)
+            # Vol-informed flow: an option is long vega on either side, so vol
+            # buyers lift our ask on paths whose realised vol will exceed the
+            # implied they pay, and sell options to us on low-vol paths.
+            # Delta-hedging cannot neutralise this - it selects which vol
+            # regime each side of our book rides.
+            hi_vol = sigma_real > p.sigma_impl
+            v_ask = hi_vol & (rng.random(n_sims) < vtox * prob_ask)
+            v_bid = (~hi_vol) & (rng.random(n_sims) < vtox * prob_bid)
 
-            fill_bid = u_bid | i_bid    # we BUY 1 @ bid
-            fill_ask = u_ask | i_ask    # we SELL 1 @ ask
+            fill_bid = u_bid | i_bid | v_bid    # we BUY 1 @ bid
+            fill_ask = u_ask | i_ask | v_ask    # we SELL 1 @ ask
             fill_bid &= q_inv < p.max_inventory
             fill_ask &= q_inv > -p.max_inventory
 
@@ -378,6 +410,82 @@ def experiment_toxic_spread(base: MMParams, toxicities, half_spreads, n_sims, se
 
 
 # --------------------------------------------------------------------------- #
+# Experiment D - vol-informed (vega-toxic) flow: unhedgeable, must be priced   #
+# --------------------------------------------------------------------------- #
+def _regime_vols(base: MMParams, vol_shock: float, n_sims: int, seed: int):
+    """Per-path realised vols: sigma_impl +/- vol_shock with p=1/2 each.
+
+    Symmetric around implied, so a desk facing only uninformed flow has no
+    systematic vol edge or cost - any loss under vol-informed flow is pure
+    adverse selection, not a mispriced mark.
+    """
+    rng = np.random.default_rng(seed)
+    hi = rng.random(n_sims) < 0.5
+    return np.where(hi, base.sigma_impl + vol_shock, base.sigma_impl - vol_shock)
+
+
+def experiment_vol_informed_flow(base: MMParams, toxicities, vol_shock=0.06,
+                                 n_sims=4000, seed=4):
+    """Directional vs vol-informed toxicity under INSTANT hedging (lag 0).
+
+    Realised vol per path is sigma_impl +/- vol_shock with equal probability.
+    Hedging before the move neutralises direction-informed flow, so its cost
+    stays ~0 at any toxicity. Vol-informed flow is different in kind: the
+    informed side buys our ask exactly on the paths whose realised vol will
+    exceed implied and sells to us on the quiet paths, so the desk is
+    systematically short gamma into storms and long gamma into calm. No hedge
+    frequency fixes that - it is a vega bet selected against us, and the only
+    defences are price (spread / vol markup) or flow discrimination.
+    """
+    rows = []
+    for tox in toxicities:
+        sig_paths = _regime_vols(base, vol_shock, n_sims, seed)
+        r_dir = simulate_paths(replace(base, toxicity=tox, vol_toxicity=0.0, hedge_lag=0),
+                               sig_paths, n_sims, np.random.default_rng(seed + 1), quoting=True)
+        r_vol = simulate_paths(replace(base, toxicity=0.0, vol_toxicity=tox, hedge_lag=0),
+                               sig_paths, n_sims, np.random.default_rng(seed + 1), quoting=True)
+        rows.append({
+            "toxicity": tox,
+            "dir_total": _summ(r_dir["total_pnl"])[0],
+            "dir_resid": _summ(r_dir["vol_hedge_pnl"])[0],
+            "vol_total": _summ(r_vol["total_pnl"])[0],
+            "vol_spreadcap": _summ(r_vol["spread_capture"])[0],
+            "vol_resid": _summ(r_vol["vol_hedge_pnl"])[0],   # ~ vega adverse selection
+        })
+    return rows
+
+
+def experiment_vol_spread_defence(base: MMParams, vol_spreads, tox=0.5,
+                                  vol_shock=0.06, n_sims=4000, seed=5):
+    """Does quoting a half-spread in VOL space defend against vol-informed flow?
+
+    The vega markup charges the informed flow in its own currency, so the
+    vega-adverse-selection residual shrinks toward zero as it widens - but a
+    wider quote also kills volume (Avellaneda-Stoikov intensity decays in
+    quote distance), so under toxic flow the optimum markup is interior, and
+    under clean flow any markup is pure cost. Each row therefore also reports
+    the same desk facing purely uninformed flow (``clean_total``): the markup
+    is a *defence*, priced only when the flow warrants it, not a free lunch.
+    """
+    rows = []
+    for vs in vol_spreads:
+        sig_paths = _regime_vols(base, vol_shock, n_sims, seed)
+        r = simulate_paths(replace(base, vol_toxicity=tox, hedge_lag=0, vol_spread=vs),
+                           sig_paths, n_sims, np.random.default_rng(seed + 1), quoting=True)
+        rc = simulate_paths(replace(base, vol_toxicity=0.0, hedge_lag=0, vol_spread=vs),
+                            sig_paths, n_sims, np.random.default_rng(seed + 1), quoting=True)
+        rows.append({
+            "vol_spread": vs,
+            "total": _summ(r["total_pnl"])[0],
+            "spreadcap": _summ(r["spread_capture"])[0],
+            "resid": _summ(r["vol_hedge_pnl"])[0],
+            "clean_total": _summ(rc["total_pnl"])[0],
+            "avg_fills": float(r["fills"].mean()),
+        })
+    return rows
+
+
+# --------------------------------------------------------------------------- #
 # Plotting (guarded - matplotlib optional) and CLI                            #
 # --------------------------------------------------------------------------- #
 def _try_matplotlib():
@@ -486,6 +594,46 @@ def _plot_adverse_selection(adv_rows, spread_grid, params, plt, outdir):
     plt.close(fig)
 
 
+def _plot_vol_informed(vi_rows, defence_rows, plt, outdir):
+    tox = [r["toxicity"] for r in vi_rows]
+    dir_tot = np.array([r["dir_total"] for r in vi_rows])
+    vol_tot = np.array([r["vol_total"] for r in vi_rows])
+
+    fig, (axA, axB) = plt.subplots(1, 2, figsize=(13, 5))
+
+    # Panel A: with instant hedging, direction-informed flow costs ~nothing;
+    # vol-informed flow still bleeds - the unhedgeable kind of toxicity.
+    axA.plot(tox, dir_tot, "-o", color="C2", label="direction-informed flow (hedged instantly)")
+    axA.plot(tox, vol_tot, "-o", color="C3", label="vol-informed flow (hedged instantly)")
+    axA.fill_between(tox, dir_tot, vol_tot, color="C3", alpha=0.15,
+                     label="unhedgeable vega adverse selection")
+    axA.axhline(0, color="k", lw=0.6)
+    axA.set_xlabel("informed fraction of flow")
+    axA.set_ylabel("mean total P&L per option")
+    axA.set_title("Instant hedging kills directional toxicity;\nvol toxicity survives it")
+    axA.legend(fontsize=8)
+
+    # Panel B: the defence is priced in vol space - it removes the vega loss
+    # (residual -> 0) but costs volume, so it only pays against toxic flow.
+    vs = [r["vol_spread"] for r in defence_rows]
+    axB.plot(vs, [r["total"] for r in defence_rows], "-o", color="C0",
+             label="total P&L (vol-toxic flow)")
+    axB.plot(vs, [r["clean_total"] for r in defence_rows], "-o", color="C2", ms=4,
+             label="total P&L (uninformed flow)")
+    axB.plot(vs, [r["resid"] for r in defence_rows], "--o", color="C3", ms=4,
+             label="vega adverse-selection residual")
+    axB.axhline(0, color="k", lw=0.6)
+    axB.set_xlabel("quoted half-spread in vol space")
+    axB.set_ylabel("mean P&L per option")
+    axB.set_title("The vol markup removes the vega loss but costs volume:\n"
+                  "an interior optimum against toxic flow, pure cost against clean")
+    axB.legend(fontsize=8)
+
+    fig.tight_layout()
+    fig.savefig(f"{outdir}/vol_informed_flow.png", dpi=130)
+    plt.close(fig)
+
+
 def _print_table(title, rows, cols, fmts):
     print(f"\n{title}")
     print("  " + "".join(f"{c:>16}" for c in cols))
@@ -535,6 +683,30 @@ def main():
     print("  negative as informed flow rises. lag0 (instant hedge) avoids it.")
     spread_grid = experiment_toxic_spread(adv_base, tox_grid, [0.10, 0.15, 0.25], n_sims, seed=3)
 
+    # Experiment D - vol-informed (vega-toxic) flow
+    vi_rows = experiment_vol_informed_flow(adv_base, tox_grid, vol_shock=0.06,
+                                           n_sims=n_sims, seed=4)
+    _print_table(
+        "Experiment D - vol-informed flow vs direction-informed flow (both hedged INSTANTLY)",
+        vi_rows, ["toxicity", "dir_total", "vol_total", "vol_spreadcap", "vol_resid"],
+        {"toxicity": lambda x: f"{x:.2f}", "dir_total": lambda x: f"{x:+.3f}",
+         "vol_total": lambda x: f"{x:+.3f}", "vol_spreadcap": lambda x: f"{x:+.3f}",
+         "vol_resid": lambda x: f"{x:+.3f}"})
+    print("  Instant hedging neutralises direction-informed flow (dir_total ~ flat) but")
+    print("  NOT vol-informed flow: vol_resid goes negative as vega-toxic flow selects")
+    print("  which vol regime each side of the book rides. The defence is price, not speed:")
+    defence_rows = experiment_vol_spread_defence(adv_base, [0.0, 0.002, 0.005, 0.01, 0.02],
+                                                 tox=0.5, vol_shock=0.06,
+                                                 n_sims=n_sims, seed=5)
+    _print_table(
+        "Experiment D2 - defending with a vol-space half-spread (vol toxicity = 0.5)",
+        defence_rows, ["vol_spread", "total", "clean_total", "resid", "avg_fills"],
+        {"vol_spread": lambda x: f"{x:.3f}", "total": lambda x: f"{x:+.3f}",
+         "clean_total": lambda x: f"{x:+.3f}", "resid": lambda x: f"{x:+.3f}",
+         "avg_fills": lambda x: f"{x:.1f}"})
+    print("  The markup shrinks the vega loss (resid -> 0) but costs volume: against")
+    print("  toxic flow the optimum is interior; against clean flow it is pure cost.")
+
     plt = _try_matplotlib()
     if plt is None:
         print("\n[matplotlib not available - skipped figures; numeric tables above are the result]")
@@ -542,9 +714,10 @@ def main():
         _plot_validation(val, params, plt, outdir)
         _plot_sweep(sweep, params, plt, outdir)
         _plot_adverse_selection(adv_rows, spread_grid, params, plt, outdir)
+        _plot_vol_informed(vi_rows, defence_rows, plt, outdir)
         print(f"\nFigures written to {outdir}/:")
         print("  hedging_validation.png, mm_pnl_vs_vol.png, sample_inventory_path.png,")
-        print("  adverse_selection.png")
+        print("  adverse_selection.png, vol_informed_flow.png")
 
 
 if __name__ == "__main__":

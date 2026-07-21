@@ -26,8 +26,10 @@ where that pricing breaks down.
   arbitrage (total variance rising with maturity). Demonstrates that a naive
   spline through noisy quotes admits butterfly arbitrage that SSVI removes.
   Supports **vega/liquidity-weighted calibration** so noisy illiquid wings don't
-  drag the fit off the reliable ATM quotes. Builds surfaces from prices via its
-  own Brent IV inverter, not yfinance's IV
+  drag the fit off the reliable ATM quotes, and **bid-ask band calibration**
+  (`fit_svi_slice_band`) that fits the quoted interval instead of a point mid —
+  the quote structure itself does the weighting. Builds surfaces from prices via
+  its own Brent IV inverter, not yfinance's IV
   field. See `pricing_and_vol_surface/VOL_SURFACE.md` for the write-up and
   figures. `Skew_surface_example.png` shows the older single-snapshot
   `skew_surface()` plot, kept for contrast.
@@ -71,9 +73,13 @@ decomposes P&L into **spread capture** vs **vol / hedging P&L**. It shows that a
 net-short desk's total P&L falls as realised vol rises above the implied vol it
 quoted — the spread has to pay for the vol risk of the inventory taken on. The
 hedging engine is validated against the closed-form Black-Scholes gamma-P&L
-identity. It also models **adverse selection / toxic flow**: informed flow costs
-a delta-hedged desk through hedge latency, and a wider quoted spread buys
-tolerance to it. See `market_making/README.md` for the write-up and figures.
+identity. It also models **adverse selection / toxic flow** in both kinds:
+*directional* informed flow costs a delta-hedged desk through hedge latency
+(so speed fixes it), while **vol-informed (vega-toxic) flow** — clients who buy
+options precisely on the paths that will realise high vol — survives instant
+hedging entirely and must be priced via a vol-space markup, which has an
+interior optimum because it trades vega edge against volume. See
+`market_making/README.md` for the write-up and figures.
 
 ```bash
 python market_making/mm_sim.py          # prints tables, writes figures/
@@ -101,8 +107,10 @@ pip install -r requirements.txt
   teaching/diagnostic tool, not a live signal.
 
 ## Planned
-- Vol-informed (not just directional) toxic flow in the market-making simulator.
-- Fitting the vol surface to the full bid-ask band rather than a weighted mid.
+- Online toxicity estimation in the market-making simulator: infer the informed
+  fraction from the desk's own fill stream and adapt the spread/markup.
+- Wiring the bid-ask band residual into the global SSVI fit (it is per-slice
+  today).
 
 ## Note
 Research and learning code - not investment advice. Data is pulled live from

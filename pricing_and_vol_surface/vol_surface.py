@@ -316,9 +316,113 @@ def heteroskedastic_slice(seed=0, T=0.5, n=25, atm_vol=0.20):
     iv_true = np.sqrt(w_true / T)
     sd = 0.003 + 0.05 * np.abs(k)     # per-quote IV error grows into the wings
     iv_obs = iv_true + rng.normal(0.0, sd)
-    spread_iv = 2.0 * sd              # bid-ask (in vol) wider in the wings
+    # Bid-ask (in vol), wider in the wings. Half-spread = 2*sd so the true
+    # smile lies inside the quoted band ~95% of the time - as in a real
+    # market, where the mid wanders inside the spread but the spread brackets
+    # value. (Only the RATIO of spreads matters to vega_spread_weights, which
+    # normalises to mean 1, so this scale does not affect the weighted fit.)
+    spread_iv = 4.0 * sd
     return {"k": k, "T": T, "theta": theta, "w_true": w_true, "iv_true": iv_true,
             "iv_obs": iv_obs, "spread_iv": spread_iv}
+
+
+def fit_svi_slice_band(k, w_bid, w_ask, weights=None,
+                       butterfly_penalty: float = 0.0,
+                       mid_pull: float = 1e-2) -> SVIParams:
+    """Fit a raw-SVI slice to the full bid-ask BAND rather than a point mid.
+
+    The market does not give you a price, it gives you an interval: any curve
+    passing inside [w_bid, w_ask] is consistent with the quotes. The residual
+    is therefore a hinge - zero anywhere inside the band, the distance to the
+    nearer edge outside it - normalised by the band's half-width, so escaping
+    a tight ATM band by a tick is a large error while missing a wide illiquid
+    wing band by the same tick barely registers. That is the whole point: no
+    weighting scheme is needed because the quote structure itself carries the
+    information.
+
+    Inside the band the problem is under-determined, so a small ``mid_pull``
+    times the (band-normalised) mid-distance acts as a tiebreak toward the
+    band centre (and keeps the least-squares gradient alive).
+    ``butterfly_penalty`` > 0 pushes the fit into the no-arbitrage region
+    exactly as in ``fit_svi_slice``.
+    """
+    k = np.asarray(k, dtype=float)
+    w_bid = np.asarray(w_bid, dtype=float)
+    w_ask = np.asarray(w_ask, dtype=float)
+    w_mid = 0.5 * (w_bid + w_ask)
+    half_width = np.maximum(0.5 * (w_ask - w_bid), 1e-12)
+    weights = np.ones_like(k) if weights is None else np.asarray(weights, dtype=float)
+    k_grid = np.linspace(k.min() - 0.1, k.max() + 0.1, 120)
+
+    def resid(theta):
+        p = SVIParams(*theta)
+        w_fit = svi_w(k, p)
+        below = np.maximum(w_bid - w_fit, 0.0)   # fit fell out below the bid
+        above = np.maximum(w_fit - w_ask, 0.0)   # fit escaped above the ask
+        r = weights * ((below + above) + mid_pull * (w_fit - w_mid)) / half_width
+        if butterfly_penalty > 0:
+            g = _min_durrleman_g_svi(p, k_grid)
+            if g < 0:
+                r = np.append(r, butterfly_penalty * (-g))
+        return r
+
+    # Warm-start from the plain mid fit so the band fit refines rather than
+    # searches from scratch.
+    p0 = fit_svi_slice(k, w_mid, weights=weights)
+    x0 = [p0.a, p0.b, p0.rho, p0.m, p0.sigma]
+    lb = [1e-8, 1e-8, -0.999, -2.0, 1e-4]
+    ub = [np.inf, np.inf, 0.999, 2.0, 5.0]
+    x0 = np.clip(x0, lb, ub)
+    sol = least_squares(resid, x0, bounds=(lb, ub), max_nfev=5000)
+    return SVIParams(*sol.x)
+
+
+def band_violation_fraction(k, w_bid, w_ask, p: SVIParams, tol: float = 1e-9) -> float:
+    """Fraction of quotes whose band the fitted slice does NOT pass through."""
+    w_fit = svi_w(np.asarray(k, dtype=float), p)
+    outside = (w_fit < np.asarray(w_bid) - tol) | (w_fit > np.asarray(w_ask) + tol)
+    return float(np.mean(outside))
+
+
+def fit_band_vs_mid(slice_data):
+    """Fit one noisy slice to the bid-ask band vs to the (unweighted) mid.
+
+    The wings are wide and noisy, the ATM quotes tight - so the mid fit gets
+    dragged by wing noise it should never have trusted, while the band fit is
+    only loosely constrained there and spends its freedom passing through the
+    tight ATM bands. Same goal as vega weighting, achieved with no weights:
+    the quote structure is the weighting.
+    """
+    s = slice_data
+    T = s["T"]
+    iv_bid = np.maximum(s["iv_obs"] - 0.5 * s["spread_iv"], 1e-4)
+    iv_ask = s["iv_obs"] + 0.5 * s["spread_iv"]
+    w_bid = iv_bid**2 * T
+    w_ask = iv_ask**2 * T
+    w_mid_obs = s["iv_obs"] ** 2 * T
+
+    p_mid = fit_svi_slice(s["k"], w_mid_obs)
+    p_band = fit_svi_slice_band(s["k"], w_bid, w_ask)
+
+    liq = np.abs(s["k"]) <= 0.2
+
+    def rms(x):
+        return float(np.sqrt(np.mean(x**2)))
+
+    return {
+        "p_mid": p_mid, "p_band": p_band,
+        "w_bid": w_bid, "w_ask": w_ask,
+        "atm_err_mid": abs(float(svi_w(0.0, p_mid)) - s["theta"]),
+        "atm_err_band": abs(float(svi_w(0.0, p_band)) - s["theta"]),
+        "liq_rms_mid": rms(svi_w(s["k"][liq], p_mid) - s["w_true"][liq]),
+        "liq_rms_band": rms(svi_w(s["k"][liq], p_band) - s["w_true"][liq]),
+        "viol_mid": band_violation_fraction(s["k"], w_bid, w_ask, p_mid),
+        "viol_band": band_violation_fraction(s["k"], w_bid, w_ask, p_band),
+        # The irreducible rate: bands the TRUE smile itself does not pass
+        # through (quote noise can put a band entirely on the wrong side of
+        # value). No fit can beat this; the band fit should approach it.
+        "viol_true": float(np.mean((s["w_true"] < w_bid) | (s["w_true"] > w_ask))),
+    }
 
 
 def fit_weighted_vs_unweighted(slice_data):
@@ -421,6 +525,15 @@ def main():
     print("    weighting nails the liquid/high-vega region (where you price and hedge)")
     print("    by not chasing the noisy wings.")
 
+    # Bid-ask band calibration: the quote structure IS the weighting
+    bcal = fit_band_vs_mid(sl)
+    print("\n  Bid-ask band calibration (fit to the interval, not a point mid):")
+    print(f"    ATM total-variance error : mid-fit={bcal['atm_err_mid']:.2e}  band-fit={bcal['atm_err_band']:.2e}")
+    print(f"    liquid-region |k|<=0.2   : mid-fit={bcal['liq_rms_mid']:.2e}  band-fit={bcal['liq_rms_band']:.2e}")
+    print(f"    quotes whose band the fit misses: mid-fit={bcal['viol_mid']:.0%}  band-fit={bcal['viol_band']:.0%}")
+    print("    a wide wing quote constrains the band fit only loosely; the tight ATM")
+    print("    bands pin it - the same lesson as vega weighting, with no weights needed.")
+
     plt = _try_plt()
     if plt is None:
         print("\n[matplotlib not available - numeric results above are the proof]")
@@ -477,8 +590,27 @@ def main():
     ax.legend(fontsize=8)
     fig.tight_layout(); fig.savefig(f"{outdir}/weighted_calibration.png", dpi=130); plt.close(fig)
 
+    # Figure 5: band fit vs mid fit
+    fig, ax = plt.subplots(figsize=(7.5, 5))
+    iv_bid = np.sqrt(bcal["w_bid"] / sl["T"])
+    iv_ask = np.sqrt(bcal["w_ask"] / sl["T"])
+    ax.vlines(sl["k"], iv_bid, iv_ask, color="grey", lw=3, alpha=0.5,
+              label="bid-ask band (per quote)")
+    ax.plot(kk2, np.sqrt(ssvi_w(kk2, sl["theta"], SSVIParams(-0.4, 1.0, 0.4)) / sl["T"]),
+            "k-", lw=1.5, label="true smile")
+    ax.plot(kk2, np.sqrt(svi_w(kk2, bcal["p_mid"]) / sl["T"]), "--", color="C0",
+            label="fit to point mid")
+    ax.plot(kk2, np.sqrt(svi_w(kk2, bcal["p_band"]) / sl["T"]), "-", color="C2",
+            label="fit to bid-ask band")
+    ax.axvspan(-0.2, 0.2, color="green", alpha=0.07, label="liquid region")
+    ax.set_xlabel("log-moneyness k"); ax.set_ylabel("implied vol")
+    ax.set_title("Band calibration: the quote structure is the weighting")
+    ax.legend(fontsize=8)
+    fig.tight_layout(); fig.savefig(f"{outdir}/band_fit.png", dpi=130); plt.close(fig)
+
     print(f"\nFigures written to {os.path.normpath(outdir)}/:")
-    print("  ssvi_surface.png, slice_fit.png, density_check.png, weighted_calibration.png")
+    print("  ssvi_surface.png, slice_fit.png, density_check.png, weighted_calibration.png,")
+    print("  band_fit.png")
 
 
 if __name__ == "__main__":

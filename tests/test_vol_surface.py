@@ -115,6 +115,46 @@ def test_weighted_calibration_improves_atm_accuracy():
     assert np.mean(atm_w) < np.mean(atm_u)
 
 
+def test_band_fit_respects_the_quotes():
+    """Quote noise can put a band entirely on the wrong side of value, so even
+    the TRUE smile misses some bands - that rate is the irreducible floor. The
+    band fit must sit at that floor (and not above the mid fit)."""
+    viol_mid, viol_band, viol_true = [], [], []
+    for seed in range(10):
+        res = V.fit_band_vs_mid(V.heteroskedastic_slice(seed=seed))
+        viol_mid.append(res["viol_mid"])
+        viol_band.append(res["viol_band"])
+        viol_true.append(res["viol_true"])
+    assert np.mean(viol_band) <= np.mean(viol_true) + 0.02  # at the achievable floor
+    assert np.mean(viol_band) <= np.mean(viol_mid)
+
+
+def test_band_fit_improves_liquid_region_accuracy():
+    """Averaged over draws, fitting the band beats fitting the point mid where
+    it matters - ATM and the liquid region - with no weighting scheme at all."""
+    atm_mid, atm_band, liq_mid, liq_band = [], [], [], []
+    for seed in range(10):
+        res = V.fit_band_vs_mid(V.heteroskedastic_slice(seed=seed))
+        atm_mid.append(res["atm_err_mid"])
+        atm_band.append(res["atm_err_band"])
+        liq_mid.append(res["liq_rms_mid"])
+        liq_band.append(res["liq_rms_band"])
+    assert np.mean(atm_band) < np.mean(atm_mid)
+    assert np.mean(liq_band) < np.mean(liq_mid)
+
+
+def test_band_fit_can_be_pushed_arbitrage_free():
+    """With the butterfly penalty on, the band-fitted slice has g >= 0."""
+    s = V.heteroskedastic_slice(seed=3)
+    T = s["T"]
+    w_bid = np.maximum(s["iv_obs"] - 0.5 * s["spread_iv"], 1e-4) ** 2 * T
+    w_ask = (s["iv_obs"] + 0.5 * s["spread_iv"]) ** 2 * T
+    p = V.fit_svi_slice_band(s["k"], w_bid, w_ask, butterfly_penalty=10.0)
+    k_grid = np.linspace(s["k"].min() - 0.1, s["k"].max() + 0.1, 300)
+    w, wp, wpp = V.svi_derivatives(k_grid, p)
+    assert V.durrleman_g_from_w(k_grid, w, wp, wpp).min() >= -1e-9
+
+
 def test_iv_from_price_roundtrip():
     S, K, T, r, sigma = 100.0, 105.0, 0.5, 0.02, 0.25
     price = V.bs_call(S, K, T, r, sigma)

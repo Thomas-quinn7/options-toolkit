@@ -24,6 +24,9 @@ from mm_sim import (  # noqa: E402
     experiment_hedging_validation,
     experiment_mm_vol_sweep,
     experiment_toxic_spread,
+    experiment_vol_informed_flow,
+    experiment_vol_spread_defence,
+    simulate_paths,
 )
 
 
@@ -119,6 +122,60 @@ def test_wider_spread_survives_toxic_flow():
     base = MMParams(flow_imbalance=0.0)
     grid = experiment_toxic_spread(base, [0.6], [0.10, 0.25], n_sims=3000, seed=3)
     assert grid[0.25][0] > grid[0.10][0]
+
+
+# --------------------------------------------------------------------------- #
+# Vol-informed (vega-toxic) flow                                              #
+# --------------------------------------------------------------------------- #
+def test_per_path_sigma_preserves_hedging_identity():
+    """The gamma-P&L identity must hold path-by-path with per-path realised vols."""
+    params = MMParams(n_steps=126)
+    rng = np.random.default_rng(11)
+    sig = np.where(rng.random(3000) < 0.5, 0.26, 0.14)
+    res = simulate_paths(params, sig, 3000, rng, quoting=False, init_position=-1)
+    err = abs(res["total_pnl"].mean() - res["vol_theory"].mean())
+    se = res["total_pnl"].std(ddof=1) / np.sqrt(len(res["total_pnl"]))
+    assert err < 6 * se + 1e-3
+
+
+def test_vol_informed_flow_survives_instant_hedging():
+    """Instant hedging neutralises direction-informed flow (residual ~ 0 at any
+    toxicity - its total falls only because informed flow is one-sided volume)
+    but NOT vol-informed flow, whose loss lands in the vol/hedging residual."""
+    base = MMParams(flow_imbalance=0.0)
+    rows = experiment_vol_informed_flow(base, [0.0, 0.6], vol_shock=0.06,
+                                        n_sims=3000, seed=4)
+    clean, toxic = rows[0], rows[1]
+    # direction-informed flow, hedged instantly: no systematic vol residual
+    assert abs(clean["dir_resid"]) < 0.3
+    assert abs(toxic["dir_resid"]) < 0.3
+    # vol-informed flow: a large negative residual instant hedging cannot remove
+    assert toxic["vol_resid"] < -1.5
+    # at the same toxicity (same one-sided volume geometry), the vega-toxic desk
+    # does materially worse than the direction-toxic one
+    assert toxic["vol_total"] < toxic["dir_total"] - 1.5
+
+
+def test_vol_spread_defends_against_vega_toxicity():
+    """The vol-space markup charges informed flow in its own currency: it
+    shrinks the vega adverse-selection residual, an interior markup beats no
+    defence under toxic flow, and the same markup is pure cost on clean flow."""
+    base = MMParams(flow_imbalance=0.0)
+    rows = experiment_vol_spread_defence(base, [0.0, 0.005, 0.02], tox=0.5,
+                                         vol_shock=0.06, n_sims=3000, seed=5)
+    none, small, wide = rows
+    # the residual (the vega loss itself) shrinks as the markup widens
+    assert wide["resid"] > none["resid"] + 1.0
+    # under toxic flow, a small markup beats quoting none
+    assert small["total"] > none["total"]
+    # under clean flow the markup only costs volume - no free lunch
+    assert small["clean_total"] < none["clean_total"]
+
+
+def test_flow_fractions_validated():
+    with pytest.raises(ValueError):
+        simulate_paths(MMParams(toxicity=0.7, vol_toxicity=0.6), 0.2, 10,
+                       np.random.default_rng(0))
 
 
 # --------------------------------------------------------------------------- #

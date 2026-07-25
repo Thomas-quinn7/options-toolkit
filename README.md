@@ -93,13 +93,60 @@ fixed policies when toxicity switches regime, and a vega-space markout (fills
 scored against the next bars' realised variance, marked up only above a
 calibrated null threshold) detects vol-informed flow — cleanly, though one
 book's vega markout is noisy enough that per-book repricing recovers only part
-of the oracle markup's edge, the honest asymmetry between the two kinds. See
-`market_making/README.md` for the write-up and figures. Charts across the repo
-share one colorblind-validated style (`plotstyle.py`).
+of the oracle markup's edge, the honest asymmetry between the two kinds.
+`glft.py` adds a **GLFT quoting engine** (Gueant-Lehalle-Fernandez-Tapia, the
+tractable successor to Avellaneda-Stoikov): the exact finite-horizon solution
+via the linearised HJB's matrix exponential, the exact stationary quotes from
+its ground eigenvector, and the closed-form constant-spread-plus-linear-skew
+approximation desks actually implement — cross-checked against each other in
+tests. With `quote_policy="glft"` the simulator *derives* its spread and skew
+from the fill model instead of hand-picking them, and Experiment G measures
+what that buys under uncertain realised vol (inventory control is worth ~4 CE
+points over none; risk aversion is the only free dial). Experiment H then
+breaks the assumption every one of these models shares: fills arriving
+**independently**. A volume-matched Hawkes mechanism makes flow self-excite
+into same-side clusters (the realism gap the option-MM literature itself
+flags — Baldacci 2020 §4.1.1), inventory excursions and P&L dispersion grow
+with clustering, and the desk ranking **flips**: the hand-tuned quotes win in
+the arena they were tuned for and lose to the derived conservative quotes
+when the independence assumption fails. See `market_making/README.md` for the
+write-up and figures. Charts across the repo share one colorblind-validated
+style (`plotstyle.py`).
 
 ```bash
 python market_making/mm_sim.py          # prints tables, writes figures/
-python -m pytest tests/test_mm.py -q    # validates the hedging engine
+python market_making/glft.py            # GLFT quote table + convergence figure
+python -m pytest tests/test_mm.py tests/test_glft.py -q
+```
+
+### `vol_snapshots/`
+Free data has no history, so `capture.py` builds the missing dataset one day
+at a time: a one-command (or scheduled) capture of full option chains —
+bid/ask **intervals** for the band calibration, spot, T-bill rate, volume/OI —
+for a default list of liquid names, written as tidy `csv.gz` per ticker per
+day, idempotent per day. This is the raw material for everything the vol
+surface work wants next (eSSVI parameter dynamics, sticky-strike vs
+sticky-delta, term-structure signals), none of which can be studied without a
+time series that only accumulates if capture starts now. Schema and IO are
+covered offline by `tests/test_snapshots.py`; see `vol_snapshots/README.md`.
+
+```bash
+python vol_snapshots/capture.py         # capture today's chains (default list)
+```
+
+## Testing
+
+Alongside the per-module test files, `tests/test_properties.py` runs
+**property-based tests** (hypothesis): put-call parity, price bounds and
+monotonicities, IV round-trips, SVI derivative-vs-finite-difference checks,
+and the Gatheral-Jacquier no-arbitrage guarantees — parameters satisfying the
+sufficient butterfly conditions must produce a non-negative Durrleman density,
+sampled all the way up to the conditions' boundary, plus the power-law
+`eta (1+|rho|) <= 2` bound under which the surface must also be
+calendar-free. The whole suite is offline:
+
+```bash
+python -m pytest tests/ -q
 ```
 
 ## Setup

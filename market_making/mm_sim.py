@@ -37,7 +37,10 @@ from dataclasses import dataclass, field, replace
 from typing import Optional
 
 import numpy as np
+from scipy.special import logsumexp
 from scipy.stats import norm
+
+from glft import glft_spread_skew
 
 
 # --------------------------------------------------------------------------- #
@@ -121,6 +124,32 @@ class MMParams:
     k: float = 8.0                  # intensity decay per unit quote distance
     flow_imbalance: float = 0.0     # >0 => clients net buyers (lift our ask)
     max_inventory: int = 25         # hard cap on |inventory|
+
+    # quote policy: "static" uses the hand-picked half_spread/skew_coef above;
+    # "glft" derives both from the Gueant-Lehalle-Fernandez-Tapia closed-form
+    # optimum for THIS simulator's own fill model lambda = A exp(-k d) (see
+    # glft.py): half_spread = c0 + c1/2 and skew = c1, with the option mapped
+    # to the GLFT asset through its instantaneous dollar vol |delta|*sigma*S.
+    # That mapping prices the risk of raw (unhedged) option inventory - a
+    # delta-hedged desk carries less - so gamma_risk is the honest knob; the
+    # point is that spread and skew stop being free parameters.
+    quote_policy: str = "static"
+    gamma_risk: float = 0.1         # CARA risk aversion for the GLFT policy (1/$)
+
+    # clustered (self-exciting) client flow. The academic option-MM models this
+    # simulator descends from treat fills as independently thinned point
+    # processes - no fill makes another more likely - a realism gap the
+    # literature itself acknowledges (Baldacci, arXiv:2012.10875, sec 4.1.1).
+    # Real client flow clusters on a side (herding, order splitting), which is
+    # exactly what hurts an inventory-warehousing desk. Here each fill adds a
+    # Hawkes-style boost to its OWN side's intensity that decays at
+    # hawkes_decay per year; hawkes_branching is the expected number of
+    # follow-on FILLS a fill triggers (children counted at the desk's base
+    # quote). The base intensity is scaled by (1 - branching) so the desk's
+    # long-run AVERAGE volume matches the independent-flow desk - clustering
+    # changes the timing of the same flow, not its amount.
+    hawkes_branching: float = 0.0   # in [0, 1): 0 = independent flow (Poisson)
+    hawkes_decay: float = 60.0      # excitement decay rate (/year): ~3-day half-life
 
     # adverse selection
     toxicity: float = 0.0           # fraction of flow informed about DIRECTION (0..1)
@@ -207,6 +236,14 @@ def simulate_paths(
     for sched in (p.toxicity_schedule, p.vol_toxicity_schedule):
         if sched is not None and len(sched) != p.n_steps:
             raise ValueError("toxicity schedules must have length n_steps")
+    if p.quote_policy not in ("static", "glft"):
+        raise ValueError("quote_policy must be 'static' or 'glft'")
+    if p.quote_policy == "glft" and p.gamma_risk <= 0:
+        raise ValueError("gamma_risk must be positive for the GLFT policy")
+    if not 0.0 <= p.hawkes_branching < 1.0:
+        raise ValueError("hawkes_branching must be in [0, 1)")
+    if p.hawkes_decay <= 0:
+        raise ValueError("hawkes_decay must be positive")
     m = p.contract_multiplier
     dt = p.T / p.n_steps
     sqrt_dt = np.sqrt(dt)
@@ -237,13 +274,41 @@ def simulate_paths(
         cash -= (H_target - H) * S + p.tc_underlying * np.abs(H_target - H) * S
         H = H_target
 
-    A_ask = p.A * (1.0 + p.flow_imbalance)   # client buys lift our ask
-    A_bid = p.A * (1.0 - p.flow_imbalance)
+    # Clustered flow setup. hawkes_branching n is the expected number of
+    # follow-on FILLS each fill triggers on its own side, with children
+    # counted at the desk's base quote - so the intensity kick per fill is
+    # pre-inflated by exp(+k*hs0) to undo the quote-distance thinning children
+    # face, and the stationary fill rate inflates by exactly 1/(1-n). Scaling
+    # the base intensity by (1-n) keeps the desk's long-run average volume
+    # equal to the independent-flow desk's: clustering changes the timing of
+    # the same flow, not its amount (skew/adaptive width shifts are second
+    # order; the experiment tables report realised fills to keep this honest).
+    n_h = p.hawkes_branching
+    if n_h > 0.0:
+        if p.quote_policy == "glft":
+            delta0 = float(bs_delta(p.S0, p.K, p.T, p.r, p.sigma_impl, p.q, p.otype))
+            hs0, _ = glft_spread_skew(abs(delta0) * p.sigma_impl * p.S0,
+                                      p.A, p.k, p.gamma_risk)
+            hs0 = float(hs0)
+        else:
+            hs0 = p.half_spread
+        excite_jump = n_h * p.hawkes_decay * np.exp(p.k * hs0)
+    else:
+        excite_jump = 0.0
+    base_scale = 1.0 - n_h
+    A_ask = p.A * (1.0 + p.flow_imbalance) * base_scale   # client buys lift our ask
+    A_bid = p.A * (1.0 - p.flow_imbalance) * base_scale
+    E_bid = np.zeros(n_sims)                # Hawkes excitement state, per path
+    E_ask = np.zeros(n_sims)
+    hawkes_fade = np.exp(-p.hawkes_decay * dt)
 
     inv_track = np.zeros(p.n_steps + 1)      # mean inventory across paths, per step
+    abs_inv_track = np.zeros(p.n_steps + 1)  # mean |inventory| across paths, per step
     S_track = np.zeros(p.n_steps + 1)        # one sample path of the underlying
     inv_sample = np.zeros(p.n_steps + 1)     # inventory of that same sample path
+    q_absmax = np.abs(q_inv)                 # per-path peak |inventory|
     inv_track[0] = q_inv.mean()
+    abs_inv_track[0] = np.abs(q_inv).mean()
     S_track[0] = S[0]
     inv_sample[0] = q_inv[0]
 
@@ -313,17 +378,30 @@ def simulate_paths(
             # Online toxicity estimate (causal: uses fills/moves up to t-1).
             tox_hat = _tox_hat_from_state()
             tox_hat_track[t] = float(tox_hat.mean())
-            half_spread = p.half_spread + (p.spread_slope * tox_hat
-                                           if p.adaptive_spread else 0.0)
+            if p.quote_policy == "glft":
+                # Optimal (spread, skew) for this step's fill model, from the
+                # GLFT closed form. The option's instantaneous dollar vol
+                # |delta|*sigma*S feeds the formula per path, so the skew
+                # tightens as the option's own risk decays (e.g. going OTM
+                # into expiry). A is the symmetric base intensity: the desk
+                # does not know the client imbalance, that's the stress.
+                delta_now = bs_delta(S, p.K, tau, p.r, p.sigma_impl, p.q, p.otype)
+                sigma_opt = np.abs(delta_now) * p.sigma_impl * S
+                base_half, skew_unit_v = glft_spread_skew(sigma_opt, p.A, p.k,
+                                                          p.gamma_risk)
+            else:
+                base_half, skew_unit_v = p.half_spread, p.skew_coef
+            half_spread = base_half + (p.spread_slope * tox_hat
+                                       if p.adaptive_spread else 0.0)
 
-            skew_shift = p.skew_coef * q_inv
+            skew_shift = skew_unit_v * q_inv
             bid = bid_base - skew_shift - half_spread
             ask = ask_base - skew_shift + half_spread
             d_bid = theo - bid          # distance from fair (drives fill intensity)
             d_ask = ask - theo
 
-            lam_bid = A_bid * np.exp(-p.k * d_bid)
-            lam_ask = A_ask * np.exp(-p.k * d_ask)
+            lam_bid = (A_bid + E_bid) * np.exp(-p.k * d_bid)
+            lam_ask = (A_ask + E_ask) * np.exp(-p.k * d_ask)
             prob_bid = np.clip(1.0 - np.exp(-lam_bid * dt), 0.0, 1.0)
             prob_ask = np.clip(1.0 - np.exp(-lam_ask * dt), 0.0, 1.0)
 
@@ -360,6 +438,13 @@ def simulate_paths(
             cash += fill_ask * ask * m
             spread_capture += fill_ask * (ask - theo) * m
             fills += fill_bid + fill_ask
+
+            # Clustered flow: an executed fill excites more flow on its own
+            # side from the NEXT step on (causal). Blocked quotes (inventory
+            # cap) excite nothing - no trade happened.
+            if n_h > 0.0:
+                E_bid = E_bid * hawkes_fade + excite_jump * fill_bid
+                E_ask = E_ask * hawkes_fade + excite_jump * fill_ask
 
         # Hedge BEFORE the move (delta-neutral into it) unless a hedge lag is set,
         # in which case newly-acquired inventory rides the move unhedged - the
@@ -419,7 +504,9 @@ def simulate_paths(
             cash -= dH * S + p.tc_underlying * np.abs(dH) * S
             H = H_target
 
+        q_absmax = np.maximum(q_absmax, np.abs(q_inv))
         inv_track[t + 1] = q_inv.mean()
+        abs_inv_track[t + 1] = np.abs(q_inv).mean()
         S_track[t + 1] = S[0]
         inv_sample[t + 1] = q_inv[0]
 
@@ -441,7 +528,9 @@ def simulate_paths(
         "vol_theory": vol_theory,
         "fills": fills,
         "final_inventory": q_inv,
+        "max_abs_inventory": q_absmax,
         "inv_track": inv_track,
+        "abs_inv_track": abs_inv_track,
         "S_track": S_track,
         "inv_sample": inv_sample,
         "var_gap": var_gap,
@@ -734,6 +823,106 @@ def experiment_online_vol_toxicity(base: MMParams, vtox_hi=0.6, vol_shock=0.06,
 
 
 # --------------------------------------------------------------------------- #
+# Experiment G - GLFT optimal quoting vs hand-tuned quoting                    #
+# --------------------------------------------------------------------------- #
+def certainty_equivalent(pnl: np.ndarray, gamma: float) -> float:
+    """CARA certainty equivalent -(1/gamma) ln E[exp(-gamma PnL)].
+
+    This is the objective GLFT optimises, estimated directly from the P&L
+    sample (via logsumexp for stability). It is mean P&L penalised by the
+    whole right tail of losses - the yardstick under which "same mean, less
+    variance" is genuinely worth paying spread width for.
+    """
+    pnl = np.asarray(pnl, dtype=float)
+    return -(logsumexp(-gamma * pnl) - np.log(pnl.size)) / gamma
+
+
+def experiment_glft_quoting(base: MMParams, gammas=(0.02, 0.1, 0.2),
+                            vol_shock=0.06, n_sims=4000, seed=8, gamma_ref=0.1):
+    """Does deriving (spread, skew) from GLFT beat picking them by hand?
+
+    The arena matters. At realised == implied with instant hedging, carried
+    inventory is nearly FREE (zero-mean vol P&L, small hedge noise), and the
+    optimal play is to skew little and collect volume - inventory control has
+    nothing to pay for. For a delta-hedged options desk, inventory risk IS vol
+    uncertainty: here each path realises sigma_impl +/- vol_shock with equal
+    probability (fair on average, as in Experiment D), so whatever net book
+    the one-sided client flow forces on the desk is a genuine vega bet. The
+    desks differ only in quoting policy: a no-skew desk (fixed spread, no
+    inventory control), the repo's hand-tuned desk, and GLFT desks across risk
+    aversions. Judged on mean P&L, P&L dispersion, and the CARA certainty
+    equivalent at one reference gamma - the criterion GLFT actually optimises,
+    applied evenly to every desk.
+    """
+    desks = {"no skew": dict(skew_coef=0.0),
+             "hand-tuned": {}}
+    for g in gammas:
+        desks[f"GLFT g={g}"] = dict(quote_policy="glft", gamma_risk=g)
+    rows = []
+    tracks = {}
+    sig_paths = _regime_vols(base, vol_shock, n_sims, seed)
+    for name, kw in desks.items():
+        r = simulate_paths(replace(base, **kw), sig_paths, n_sims,
+                           np.random.default_rng(seed + 1), quoting=True)
+        pnl = r["total_pnl"]
+        m, se = _summ(pnl)
+        rows.append({"desk": name, "mean": m, "se": se,
+                     "std": float(pnl.std(ddof=1)),
+                     "ce": certainty_equivalent(pnl, gamma_ref),
+                     "abs_inv": float(np.abs(r["final_inventory"]).mean()),
+                     "avg_fills": float(r["fills"].mean())})
+        tracks[name] = r["abs_inv_track"]
+    return {"rows": rows, "tracks": tracks, "gamma_ref": gamma_ref}
+
+
+# --------------------------------------------------------------------------- #
+# Experiment H - clustered (self-exciting) flow vs the independence assumption #
+# --------------------------------------------------------------------------- #
+def experiment_hawkes_clustering(base: MMParams, branchings=(0.0, 0.3, 0.6, 0.8),
+                                 vol_shock=0.06, n_sims=4000, seed=10,
+                                 gamma_ref=0.1):
+    """What does the standard independent-fills assumption hide?
+
+    Every desk here faces symmetric, uninformed, volume-matched flow with
+    uncertain realised vol - the only thing swept is HOW the same flow
+    arrives: independently (branching 0, the assumption in Avellaneda-Stoikov,
+    GLFT and the option-MM literature) or in self-exciting same-side clusters
+    (a fill breeds more fills on its side, ~3-day excitement half-life).
+    Clustering makes one-sided runs endogenous: the book gets pushed further,
+    stays displaced longer, and the inventory-risk term every quoting model
+    prices from sigma alone is understated. Both a hand-tuned desk and a GLFT
+    desk run the sweep. Two things to watch in the output: realised fills FALL
+    with clustering even though the flow is volume-matched at the base quote -
+    the skew actively extinguishes one-sided runs, so part of the clustering
+    cost is paid in volume (the defence) and part in inventory risk (what
+    leaks through) - and the CE ranking between the desks flips as clustering
+    rises: the hand-tuned point was tuned under independence, the derived
+    conservative quotes are what survive the assumption failing.
+    """
+    desks = {"hand-tuned": {},
+             "GLFT g=0.1": dict(quote_policy="glft", gamma_risk=0.1)}
+    rows = []
+    sig_paths = _regime_vols(base, vol_shock, n_sims, seed)
+    for n_h in branchings:
+        for dname, kw in desks.items():
+            p = replace(base, hawkes_branching=n_h, **kw)
+            r = simulate_paths(p, sig_paths, n_sims,
+                               np.random.default_rng(seed + 1), quoting=True)
+            pnl = r["total_pnl"]
+            rows.append({
+                "branching": n_h, "desk": dname,
+                "avg_fills": float(r["fills"].mean()),
+                "abs_inv": float(np.abs(r["final_inventory"]).mean()),
+                "peak_inv": float(r["max_abs_inventory"].mean()),
+                "std": float(pnl.std(ddof=1)),
+                "mean": _summ(pnl)[0],
+                "ce": certainty_equivalent(pnl, gamma_ref),
+            })
+    return {"rows": rows, "branchings": list(branchings),
+            "desks": list(desks), "gamma_ref": gamma_ref}
+
+
+# --------------------------------------------------------------------------- #
 # Plotting (guarded - matplotlib optional) and CLI                            #
 # --------------------------------------------------------------------------- #
 def _try_matplotlib():
@@ -977,6 +1166,68 @@ def _plot_online_vol_toxicity(online, params, plt, ps, outdir):
     plt.close(fig)
 
 
+def _plot_glft_quoting(glft_res, plt, ps, outdir):
+    fig, (axA, axB) = plt.subplots(1, 2, figsize=(13, 5))
+
+    # Panel A: mean |inventory| through time - the control loop each policy runs.
+    for i, (name, track) in enumerate(glft_res["tracks"].items()):
+        axA.plot(np.arange(len(track)), track, color=ps.series_color(i),
+                 lw=2, label=name)
+    axA.set_xlabel("quote/hedge step")
+    axA.set_ylabel("mean |inventory| (contracts)")
+    axA.set_title("One-sided flow fills the uncontrolled book;\n"
+                  "GLFT's derived skew holds it near flat")
+    axA.legend(fontsize=8)
+
+    # Panel B: mean P&L vs the CARA certainty equivalent per desk.
+    rows = glft_res["rows"]
+    names = [r["desk"] for r in rows]
+    x = np.arange(len(names))
+    width = 0.38
+    bars_m = axB.bar(x - width / 2, [r["mean"] for r in rows], width * 0.92,
+                     color=ps.series_color(0), label="mean P&L")
+    bars_c = axB.bar(x + width / 2, [r["ce"] for r in rows], width * 0.92,
+                     color=ps.series_color(1),
+                     label=f"certainty equivalent (g={glft_res['gamma_ref']})")
+    axB.bar_label(bars_m, fmt="%+.1f", fontsize=8, color=ps.INK_2, padding=2)
+    axB.bar_label(bars_c, fmt="%+.1f", fontsize=8, color=ps.INK_2, padding=2)
+    axB.axhline(0, color=ps.BASELINE, lw=0.8)
+    axB.set_xticks(x)
+    axB.set_xticklabels(names, fontsize=8)
+    axB.set_ylabel("$ per option book")
+    axB.set_title("Inventory control is worth ~4 CE points over none;\n"
+                  "one derived dial spans the whole mean-risk frontier")
+    axB.legend(fontsize=8)
+
+    fig.tight_layout()
+    fig.savefig(f"{outdir}/glft_vs_static.png", dpi=130)
+    plt.close(fig)
+
+
+def _plot_hawkes_clustering(hres, plt, ps, outdir):
+    fig, (axA, axB) = plt.subplots(1, 2, figsize=(13, 5))
+    ns = hres["branchings"]
+    for i, desk in enumerate(hres["desks"]):
+        rows = [r for r in hres["rows"] if r["desk"] == desk]
+        axA.plot(ns, [r["peak_inv"] for r in rows], "-o", color=ps.series_color(i),
+                 label=desk)
+        axB.plot(ns, [r["ce"] for r in rows], "-o", color=ps.series_color(i),
+                 label=desk)
+    axA.set_xlabel("flow branching (follow-on fills per fill)")
+    axA.set_ylabel("mean peak |inventory| (contracts)")
+    axA.set_title("Clustered flow pushes the book further than the\n"
+                  "independent-fills assumption predicts")
+    axA.legend(fontsize=8)
+    axB.set_xlabel("flow branching (follow-on fills per fill)")
+    axB.set_ylabel(f"certainty equivalent (g={hres['gamma_ref']})")
+    axB.set_title("The desk tuned under independence wins when it holds -\n"
+                  "and loses to the conservative derived quotes when it fails")
+    axB.legend(fontsize=8)
+    fig.tight_layout()
+    fig.savefig(f"{outdir}/hawkes_clustering.png", dpi=130)
+    plt.close(fig)
+
+
 def _print_table(title, rows, cols, fmts):
     print(f"\n{title}")
     print("  " + "".join(f"{c:>16}" for c in cols))
@@ -1079,6 +1330,43 @@ def main():
     print("  and beats it when toxicity is time-varying. Detection is cheap; per-book")
     print("  repricing is not.")
 
+    # Experiment G - GLFT-derived quotes vs hand-tuned quotes
+    glft_res = experiment_glft_quoting(MMParams(flow_imbalance=0.30),
+                                       n_sims=n_sims, seed=8)
+    _print_table(
+        "Experiment G - GLFT quoting vs hand-tuned (one-sided flow, uncertain realised vol)",
+        glft_res["rows"], ["desk", "mean", "std", "ce", "abs_inv", "avg_fills"],
+        {"desk": lambda x: x, "mean": lambda x: f"{x:+.3f}",
+         "std": lambda x: f"{x:.3f}", "ce": lambda x: f"{x:+.3f}",
+         "abs_inv": lambda x: f"{x:.2f}", "avg_fills": lambda x: f"{x:.1f}"})
+    print("  Spread and skew here are not knobs: they are the GLFT closed-form optimum")
+    print("  for this simulator's own fill model (see glft.py). Realised vol is")
+    print("  uncertain (+/- shock, fair on average), so the net book one-sided flow")
+    print("  builds is a live vega bet: any inventory control is worth several CE")
+    print("  points over none, and gamma traces the whole mean-risk frontier from one")
+    print("  interpretable dial. The hand-tuned desk stays competitive on CE for a")
+    print("  documented reason: the |delta|*sigma*S mapping prices UNHEDGED option")
+    print("  inventory, so GLFT over-skews a delta-hedged book - its quotes sit on")
+    print("  the conservative side of the frontier (visibly lower P&L dispersion).")
+
+    # Experiment H - clustered (self-exciting) flow
+    hres = experiment_hawkes_clustering(MMParams(flow_imbalance=0.0),
+                                        n_sims=n_sims, seed=10)
+    _print_table(
+        "Experiment H - clustered flow vs the independent-fills assumption (symmetric flow, uncertain vol)",
+        hres["rows"], ["branching", "desk", "avg_fills", "abs_inv", "peak_inv", "std", "ce"],
+        {"branching": lambda x: f"{x:.1f}", "desk": lambda x: x,
+         "avg_fills": lambda x: f"{x:.1f}", "abs_inv": lambda x: f"{x:.2f}",
+         "peak_inv": lambda x: f"{x:.2f}", "std": lambda x: f"{x:.3f}",
+         "ce": lambda x: f"{x:+.3f}"})
+    print("  Same average flow, arriving in self-exciting same-side clusters instead of")
+    print("  independently (the assumption in A-S/GLFT and the option-MM literature,")
+    print("  a gap that literature itself flags - Baldacci 2020, sec 4.1.1). Peak")
+    print("  inventory and P&L dispersion grow with clustering; realised volume falls")
+    print("  because the skew actively extinguishes one-sided runs. And the CE ranking")
+    print("  FLIPS: hand-tuned wins under independence (what it was tuned for), the")
+    print("  more conservative derived quotes win when the assumption fails.")
+
     res = _try_matplotlib()
     if res is None:
         print("\n[matplotlib not available - skipped figures; numeric tables above are the result]")
@@ -1090,10 +1378,12 @@ def main():
         _plot_vol_informed(vi_rows, defence_rows, plt, ps, outdir)
         _plot_online_toxicity(online, params, plt, ps, outdir)
         _plot_online_vol_toxicity(online_v, params, plt, ps, outdir)
+        _plot_glft_quoting(glft_res, plt, ps, outdir)
+        _plot_hawkes_clustering(hres, plt, ps, outdir)
         print(f"\nFigures written to {outdir}/:")
         print("  hedging_validation.png, mm_pnl_vs_vol.png, sample_inventory_path.png,")
         print("  adverse_selection.png, vol_informed_flow.png, online_toxicity.png,")
-        print("  online_vol_toxicity.png")
+        print("  online_vol_toxicity.png, glft_vs_static.png, hawkes_clustering.png")
 
 
 if __name__ == "__main__":

@@ -117,10 +117,13 @@ pip install -r requirements.txt
 - **`IV_skew.py`'s skew/inversion thresholds are unvalidated heuristics** (the
   IVs themselves now come from the repo's own price inverter). A delta-target
   config exists but is not yet wired in.
-- **The arbitrage checks apply European relationships** (parity, box) to American
-  yfinance options with **no dividend term**, so flagged trades can be spurious;
-  realised edge is typically small relative to transaction costs. This is a
-  teaching/diagnostic tool, not a live signal.
+- **The arbitrage scanner runs on delayed yfinance quotes.** Parity is now the
+  American no-arbitrage band on executable (bid/ask-crossed) prices with a
+  trailing-dividend term, so mid-price and dividend false positives are gone —
+  but quotes can still be stale between the spot snapshot and each chain fetch,
+  the reversal leg ignores stock-borrow cost, and the box/butterfly checks keep
+  their European settlement logic. The scanner's live false-positive rate has
+  never been measured. This is a teaching/diagnostic tool, not a live signal.
 
 ## Planned
 - Pooling toxicity markouts across books/instruments in the MM simulator —

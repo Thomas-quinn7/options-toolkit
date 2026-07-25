@@ -544,7 +544,7 @@ def _try_plt():
 def main():
     import os
 
-    outdir = os.path.join(os.path.dirname(__file__), "figures")
+    outdir = os.path.join(os.path.dirname(__file__), "..", "charts", "vol_surface")
     os.makedirs(outdir, exist_ok=True)
 
     mats, ks, ivs, true, thetas = synthetic_surface()

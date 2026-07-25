@@ -1237,7 +1237,7 @@ def _print_table(title, rows, cols, fmts):
 
 def main():
     import os
-    outdir = os.path.join(os.path.dirname(__file__), "figures")
+    outdir = os.path.join(os.path.dirname(__file__), "..", "charts", "market_making")
     os.makedirs(outdir, exist_ok=True)
 
     params = MMParams(flow_imbalance=0.30)

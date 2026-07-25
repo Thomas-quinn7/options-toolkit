@@ -38,7 +38,7 @@ where that pricing breaks down.
   `skew_surface()` plot, kept for contrast.
 
 ```bash
-python pricing_and_vol_surface/vol_surface.py    # fit, prove arb-free, write figures/
+python pricing_and_vol_surface/vol_surface.py    # fit, prove arb-free, write charts/vol_surface/
 python -m pytest tests/test_vol_surface.py -q
 ```
 
@@ -114,7 +114,7 @@ write-up and figures. Charts across the repo share one colorblind-validated
 style (`plotstyle.py`).
 
 ```bash
-python market_making/mm_sim.py          # prints tables, writes figures/
+python market_making/mm_sim.py          # prints tables, writes charts/market_making/
 python market_making/glft.py            # GLFT quote table + convergence figure
 python -m pytest tests/test_mm.py tests/test_glft.py -q
 ```
@@ -133,6 +133,11 @@ covered offline by `tests/test_snapshots.py`; see `vol_snapshots/README.md`.
 ```bash
 python vol_snapshots/capture.py         # capture today's chains (default list)
 ```
+
+### `charts/`
+Every generated figure lands here (`charts/market_making/`,
+`charts/vol_surface/`), and [`charts/README.md`](charts/README.md) is a
+one-page gallery of all of them with links back to each write-up.
 
 ## Testing
 

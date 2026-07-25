@@ -6,7 +6,7 @@ just interpolates a single snapshot of market IVs and can imply negative
 probabilities or a total variance that falls with maturity.
 
 ```bash
-python pricing_and_vol_surface/vol_surface.py     # fit, prove, write figures/
+python pricing_and_vol_surface/vol_surface.py     # fit, prove, write charts/vol_surface/
 python -m pytest tests/test_vol_surface.py -q      # the checks, as tests
 ```
 
@@ -56,14 +56,14 @@ No-arbitrage checks on the fitted SSVI surface:
   calendar : min d(total var)/dT gap = +0.0052   -> PASS
 ```
 
-![SSVI surface](figures/ssvi_surface.png)
+![SSVI surface](../charts/vol_surface/ssvi_surface.png)
 
 **The failure it prevents.** Interpolating the noisy quotes directly with a cubic
 spline — a very common shortcut — chases the quote noise and drives `g(k)`
 negative across the smile: a butterfly arbitrage. The fitted SSVI surface removes
 it. This is the "where pricing breaks down" story made concrete:
 
-![density check](figures/density_check.png)
+![density check](../charts/vol_surface/density_check.png)
 
 The blue SSVI density proxy stays above zero everywhere; the orange spline dips
 into the red arbitrage region repeatedly. `tests/test_vol_surface.py` asserts
@@ -86,7 +86,7 @@ ATM total-variance error : unweighted=1.39e-03  weighted=8.61e-04
 liquid-region |k|<=0.2   : unweighted=1.02e-03  weighted=9.63e-04
 ```
 
-![weighted calibration](figures/weighted_calibration.png)
+![weighted calibration](../charts/vol_surface/weighted_calibration.png)
 
 Weighting nails the liquid, high-vega region — **where you actually price and
 hedge** — by deliberately not chasing the wings. It is an honest trade: the
@@ -112,7 +112,7 @@ ATM total-variance error : mid-fit=1.39e-03  band-fit=8.89e-04
 quotes whose band the fit misses: mid-fit=0%  band-fit=0%
 ```
 
-![band fit](figures/band_fit.png)
+![band fit](../charts/vol_surface/band_fit.png)
 
 One subtlety the tests make explicit: quote noise can put a band entirely on
 the wrong side of value, so even the **true** smile misses some bands — that

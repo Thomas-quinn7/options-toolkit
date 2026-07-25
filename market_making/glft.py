@@ -58,7 +58,7 @@ Honest caveats (state these, don't hide them)
   skew from A, k, sigma, gamma) is the point.
 
 Run ``python market_making/glft.py`` to print a quote table and write
-``figures/glft_quotes.png`` (exact finite-horizon quotes converging to the
+``charts/market_making/glft_quotes.png`` (exact finite-horizon quotes converging to the
 ergodic ones, and the closed form's accuracy against both).
 """
 
@@ -241,7 +241,7 @@ def value_function_expm(p: GLFTParams, tau: float) -> np.ndarray:
 # --------------------------------------------------------------------------- #
 def main():
     import os
-    outdir = os.path.join(os.path.dirname(__file__), "figures")
+    outdir = os.path.join(os.path.dirname(__file__), "..", "charts", "market_making")
     os.makedirs(outdir, exist_ok=True)
 
     # The simulator's own fill model, mapped to its ATM option: an ATM call at

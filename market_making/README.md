@@ -5,7 +5,7 @@ the two P&L engines a real options desk runs on and how they trade off against
 each other. Run it:
 
 ```bash
-python market_making/mm_sim.py          # prints the tables, writes figures/
+python market_making/mm_sim.py          # prints the tables, writes charts/market_making/
 python -m pytest tests/test_mm.py -q    # verifies the engine (see below)
 ```
 
@@ -65,7 +65,7 @@ Experiment A runs a static short option through the hedger and compares the
 simulated P&L to that integral. They match to Monte-Carlo error across the whole
 vol range, and the P&L crosses zero exactly at `sigma_real = sigma_impl`:
 
-![hedging validation](figures/hedging_validation.png)
+![hedging validation](../charts/market_making/hedging_validation.png)
 
 Left: simulated mean P&L (points) sits on the theoretical curve (line). Right:
 per path, simulated P&L tracks the analytic gamma-P&L along `y = x`, with the
@@ -78,7 +78,7 @@ than merely plausible. `tests/test_mm.py::test_hedging_identity` enforces it.
 The full market-maker — two-sided quoting, inventory skew, client buy-flow
 imbalance, delta-hedged — swept across realised vol:
 
-![MM P&L vs vol](figures/mm_pnl_vs_vol.png)
+![MM P&L vs vol](../charts/market_making/mm_pnl_vs_vol.png)
 
 * **Spread capture (green)** is flat — the desk earns its edge on volume
   regardless of where vol lands.
@@ -92,7 +92,7 @@ imbalance, delta-hedged — swept across realised vol:
 The lesson, and the reason a market-maker's spread is not arbitrary: **the
 spread has to be wide enough to pay for the vol risk of the inventory the flow
 forces onto the book.** A representative inventory path (net short, mean-reverted
-by the skew) is in `figures/sample_inventory_path.png`.
+by the skew) is in `../charts/market_making/sample_inventory_path.png`.
 
 ## Adverse selection / toxic flow (Experiment C)
 
@@ -100,7 +100,7 @@ Real flow is not uninformed. A `toxicity` parameter makes a fraction of orders
 **informed** - they lift the desk's offer just before the underlying rises and
 hit its bid just before it falls. Sweeping toxicity at realised = implied vol:
 
-![adverse selection](figures/adverse_selection.png)
+![adverse selection](../charts/market_making/adverse_selection.png)
 
 The result is subtle and correct. **Delta-hedging neutralises the *direction* of
 informed flow**, so if the desk could hedge instantaneously (green, hedge before
@@ -129,7 +129,7 @@ equal probability (fair on average, so any loss is pure adverse selection);
 vol-informed clients buy options on the paths that will realise high vol and
 sell options to the desk on the quiet ones.
 
-![vol-informed flow](figures/vol_informed_flow.png)
+![vol-informed flow](../charts/market_making/vol_informed_flow.png)
 
 Left panel — both desks hedge **instantly**. The direction-informed desk's vol
 residual stays ~0 at every toxicity (its total declines only because informed
@@ -161,7 +161,7 @@ its evidence weight so early noise cannot rectify into phantom toxicity).
 With `adaptive_spread` on, the desk widens its quote by `spread_slope *
 tox_hat` — using only information available at quote time.
 
-![online toxicity](figures/online_toxicity.png)
+![online toxicity](../charts/market_making/online_toxicity.png)
 
 Three desks (static, oracle-wide — permanently sized for the toxic regime —
 and adaptive) run through clean, toxic, and regime-switching flow, all with
@@ -206,7 +206,7 @@ Two structural points the experiment surfaces:
   enough to nearly match the oracle: acting on vega toxicity at scale needs
   pooling across books, which a single-option simulator cannot show.
 
-![online vol toxicity](figures/online_vol_toxicity.png)
+![online vol toxicity](../charts/market_making/online_vol_toxicity.png)
 
 `tests/test_mm.py` asserts the discrimination (both directions), the
 gamma-P&L identity under full vol paths, and the three desk-comparison facts.
@@ -234,10 +234,10 @@ delta_a(q) ~ c0 - (2q-1)/2 * c1        c1 = sqrt( sigma^2 gamma / (2kA) * (1+gam
 finite-horizon via eigendecomposition, exact stationary via the ground
 eigenvector, closed form) and `tests/test_glft.py` cross-checks them against
 each other and against the paper's literal matrix exponential;
-`figures/glft_quotes.png` shows the finite-horizon quotes converging to the
+`../charts/market_making/glft_quotes.png` shows the finite-horizon quotes converging to the
 stationary ones and the closed form's accuracy.
 
-![GLFT quotes](figures/glft_quotes.png)
+![GLFT quotes](../charts/market_making/glft_quotes.png)
 
 Experiment G runs the derived quotes against the hand-tuned ones under
 one-sided client flow with **uncertain realised vol** (`sigma_impl ±
@@ -247,7 +247,7 @@ instantaneous dollar vol `|delta| * sigma * S`, and desks are judged on the
 CARA certainty equivalent — the criterion GLFT actually optimises, applied
 evenly to every desk:
 
-![GLFT vs static](figures/glft_vs_static.png)
+![GLFT vs static](../charts/market_making/glft_vs_static.png)
 
 Three honest findings, all asserted in `tests/test_glft.py`:
 
@@ -288,7 +288,7 @@ the same flow, not its amount. Sweeping branching from 0 (the literature's
 assumption) to 0.8 for both a hand-tuned and a GLFT desk, under symmetric
 uninformed flow with uncertain realised vol:
 
-![Hawkes clustering](figures/hawkes_clustering.png)
+![Hawkes clustering](../charts/market_making/hawkes_clustering.png)
 
 * **Peak inventory and P&L dispersion grow steadily with clustering** —
   one-sided runs become endogenous, the book gets pushed further and stays

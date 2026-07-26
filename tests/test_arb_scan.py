@@ -174,5 +174,5 @@ def test_negative_cost_butterfly_still_flagged():
         opt(105, "call", 2.40, 2.50),
     ])
     # Cost = 7.00 - 2*5.00 + 2.50 = -0.50.
-    assert result is not None
-    assert result["estimated_profit"] == pytest.approx(0.50)
+    assert len(result) == 1
+    assert result[0]["estimated_profit"] == pytest.approx(0.50)

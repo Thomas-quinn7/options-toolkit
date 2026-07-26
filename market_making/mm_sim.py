@@ -523,7 +523,8 @@ def simulate_paths(
 
         # Hedge AFTER the move if a lag is configured (adverse-selection channel).
         if p.hedge_lag == 1:
-            delta_opt = bs_delta(S, p.K, tau, p.r, p.sigma_impl, p.q, p.otype)
+            # The move has resolved: time to expiry is now tau - dt, not tau.
+            delta_opt = bs_delta(S, p.K, tau - dt, p.r, p.sigma_impl, p.q, p.otype)
             H_target = -q_inv * delta_opt * m
             dH = H_target - H
             cash -= dH * S + p.tc_underlying * np.abs(dH) * S

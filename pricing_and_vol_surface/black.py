@@ -1,7 +1,14 @@
-from jax.scipy.stats import norm as jnorm
-import yfinance as yf
-import jax.numpy as jnp
-from jax import grad, jit, vmap
+import jax
+
+# Full float64 precision: without this JAX defaults to float32, which caps
+# implied-vol accuracy around 1e-4 (worse in low-vega wings) and adds ~1e-6
+# noise to prices - unacceptable for a pricing library, negligible cost here.
+jax.config.update("jax_enable_x64", True)
+
+from jax.scipy.stats import norm as jnorm  # noqa: E402
+import yfinance as yf  # noqa: E402
+import jax.numpy as jnp  # noqa: E402
+from jax import grad, jit, vmap  # noqa: E402
 import seaborn as sn
 from matplotlib import pyplot as plt
 from datetime import datetime, date
@@ -38,15 +45,6 @@ def black_scholes(S, K, T, r, sigma, q=0, otype="call"):
         return _black_scholes_put(S, K, T, r, sigma, q)
     else:
         raise ValueError("otype must be 'call' or 'put'")
-
-
-black_scholes_vectorized = vmap(black_scholes, in_axes=(0, 0, 0, 0, 0, 0, None))
-black_scholes_batch_strikes = vmap(
-    black_scholes, in_axes=(None, 0, None, None, None, None, None)
-)
-black_scholes_batch_volatilities = vmap(
-    black_scholes, in_axes=(None, None, None, None, 0, None, None)
-)
 
 
 def stock_data(stock):
@@ -190,13 +188,6 @@ def greeks(S, K, T, r, sigma, q=0, otype="call"):
     vega = _vega(S, K, T, r, sigma, q)
 
     return delta, gamma, theta, vega, rho
-
-
-greeks_vectorized = vmap(greeks, in_axes=(0, 0, 0, 0, 0, 0, None))
-greeks_batch_strikes = vmap(greeks, in_axes=(None, 0, None, None, None, None, None))
-greeks_batch_volatilities = vmap(
-    greeks, in_axes=(None, None, None, None, 0, None, None)
-)
 
 
 def price_heatmap(

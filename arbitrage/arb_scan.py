@@ -273,15 +273,17 @@ class ArbitrageDetector:
 
     def check_butterfly_arbitrage(self, options: List[Option],
                                   tolerance: float = 0.01,
-                                  spacing_tol: float = 0.01) -> Optional[Dict]:
+                                  spacing_tol: float = 0.01) -> List[Dict]:
         """Butterfly convexity: buy 1 low, sell 2 mid, buy 1 high must cost >= 0.
 
-        A negative entry cost is a free-money arbitrage. Tolerances default to the
-        strict (institutional) values; the retail path passes looser ones.
+        A negative entry cost is a free-money arbitrage. Every violating triple
+        is reported, not just the first found. Tolerances default to the strict
+        (institutional) values; the retail path passes looser ones.
         """
         options = sorted(options, key=lambda x: x.strike)
+        found: List[Dict] = []
         if len(options) < 3:
-            return None
+            return found
 
         for i in range(len(options) - 2):
             low, mid, high = options[i], options[i + 1], options[i + 2]
@@ -299,7 +301,7 @@ class ArbitrageDetector:
             cost = low.ask - 2 * mid.bid + high.ask
 
             if cost < -tolerance:
-                return {
+                found.append({
                     "type": "Butterfly Arbitrage (Negative Cost)",
                     "strikes": f"{low.strike}/{mid.strike}/{high.strike}",
                     "option_type": low.type,
@@ -308,9 +310,9 @@ class ArbitrageDetector:
                     "entry_cost": cost,
                     "estimated_profit": -cost,
                     "max_additional_profit": min(wing1, wing2),
-                }
+                })
 
-        return None
+        return found
 
     def check_calendar_spread(self, near: Option, far: Option,
                               tolerance: float = 0.01) -> Optional[Dict]:
@@ -338,16 +340,18 @@ class ArbitrageDetector:
 
     # ---------- retail checks (no short selling) ----------
 
-    def check_vertical_spread_arbitrage(self, options: List[Option]) -> Optional[Dict]:
+    def check_vertical_spread_arbitrage(self, options: List[Option]) -> List[Dict]:
         """Vertical monotonicity (no shorting needed).
 
         Calls: a lower strike must be worth more than a higher strike.
         Puts:  a higher strike must be worth more than a lower strike.
-        If the more valuable option can be BOUGHT below the other's bid, arbitrage.
+        If the more valuable option can be BOUGHT below the other's bid,
+        arbitrage. Every violating adjacent pair is reported.
         """
         options = sorted(options, key=lambda x: x.strike)
+        found: List[Dict] = []
         if len(options) < 2:
-            return None
+            return found
 
         for i in range(len(options) - 1):
             opt1, opt2 = options[i], options[i + 1]
@@ -357,7 +361,7 @@ class ArbitrageDetector:
 
             if opt1.type == "call":
                 if opt1.ask < opt2.bid - 0.02:
-                    return {
+                    found.append({
                         "type": "Vertical Spread Arbitrage (Call)",
                         "strikes": f"{opt1.strike}/{opt2.strike}",
                         "expiry": opt1.expiry,
@@ -366,10 +370,10 @@ class ArbitrageDetector:
                         "estimated_profit": opt2.bid - opt1.ask,
                         "capital_required": opt1.ask,
                         "risk": "Limited to premium paid",
-                    }
+                    })
             elif opt1.type == "put":
                 if opt2.ask < opt1.bid - 0.02:
-                    return {
+                    found.append({
                         "type": "Vertical Spread Arbitrage (Put)",
                         "strikes": f"{opt1.strike}/{opt2.strike}",
                         "expiry": opt1.expiry,
@@ -378,9 +382,9 @@ class ArbitrageDetector:
                         "estimated_profit": opt1.bid - opt2.ask,
                         "capital_required": opt2.ask,
                         "risk": "Limited to premium paid",
-                    }
+                    })
 
-        return None
+        return found
 
     def check_box_spread_retail(self, call_low: Option, put_low: Option,
                                 call_high: Option, put_high: Option) -> Optional[Dict]:
@@ -477,10 +481,8 @@ class ArbitrageDetector:
                             self.opportunities.append(result)
             else:
                 # Vertical monotonicity (calls and puts).
-                for result in (self.check_vertical_spread_arbitrage(calls),
-                               self.check_vertical_spread_arbitrage(puts)):
-                    if result:
-                        self.opportunities.append(result)
+                self.opportunities.extend(self.check_vertical_spread_arbitrage(calls))
+                self.opportunities.extend(self.check_vertical_spread_arbitrage(puts))
 
             # Box spreads (both modes, different admissible direction).
             for i, c1 in enumerate(calls):
@@ -505,9 +507,8 @@ class ArbitrageDetector:
                     calls, tolerance=0.05, spacing_tol=0.5)
                 bfly_puts = self.check_butterfly_arbitrage(
                     puts, tolerance=0.05, spacing_tol=0.5)
-            for result in (bfly_calls, bfly_puts):
-                if result:
-                    self.opportunities.append(result)
+            self.opportunities.extend(bfly_calls)
+            self.opportunities.extend(bfly_puts)
 
         # Calendar spreads across expiries.
         all_expiries = sorted(by_expiry.keys())

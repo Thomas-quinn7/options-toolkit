@@ -28,6 +28,11 @@ arbitrage (negative density) that the SSVI fit provably removes.
 from dragging the fit off the reliable ATM quotes.
 ![weighted calibration](vol_surface/weighted_calibration.png)
 
+**Surface history** — the SSVI band fit applied to each day's captured real
+chains (`python vol_snapshots/fit_history.py`): ATM vol, skew `rho` and term
+slope per ticker over time, arb-checked daily.
+![surface history](vol_surface/surface_history.png)
+
 **Band fit** — calibrating to the bid-ask interval instead of a point mid.
 ![band fit](vol_surface/band_fit.png)
 

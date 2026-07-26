@@ -132,8 +132,18 @@ sticky-delta, term-structure signals), none of which can be studied without a
 time series that only accumulates if capture starts now. Schema and IO are
 covered offline by `tests/test_snapshots.py`; see `vol_snapshots/README.md`.
 
+`fit_history.py` is the daily consumer: it fits the repo's **SSVI band
+surface** to every captured chain (forwards from put-call parity, IVs
+inverted from prices, no-arb diagnostics recorded per fit) and accumulates
+the fitted parameters — ATM vol, skew `rho`, term-structure slope — in
+`surface_history.csv`, charted at `charts/vol_surface/surface_history.png`.
+Raw chains live in a separate data repo (nested at `vol_snapshots/data/`) so
+the growing dataset never bloats this one; the pipeline is tested offline on
+a synthetic day from a known surface (`tests/test_fit_history.py`).
+
 ```bash
 python vol_snapshots/capture.py         # capture today's chains (default list)
+python vol_snapshots/fit_history.py     # fit surfaces, update the history
 ```
 
 ### `charts/`

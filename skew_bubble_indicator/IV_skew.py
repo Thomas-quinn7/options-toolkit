@@ -34,6 +34,7 @@ _REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _REPO not in sys.path:
     sys.path.insert(0, _REPO)
 
+from pricing_and_vol_surface.american import american_iv_vector  # noqa: E402
 from pricing_and_vol_surface.vol_surface import iv_from_price  # noqa: E402
 
 GLOBAL_INDICES = {
@@ -106,15 +107,12 @@ GLOBAL_INDICES = {
 }
 
 STRIKE_NEIGHBOR_COUNT = 3
-MAX_STRIKE_WINDOW_PCT = 10.0
-INITIAL_WINDOW_PCT = 2.0
+MAX_STRIKE_WINDOW_PCT = 15.0
+INITIAL_WINDOW_PCT = 3.0
 WINDOW_EXPANSION_FACTOR = 2.0
 
-OTM_PUT_DELTA_TARGET = 0.25 
-OTM_CALL_DELTA_TARGET = 0.25
-
-OTM_PUT_BAND = 0.90  
-OTM_CALL_BAND = 1.10 
+OTM_PUT_BAND = 0.90
+OTM_CALL_BAND = 1.10
 
 CRITICAL_INVERSION_THRESHOLD = 60
 WARNING_INVERSION_THRESHOLD = 40
@@ -151,26 +149,43 @@ def get_risk_free_rate() -> float:
 
 # ============== DATA VALIDATION FUNCTIONS ==============
 
+# Exercise style for the IV inversion. "european" (default) uses the fast
+# closed-form Brent inverter; "american" prices on a CRR binomial tree
+# (correct for the American single-name/ETF options yfinance serves, but
+# ~10-100x slower). For the short-dated OTM quotes this scanner consumes, the
+# early-exercise premium is ~1% of price - well inside typical bid-ask
+# spreads - which is why European remains the default
+# (tests/test_american.py quantifies this).
+IV_STYLE = "european"
+
+
 def add_own_iv(options_df: pd.DataFrame, spot: float, T: float, r: float,
                otype: str) -> pd.DataFrame:
     """Recompute implied vol from bid-ask mid prices with the repo's inverter.
 
     yfinance's ``impliedVolatility`` is preserved as ``yf_iv`` for diagnostics;
     the ``impliedVolatility`` column is OVERWRITTEN with the repo's own
-    Brent-inverted IV so every downstream consumer uses it. Quotes without a
-    usable two-sided market (bid<=0 or crossed) and mids outside the European
-    no-arbitrage price bounds invert to NaN and fall out in validation.
+    inverted IV so every downstream consumer uses it. Quotes without a usable
+    two-sided market (bid<=0 or crossed) and mids outside the no-arbitrage
+    price bounds invert to NaN and fall out in validation. ``IV_STYLE``
+    selects European (Brent closed-form) or American (CRR tree) inversion.
     """
     df = options_df.copy()
     df["yf_iv"] = df.get("impliedVolatility", np.nan)
     bid = df.get("bid", pd.Series(np.nan, index=df.index)).astype(float)
     ask = df.get("ask", pd.Series(np.nan, index=df.index)).astype(float)
-    usable = (bid > 0) & (ask >= bid)
+    usable = ((bid > 0) & (ask >= bid)).values
     mid = np.where(usable, 0.5 * (bid + ask), np.nan)
+    strikes = df["strike"].astype(float).values
     own = np.full(len(df), np.nan)
-    for i, (px, K) in enumerate(zip(mid, df["strike"].astype(float).values)):
-        if np.isfinite(px) and K > 0 and T > 0:
-            own[i] = iv_from_price(px, spot, K, T, r, otype=otype)
+    good = usable & np.isfinite(mid) & (strikes > 0) & (T > 0)
+    if IV_STYLE == "american":
+        if good.any():
+            own[good] = american_iv_vector(mid[good], spot, strikes[good], T, r,
+                                           otype=otype)
+    else:
+        for i in np.flatnonzero(good):
+            own[i] = iv_from_price(mid[i], spot, strikes[i], T, r, otype=otype)
     df["impliedVolatility"] = own
     return df
 
@@ -505,19 +520,8 @@ def compute_iv_skew_metric(ticker: str, expiry: str, chain: object, quality_metr
         
         otm_put_strike, otm_call_strike = get_otm_strike_targets(spot_price, chain)
         
-        mean_otm_put_iv = find_mean_iv_at_strike(
-            puts_df, 
-            otm_put_strike,
-            initial_window_pct=3.0, 
-            max_window_pct=15.0     
-        )
-        
-        mean_otm_call_iv = find_mean_iv_at_strike(
-            calls_df, 
-            otm_call_strike,
-            initial_window_pct=3.0,
-            max_window_pct=15.0
-        )
+        mean_otm_put_iv = find_mean_iv_at_strike(puts_df, otm_put_strike)
+        mean_otm_call_iv = find_mean_iv_at_strike(calls_df, otm_call_strike)
         
         if np.isnan(mean_otm_put_iv) or np.isnan(mean_otm_call_iv):
             mean_otm_put_iv, mean_otm_call_iv = compute_volume_weighted_iv_skew(
@@ -882,7 +886,17 @@ if __name__ == "__main__":
         action="store_true",
         help="Display IV skew visualizations"
     )
-    
+    parser.add_argument(
+        "--american",
+        action="store_true",
+        help="Invert IVs with the CRR American pricer instead of the European "
+             "closed form (correct exercise style for these options, ~10-100x "
+             "slower; the difference is ~1%% of price for the OTM quotes used)"
+    )
+
     args = parser.parse_args()
-    
+
+    if args.american:
+        IV_STYLE = "american"
+
     run_global_iv_skew_analysis(n_workers=args.workers, show_plot=args.plot)

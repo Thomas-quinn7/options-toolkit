@@ -35,7 +35,7 @@ surface-dynamics time series. Details: [`vol_snapshots/README.md`](vol_snapshots
 ![surface history](charts/vol_surface/surface_history.png)
 
 Every chart regenerates offline from the code (`charts/README.md` is the full
-gallery), and `python -m pytest tests/ -q` runs the 100-test suite with no
+gallery), and `python -m pytest tests/ -q` runs the full suite with no
 network.
 
 ## Contents
@@ -50,9 +50,15 @@ network.
   Also includes a `price_heatmap()` (price/profit vs spot and vol) and a
   single-snapshot `skew_surface()` 3D plot. Importing the module has no side
   effects; the `skew_surface` demo runs only under `__main__`.
+- **`american.py`** - a CRR binomial **American** pricer (calls/puts, dividend
+  yield, European mode converging to Black-Scholes as the tested anchor), the
+  early-exercise premium on a shared tree, and American implied vol (Brent for
+  one quote, vectorised bisection for a chain). This is what turns the
+  "European treatment of American options" caveat into a *measured* one — and
+  `IV_skew.py --american` uses it for exercise-correct inversion.
 - **`main.py`** - A no-network smoke driver: prices a call/put, checks put-call
   parity, prints the Greeks, and runs an implied-vol round-trip
-  (price -> implied vol -> price). Run `python main.py` from this folder.
+  (price -> implied vol -> price). Run `python pricing_and_vol_surface/main.py`.
 - **`vol_surface.py`** - a real **arbitrage-free** IV surface: fits SVI per
   expiry and a global SSVI (Gatheral-Jacquier), and *proves* no butterfly
   arbitrage (Durrleman `g(k) >= 0`, i.e. non-negative density) and no calendar
@@ -215,8 +221,12 @@ only).
   for the fitted, butterfly/calendar-arbitrage-free SVI/SSVI surface;
   `skew_surface()` is kept only as the naive-interpolation contrast.
 - **`IV_skew.py`'s skew/inversion thresholds are unvalidated heuristics** (the
-  IVs themselves now come from the repo's own price inverter). A delta-target
-  config exists but is not yet wired in.
+  IVs themselves now come from the repo's own price inverter), and the OTM
+  strikes are fixed price bands (90%/110% of spot), not delta-anchored.
+  Inversion defaults to European exercise for speed; the resulting error is
+  *measured*, not assumed — under 1 vol point for the OTM quotes consumed
+  (`tests/test_american.py`) — and `--american` switches to exercise-correct
+  CRR inversion.
 - **The arbitrage scanner runs on delayed yfinance quotes.** Parity is now the
   American no-arbitrage band on executable (bid/ask-crossed) prices with a
   trailing-dividend term, so mid-price and dividend false positives are gone —
@@ -228,8 +238,9 @@ only).
 ## Planned
 - Pooling toxicity markouts across books/instruments in the MM simulator —
   the step that makes per-book-noisy vega toxicity actionable.
-- Wiring `IV_skew.py`'s delta-target config in, and validating its inversion
-  thresholds against the historical snapshots it has been accumulating.
+- Delta-anchored (rather than fixed-price-band) strike selection in
+  `IV_skew.py`, and validating its inversion thresholds against the
+  historical snapshots it has been accumulating.
 
 ## Note
 Research and learning code - not investment advice. Data is pulled live from

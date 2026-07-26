@@ -68,16 +68,24 @@ if ($LASTEXITCODE -ne 0) {
     "data: nothing new to commit" | Out-File $log -Append -Encoding utf8
 }
 
-# 4) Fit the day's surfaces and update the history + chart, then refresh the
-#    realised-vs-implied hedged replay (both toolkit-repo artifacts).
+# 4) Fit the day's surfaces and update the history + chart, refresh the
+#    realised-vs-implied hedged replay, and run the sticky-strike/sticky-delta
+#    study (self-gating: it produces output only once the history has enough
+#    usable day-pairs, and logs what it is still waiting for until then).
 & $py (Join-Path $PSScriptRoot "fit_history.py") 2>&1 | Out-File $log -Append -Encoding utf8
 & $py (Join-Path $PSScriptRoot "replay.py") 2>&1 | Out-File $log -Append -Encoding utf8
+& $py (Join-Path $PSScriptRoot "sticky.py") 2>&1 | Out-File $log -Append -Encoding utf8
 
 # 5) Commit the derived artifacts to the toolkit repo (stage ONLY these paths
-#    so unrelated work-in-progress is never swept into an automated commit).
+#    so unrelated work-in-progress is never swept into an automated commit;
+#    the sticky outputs exist only after the study activates).
 git add vol_snapshots/surface_history.csv charts/vol_surface/surface_history.png `
     vol_snapshots/replay_history.csv charts/market_making/replay_realised_vs_implied.png 2>&1 |
     Out-File $log -Append -Encoding utf8
+if (Test-Path (Join-Path $PSScriptRoot "sticky_summary.csv")) {
+    git add vol_snapshots/sticky_summary.csv charts/vol_surface/sticky_regimes.png 2>&1 |
+        Out-File $log -Append -Encoding utf8
+}
 git diff --cached --quiet
 if ($LASTEXITCODE -ne 0) {
     git commit -q -m "vol_snapshots: daily surface fit $(Get-Date -Format yyyy-MM-dd)" 2>&1 |

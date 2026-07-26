@@ -65,6 +65,28 @@ spot) are dropped. Stateless — every run recomputes from the raw data store.
 Pinned offline by `tests/test_replay.py` on GBM histories with known
 realised/implied vols (sign both ways, theory tracking, multi-expiry marking).
 
+## Sticky-strike vs sticky-delta — armed, waiting for data
+
+`sticky.py` answers Derman's smile-regime question from the daily fits: after
+a spot move, does a fixed strike keep its vol (sticky-strike) or does the
+smile move with moneyness (sticky-delta, which adds a term to every option's
+effective delta)? Each consecutive-day pair of fitted 30d smiles is compared
+against both predictions; the **demeaned RMS** of each prediction is the
+primary discriminator (immune to the day's parallel vol change), with the
+classic regime **beta** reported alongside — including its stated caveat that
+spot-vol correlation biases beta upward even in a sticky-strike world.
+
+The study gates itself on `MIN_PAIRS` usable day-pairs per ticker (consecutive
+fits with a >= 0.2% move). Until then the scheduled run just logs what it is
+waiting for; once the history is long enough, `sticky_summary.csv` and
+`charts/vol_surface/sticky_regimes.png` appear on their own. Core comparisons
+are pure functions pinned by `tests/test_sticky.py` on exactly-synthesised
+regimes of both kinds.
+
+```bash
+python vol_snapshots/sticky.py               # runs, or says what's missing
+```
+
 ## Where the data lives
 
 Raw chains would grow the public repo by ~1 MB/day forever, so they live in

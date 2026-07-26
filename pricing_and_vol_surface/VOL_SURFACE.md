@@ -36,10 +36,12 @@ remembering any parametric constant — it is read straight off the fitted surfa
   conditions on `(rho, eta, gamma)`, which the fit enforces via a penalty and
   which are then confirmed numerically.
 
-Surfaces are built from **prices**, not from yfinance's own `impliedVolatility`
-field: `iv_from_price()` is a compact Brent inverter (puts mapped to calls by
-parity), cross-checked in the tests against the repo's autodiff pricer
-`black.py`.
+For market data, `iv_from_price()` is the intended entry point: a compact Brent
+inverter (puts mapped to calls by parity) so surfaces can be built from
+**prices** rather than yfinance's own `impliedVolatility` field. It is
+round-trip- and parity-tested and cross-checked against the closed-form pricer
+in `black.py`; the demo below fits synthetic IV quotes directly, so the
+inverter is not on the demo path.
 
 ## What the demo shows
 

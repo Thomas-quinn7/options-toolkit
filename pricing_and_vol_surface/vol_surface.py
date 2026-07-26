@@ -24,10 +24,11 @@ What it does
 
 Everything here is numpy/scipy and needs no market data; `main()` fits to a
 synthetic surface with known parameters and verifies recovery + arb-freeness.
-The repo's autodiff pricer is `black.py`; `iv_from_price` here is a small
-self-contained Brent inverter for turning real mid prices into IVs (so the
-surface is built from prices, not from yfinance's own `impliedVolatility`
-field), and a test cross-checks it against `black.py`.
+The repo's JAX pricer is `black.py`; `iv_from_price` here is a small
+self-contained Brent inverter for turning real mid prices into IVs (so a
+surface can be built from prices, not from yfinance's own `impliedVolatility`
+field), and a test cross-checks it against `black.py`. Note the demo fits
+synthetic IV quotes directly and does not exercise the inverter.
 """
 
 from __future__ import annotations

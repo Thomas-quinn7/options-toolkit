@@ -10,8 +10,9 @@ where that pricing breaks down.
 
 ### `pricing_and_vol_surface/`
 - **`black.py`** - Black-Scholes pricing (calls/puts, with dividend yield), the
-  full Greeks (delta, gamma, theta, vega, rho), and a Newton-Raphson implied-vol
-  solver, all built on JAX (JIT + `vmap` batching, Greeks via autodiff). Pricing
+  full closed-form Greeks (delta, gamma, theta, vega, rho), and a Newton-Raphson
+  implied-vol solver, built on JAX (JIT-compiled; the solver's derivative comes
+  from autodiff). Pricing
   and the IV solver take spot and rate as parameters; `stock_data()` and
   `get_riskfree_rate()` are helpers for sourcing live inputs at the call site.
   Also includes a `price_heatmap()` (price/profit vs spot and vol) and a
@@ -26,9 +27,10 @@ where that pricing breaks down.
   arbitrage (total variance rising with maturity). Demonstrates that a naive
   spline through noisy quotes admits butterfly arbitrage that SSVI removes.
   Supports **vega/liquidity-weighted calibration** so noisy illiquid wings don't
-  drag the fit off the reliable ATM quotes. Builds surfaces from prices via its
-  own Brent IV inverter, not yfinance's IV
-  field. See `pricing_and_vol_surface/VOL_SURFACE.md` for the write-up and
+  drag the fit off the reliable ATM quotes. Ships its own Brent IV inverter for
+  building surfaces from prices instead of yfinance's IV field (the bundled demo
+  fits synthetic IV quotes
+  directly). See `pricing_and_vol_surface/VOL_SURFACE.md` for the write-up and
   figures. `Skew_surface_example.png` shows the older single-snapshot
   `skew_surface()` plot, kept for contrast.
 

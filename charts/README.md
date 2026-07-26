@@ -34,9 +34,11 @@ slope per ticker over time, arb-checked daily.
 ![surface history](vol_surface/surface_history.png)
 
 **Realised-vs-implied replay** — short ATM straddles on the captured chains,
-delta-hedged daily at entry IV (`python vol_snapshots/replay.py`): hedged P&L
-paths against their gamma-P&L theory, and final P&L vs realised-minus-implied
-vol as positions settle.
+delta-hedged daily at entry IV (`python vol_snapshots/replay.py`). Once positions
+have aged it will show hedged P&L paths against their gamma-P&L theory, and final
+P&L vs realised-minus-implied vol as positions settle; with the capture history
+currently at day 0, the chart below is an empty frame by construction — the
+nightly scheduled run fills it in as the dataset accrues.
 ![replay](market_making/replay_realised_vs_implied.png)
 
 **Band fit** — calibrating to the bid-ask interval instead of a point mid.

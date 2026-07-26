@@ -99,9 +99,11 @@ def fit_svi_slice(k, w_market, weights=None, butterfly_penalty: float = 0.0) -> 
         p = SVIParams(*theta)
         r = weights * (svi_w(k, p) - w_market)
         if butterfly_penalty > 0:
+            # Always appended (0 when satisfied): least_squares requires a
+            # fixed-size residual, so the penalty term may not appear and
+            # disappear between iterations.
             g = _min_durrleman_g_svi(p, k_grid)
-            if g < 0:
-                r = np.append(r, butterfly_penalty * (-g))
+            r = np.append(r, butterfly_penalty * max(-g, 0.0))
         return r
 
     w0 = float(np.min(w_market))
@@ -183,9 +185,9 @@ def fit_ssvi(ks: Sequence[np.ndarray], ws: Sequence[np.ndarray], thetas: Sequenc
         for k, w, th, wt in zip(ks, ws, thetas, weights):
             parts.append(wt * (ssvi_w(k, th, p) - w))
         r = np.concatenate(parts)
+        # Always appended (0 when satisfied) so the residual size is fixed.
         ok, slack = ssvi_butterfly_conditions(theta_dense, p)
-        if slack < 0:
-            r = np.append(r, butterfly_penalty * (-slack))
+        r = np.append(r, butterfly_penalty * max(-slack, 0.0))
         return r
 
     x0 = [-0.3, 1.0, 0.4]
@@ -223,9 +225,9 @@ def fit_ssvi_band(ks: Sequence[np.ndarray], w_bids: Sequence[np.ndarray],
             above = np.maximum(w_fit - wa, 0.0)
             parts.append(((below + above) + mid_pull * (w_fit - wm)) / hw)
         r = np.concatenate(parts)
+        # Always appended (0 when satisfied) so the residual size is fixed.
         ok, slack = ssvi_butterfly_conditions(theta_dense, p)
-        if slack < 0:
-            r = np.append(r, butterfly_penalty * (-slack))
+        r = np.append(r, butterfly_penalty * max(-slack, 0.0))
         return r
 
     p0 = fit_ssvi(ks, w_mids, thetas)
@@ -431,9 +433,9 @@ def fit_svi_slice_band(k, w_bid, w_ask, weights=None,
         above = np.maximum(w_fit - w_ask, 0.0)   # fit escaped above the ask
         r = weights * ((below + above) + mid_pull * (w_fit - w_mid)) / half_width
         if butterfly_penalty > 0:
+            # Always appended (0 when satisfied) so the residual size is fixed.
             g = _min_durrleman_g_svi(p, k_grid)
-            if g < 0:
-                r = np.append(r, butterfly_penalty * (-g))
+            r = np.append(r, butterfly_penalty * max(-g, 0.0))
         return r
 
     # Warm-start from the plain mid fit so the band fit refines rather than

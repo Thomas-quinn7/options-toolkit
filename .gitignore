@@ -1,3 +1,6 @@
+# local planning notes - keep out of the public repo
+BUILD_PLAN.md
+
 __pycache__/
 *.pyc
 *.pyo

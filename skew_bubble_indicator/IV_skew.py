@@ -1,16 +1,15 @@
+import sys
+
 import numpy as np
 import pandas as pd
 import yfinance as yf
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import matplotlib.pyplot as plt
-import warnings
 import argparse
 from datetime import datetime
 from pathlib import Path
 from typing import Tuple, Optional, List, Dict
 from collections import namedtuple
-
-warnings.filterwarnings("ignore", category=RuntimeWarning)
 
 GLOBAL_INDICES = {
     "US_SP500_MEGA": {
@@ -279,11 +278,12 @@ def fetch_option_chain(ticker: str, max_retries: int = 3) -> Tuple[str, Optional
             
             return ticker, best_expiry, validated_chain, quality_metrics
             
-        except Exception:
+        except Exception as exc:
             if attempt == max_retries - 1:
-                pass
+                print(f"  [warn] {ticker}: chain fetch failed after {max_retries} "
+                      f"attempts ({type(exc).__name__}: {exc})", file=sys.stderr)
             continue
-    
+
     return ticker, None, None, {}
 
 

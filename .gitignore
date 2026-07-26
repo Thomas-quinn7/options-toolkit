@@ -1,6 +1,7 @@
 # local planning notes - keep out of the public repo
 BUILD_PLAN.md
 INTERVIEW_NOTES.md
+social_preview.png
 
 __pycache__/
 *.pyc

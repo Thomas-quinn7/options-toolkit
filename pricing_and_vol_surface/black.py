@@ -81,22 +81,36 @@ def implied_volatility(
     Spot (S) and the risk-free rate (r) are passed in as parameters rather than
     fetched over the network, so this stays a pure numerical routine. Use
     stock_data() / get_riskfree_rate() at the call site to source live inputs.
-    """
-    iterations = 0
-    diff = diff_function(S, K, T, r, sigma_est, price, q, otype)
-    loss_grad = grad(diff_function, argnums=4)
-    while abs(diff) > E and iterations < max_iter:
-        diff = diff_function(S, K, T, r, sigma_est, price, q, otype)
-        diff_grad = loss_grad(S, K, T, r, sigma_est, price, q, otype)
-        if diff_grad == 0:
-            print("Gradient is zero or invalid; stopping.")
-            break
 
-        iterations += 1
-        if abs(diff) < E:
-            break
-        sigma_est = sigma_est - diff / diff_grad
-    return sigma_est
+    E is an *absolute* price tolerance: tighten it (e.g. 1e-6) for low-premium
+    OTM options, otherwise sigma_est may be accepted unchanged. If Newton stalls
+    from the caller's guess (vega ~ 0 far from the money) it is retried from a
+    few standard starts; returns nan when no start converges (e.g. price
+    outside no-arb bounds) rather than a stale or diverged guess.
+    """
+    loss_grad = grad(diff_function, argnums=4)
+
+    def newton(sigma):
+        for _ in range(max_iter):
+            diff = diff_function(S, K, T, r, sigma, price, q, otype)
+            if not jnp.isfinite(diff):
+                return float("nan")
+            if abs(diff) <= E:
+                return sigma
+            diff_grad = loss_grad(S, K, T, r, sigma, price, q, otype)
+            if not jnp.isfinite(diff_grad) or diff_grad == 0:
+                return float("nan")
+            # Keep the iterate in a sane vol range so one bad Newton step
+            # (tiny vega) cannot fling it negative or to infinity.
+            sigma = jnp.clip(sigma - diff / diff_grad, 1e-4, 10.0)
+        diff = diff_function(S, K, T, r, sigma, price, q, otype)
+        return sigma if abs(diff) <= E else float("nan")
+
+    for start in (sigma_est, 0.2, 0.5, 1.0, 2.0):
+        result = newton(start)
+        if jnp.isfinite(result):
+            return result
+    return float("nan")
 
 
 @jit

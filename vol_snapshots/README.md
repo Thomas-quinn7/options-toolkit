@@ -87,6 +87,34 @@ regimes of both kinds.
 python vol_snapshots/sticky.py               # runs, or says what's missing
 ```
 
+## Event vol — armed, waiting for earnings season
+
+`event_vol.py` extracts the three phases of a scheduled vol event from the
+daily fits: the build-up (short-dated ATM vol inflating), the term-structure
+inversion, and the crush. **Events are detected endogenously** — a one-day
+30d-ATM drop of >= 3 vol points and >= 10% of the pre-day level — so no
+earnings calendar is imported and the claim stays exactly what the surface
+shows. Each event records the pre-event **implied event move** (excess
+short-dated variance over the 182d base, square-rooted: what the options
+market charged for the announcement) against the **realized** crush-day move —
+one implied-vs-realized point per event. Gated until the first event lands
+(the August earnings cycle for AAPL/MSFT/NVDA/TSLA is already in scope);
+outputs `event_vol.csv` + `charts/vol_surface/event_vol.png`.
+
+## Skew dynamics — armed, accumulating
+
+`skew_dynamics.py` tests the two classic surface-dynamics facts on the fits:
+**skew steepens when the market falls** (daily changes in the fixed-moneyness
+30d skew regressed on SPY's return — expected beta < 0) and the **leverage
+effect** (a name's ATM vol vs its own return — expected beta < 0), reported
+in vol points per 1% move with 2-s.e. bars. Gated at 15 matched day-pairs per
+ticker; outputs `skew_dynamics.csv` + `charts/vol_surface/skew_dynamics.png`.
+
+Both studies (like `sticky.py`) run in the scheduled task every night and stay
+silent apart from an "accumulating" log line until their data threshold trips.
+Pinned offline by `tests/test_event_vol.py` (injected synthetic event + flat
+control) and `tests/test_skew_dynamics.py` (known injected dynamics).
+
 ## Where the data lives
 
 Raw chains would grow the public repo by ~1 MB/day forever, so they live in

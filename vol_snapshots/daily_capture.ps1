@@ -69,21 +69,32 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 # 4) Fit the day's surfaces and update the history + chart, refresh the
-#    realised-vs-implied hedged replay, and run the sticky-strike/sticky-delta
-#    study (self-gating: it produces output only once the history has enough
-#    usable day-pairs, and logs what it is still waiting for until then).
+#    realised-vs-implied hedged replay, then run the research studies. The
+#    studies are self-gating: each produces output only once the history has
+#    enough data (day-pairs / a detected event) and logs what it is still
+#    waiting for until then, so they are safe to call unconditionally.
 & $py (Join-Path $PSScriptRoot "fit_history.py") 2>&1 | Out-File $log -Append -Encoding utf8
 & $py (Join-Path $PSScriptRoot "replay.py") 2>&1 | Out-File $log -Append -Encoding utf8
 & $py (Join-Path $PSScriptRoot "sticky.py") 2>&1 | Out-File $log -Append -Encoding utf8
+& $py (Join-Path $PSScriptRoot "event_vol.py") 2>&1 | Out-File $log -Append -Encoding utf8
+& $py (Join-Path $PSScriptRoot "skew_dynamics.py") 2>&1 | Out-File $log -Append -Encoding utf8
 
 # 5) Commit the derived artifacts to the toolkit repo (stage ONLY these paths
 #    so unrelated work-in-progress is never swept into an automated commit;
-#    the sticky outputs exist only after the study activates).
+#    study outputs exist only after each study activates).
 git add vol_snapshots/surface_history.csv charts/vol_surface/surface_history.png `
     vol_snapshots/replay_history.csv charts/market_making/replay_realised_vs_implied.png 2>&1 |
     Out-File $log -Append -Encoding utf8
 if (Test-Path (Join-Path $PSScriptRoot "sticky_summary.csv")) {
     git add vol_snapshots/sticky_summary.csv charts/vol_surface/sticky_regimes.png 2>&1 |
+        Out-File $log -Append -Encoding utf8
+}
+if (Test-Path (Join-Path $PSScriptRoot "event_vol.csv")) {
+    git add vol_snapshots/event_vol.csv charts/vol_surface/event_vol.png 2>&1 |
+        Out-File $log -Append -Encoding utf8
+}
+if (Test-Path (Join-Path $PSScriptRoot "skew_dynamics.csv")) {
+    git add vol_snapshots/skew_dynamics.csv charts/vol_surface/skew_dynamics.png 2>&1 |
         Out-File $log -Append -Encoding utf8
 }
 git diff --cached --quiet

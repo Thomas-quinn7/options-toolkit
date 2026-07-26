@@ -8,6 +8,36 @@ vol surface**, static no-arbitrage checks, and a delta-hedged options
 **market-making simulator**. Built to explore how options markets price risk and
 where that pricing breaks down.
 
+## Five minutes? Start here
+
+**A delta-hedged market-maker's P&L tracks realised-minus-implied vol.** The
+simulator's hedging engine is validated against the closed-form gamma-P&L
+identity, then a full quoting desk is swept across realised vol: spread capture
+is flat, the short book's vol P&L slopes down through zero at the implied vol
+it quoted — the spread has to pay for the vol risk the flow forces onto the
+book. Write-up: [`market_making/README.md`](market_making/README.md).
+
+![MM P&L vs realised vol](charts/market_making/mm_pnl_vs_vol.png)
+
+**"Arbitrage-free" is proved, not claimed.** A naive spline through noisy
+quotes admits butterfly arbitrage (negative implied density, Durrleman
+`g(k) < 0`); the fitted SSVI surface removes it, and tests pin both facts.
+Write-up: [`pricing_and_vol_surface/VOL_SURFACE.md`](pricing_and_vol_surface/VOL_SURFACE.md).
+
+![density check](charts/vol_surface/density_check.png)
+
+**And it runs on real data, daily.** A scheduled capture snapshots live option
+chains every close; the SSVI band surface is fitted to each day's chains
+(forwards implied from put-call parity, IVs inverted from prices, no-arb
+diagnostics recorded per fit) and the fitted parameters accumulate into a
+surface-dynamics time series. Details: [`vol_snapshots/README.md`](vol_snapshots/README.md).
+
+![surface history](charts/vol_surface/surface_history.png)
+
+Every chart regenerates offline from the code (`charts/README.md` is the full
+gallery), and `python -m pytest tests/ -q` runs the 100-test suite with no
+network.
+
 ## Contents
 
 ### `pricing_and_vol_surface/`
@@ -170,8 +200,14 @@ python -m pytest tests/ -q
 
 ```bash
 python -m venv .venv && source .venv/bin/activate   # Windows: .venv\Scripts\activate
-pip install -r requirements.txt
+pip install -e .[dev]                               # package + test deps
 ```
+
+The repo is a proper package (`pyproject.toml`; the folder names above are the
+import paths, e.g. `from pricing_and_vol_surface import vol_surface`) — but
+nothing *requires* installing it: every script and the test suite also run
+straight out of a clone (`pip install -r requirements.txt` for dependencies
+only).
 
 ## Known limitations
 - **`skew_surface()` (in `black.py`) is not arbitrage-free** - it is a

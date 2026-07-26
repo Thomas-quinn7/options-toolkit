@@ -16,14 +16,44 @@ Each run writes one tidy `csv.gz` per ticker under `data/<YYYY-MM-DD>/`
 (~1 MB/day for the default list) and is **idempotent per day** — already
 captured tickers are skipped, so a scheduler double-fire is harmless.
 
+## Fitted surface history — what the snapshots are for
+
+`fit_history.py` turns each captured (day, ticker) chain into one row of
+`surface_history.csv`: forwards implied from put-call parity, IVs inverted
+from bid/ask **prices** with the repo's own inverter, OTM quotes only, and a
+global **SSVI band fit** whose no-arbitrage diagnostics (min Durrleman `g`,
+calendar gap) are recorded in the row — a day the fit could *not* be made
+arb-free is visible in the data, not assumed away. The accumulated history
+(ATM vol, skew `rho`, term-structure slope per ticker over time) is charted to
+`charts/vol_surface/surface_history.png`.
+
+```bash
+python vol_snapshots/fit_history.py             # fit all unfitted days
+python vol_snapshots/fit_history.py --refit     # refit everything
+```
+
+The whole pipeline is pinned offline by `tests/test_fit_history.py` on a
+synthetic day priced from a known SSVI surface.
+
+## Where the data lives
+
+Raw chains would grow the public repo by ~1 MB/day forever, so they live in
+their own repo: **`vol_snapshots/data/` is a nested git checkout of
+[`options-toolkit-data`](https://github.com/Thomas-quinn7/options-toolkit-data)**
+(private), gitignored by the toolkit repo. The toolkit repo carries only the
+small derived artifacts — `surface_history.csv` and the history chart. The
+scheduled run pushes the raw data daily so the dataset stays durable
+off-machine; if the nested repo is ever missing, the script bootstraps it
+automatically (and logs loudly if it cannot).
+
 ## Scheduled daily run
 
-`daily_capture.ps1` wraps the capture for Windows Task Scheduler: it runs
-`capture.py`, appends all output to `vol_snapshots/capture.log` (gitignored),
-and **commits the new data** — staging only `vol_snapshots/data`, so
-work-in-progress elsewhere in the repo is never swept into an automated
-commit, and skipping the commit entirely when nothing new arrived (weekends,
-double-fires). Registered with:
+`daily_capture.ps1` wraps the daily habit for Windows Task Scheduler:
+capture → commit + push raw chains in the nested data repo → fit the day's
+surfaces → commit `surface_history.csv` + chart to the toolkit repo. All
+output is appended to `vol_snapshots/capture.log` (gitignored); only the
+named paths are ever staged, so work-in-progress is never swept into an
+automated commit. Registered with:
 
 ```
 schtasks /create /tn options-toolkit-snapshot /sc daily /st 22:00 /tr ^
@@ -72,7 +102,6 @@ itself touches the network.
 * yfinance is an unofficial API; per-expiry failures are caught and logged
   rather than killing the batch, but a schema change upstream would need a
   `normalize_chain` update (the offline tests pin the output schema).
-* The `data/` folder is tracked in git and auto-committed by the scheduled
-  run (~1 MB/day, compressed). If the repo ever gets heavy, the dataset can
-  be migrated to its own repo or LFS without losing history — the point is
-  that it exists somewhere durable from day one.
+* Fits need enough usable quotes: a (day, ticker) with fewer than 3 slices
+  passing the liquidity gates is skipped and simply has no history row — check
+  `capture.log` if a name goes quiet.

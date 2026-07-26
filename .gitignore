@@ -12,3 +12,6 @@ venv/
 *.egg-info/
 .ipynb_checkpoints/
 vol_snapshots/capture.log
+
+# raw snapshot data lives in its own repo (options-toolkit-data), nested here
+vol_snapshots/data/

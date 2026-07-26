@@ -44,6 +44,22 @@ def test_svi_recovers_known_slice():
 # --------------------------------------------------------------------------- #
 # SSVI recovery and arbitrage-freeness - the core guarantees                  #
 # --------------------------------------------------------------------------- #
+def test_ssvi_derivatives_match_finite_difference():
+    """The surface-level Durrleman check consumes these closed-form
+    derivatives, so they get the same finite-difference pinning as SVI's."""
+    p = V.SSVIParams(rho=-0.4, eta=1.0, gamma=0.4)
+    k = np.linspace(-0.8, 0.6, 60)
+    h = 1e-5
+    for theta in (0.01, 0.04, 0.09):
+        w, wp, wpp = V.ssvi_derivatives(k, theta, p)
+        assert np.allclose(w, V.ssvi_w(k, theta, p), atol=1e-12)
+        fd1 = (V.ssvi_w(k + h, theta, p) - V.ssvi_w(k - h, theta, p)) / (2 * h)
+        fd2 = (V.ssvi_w(k + h, theta, p) - 2 * V.ssvi_w(k, theta, p)
+               + V.ssvi_w(k - h, theta, p)) / h**2
+        assert np.allclose(wp, fd1, atol=1e-4)
+        assert np.allclose(wpp, fd2, atol=1e-3)
+
+
 def test_ssvi_recovers_and_is_arbitrage_free():
     mats, ks, ivs, true, thetas = V.synthetic_surface(seed=1, noise=0.002)
     ws = [iv**2 * T for iv, T in zip(ivs, mats)]
@@ -52,6 +68,7 @@ def test_ssvi_recovers_and_is_arbitrage_free():
 
     # parameter recovery
     assert abs(p.rho - true.rho) < 0.1
+    assert abs(p.eta - true.eta) < 0.2
     assert abs(p.gamma - true.gamma) < 0.15
 
     # no butterfly arbitrage: density >= 0 everywhere

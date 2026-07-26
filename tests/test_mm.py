@@ -71,6 +71,29 @@ def test_hedging_identity():
         assert err < 6 * row["sim_se"] + 1e-3, row  # within Monte-Carlo error
 
 
+def test_hedging_identity_put():
+    """The identity must hold for puts, not just the default call."""
+    params = MMParams(n_steps=126, otype="put")
+    grid = np.array([0.14, 0.20, 0.26])
+    val = experiment_hedging_validation(params, grid, n_sims=3000, seed=11)
+    for row in val["rows"]:
+        err = abs(row["sim_mean"] - row["theory_mean"])
+        assert err < 6 * row["sim_se"] + 1e-3, row
+
+
+def test_hedging_identity_with_financing():
+    """r, q != 0: cash accrues at r, the hedge book earns the dividend yield,
+    and the theory accrual carries the e^{r(T-t)} factor - the identity must
+    still hold, for both option types."""
+    grid = np.array([0.14, 0.26])
+    for otype in ("call", "put"):
+        params = MMParams(n_steps=126, r=0.05, q=0.02, otype=otype)
+        val = experiment_hedging_validation(params, grid, n_sims=3000, seed=13)
+        for row in val["rows"]:
+            err = abs(row["sim_mean"] - row["theory_mean"])
+            assert err < 6 * row["sim_se"] + 1e-3, (otype, row)
+
+
 def test_short_is_long_vol_downside():
     """A hedged short option makes money when realised < implied, loses when >."""
     params = MMParams()
@@ -111,6 +134,17 @@ def test_adverse_selection_needs_hedge_lag():
     assert abs(no_tox["lag0_resid"]) < 0.2
     assert abs(toxic["lag0_resid"]) < 0.2
     # hedging after the move: ~0 without toxicity, strongly negative with it
+    assert abs(no_tox["lag1_resid"]) < 0.25
+    assert toxic["lag1_resid"] < -1.0
+
+
+def test_adverse_selection_put_flow_direction():
+    """Informed flow must be toxic for puts too: it buys them before
+    down-moves, so the lag-1 residual goes negative just as for calls."""
+    base = MMParams(flow_imbalance=0.0, otype="put")
+    rows = experiment_adverse_selection(base, [0.0, 0.6], n_sims=3000, seed=5)
+    no_tox, toxic = rows[0], rows[1]
+    assert abs(toxic["lag0_resid"]) < 0.2
     assert abs(no_tox["lag1_resid"]) < 0.25
     assert toxic["lag1_resid"] < -1.0
 

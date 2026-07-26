@@ -8,15 +8,10 @@ violates them.
 Run:  python -m pytest tests/test_vol_surface.py -q
 """
 
-import os
-import sys
-
 import numpy as np
 import pytest
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "pricing_and_vol_surface"))
-
-import vol_surface as V  # noqa: E402
+from pricing_and_vol_surface import vol_surface as V
 
 
 # --------------------------------------------------------------------------- #
@@ -222,7 +217,7 @@ def test_iv_from_price_roundtrip():
 
 def test_cross_check_black_py():
     pytest.importorskip("jax")
-    import black  # noqa: E402
+    from pricing_and_vol_surface import black
 
     for S, K, T, r, sigma in [(100, 100, 0.5, 0.02, 0.2), (95, 110, 0.25, 0.0, 0.35)]:
         assert np.isclose(V.bs_call(S, K, T, r, sigma), float(black.black_scholes(S, K, T, r, sigma)), atol=1e-6)

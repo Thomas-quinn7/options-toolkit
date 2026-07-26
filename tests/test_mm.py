@@ -7,15 +7,10 @@ makes the simulator's vol P&L trustworthy rather than just plausible.
 Run:  python -m pytest tests/test_mm.py -q
 """
 
-import os
-import sys
-
 import numpy as np
 import pytest
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "market_making"))
-
-from mm_sim import (  # noqa: E402
+from market_making.mm_sim import (
     MMParams,
     bs_delta,
     bs_gamma,
@@ -324,8 +319,7 @@ def test_adaptive_vol_markup_is_priced_not_free():
 # --------------------------------------------------------------------------- #
 def test_cross_check_black_py():
     pytest.importorskip("jax")
-    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "pricing_and_vol_surface"))
-    import black  # noqa: E402
+    from pricing_and_vol_surface import black
 
     for S, K, tau, r, sigma in [(100, 100, 0.5, 0.02, 0.2), (95, 105, 0.25, 0.0, 0.35)]:
         assert np.isclose(bs_price(S, K, tau, r, sigma), float(black.black_scholes(S, K, tau, r, sigma)), atol=1e-6)

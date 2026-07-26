@@ -1,14 +1,22 @@
 """Smoke driver for black.py.
 
 Exercises Black-Scholes pricing, the full Greeks, and an implied-volatility
-round-trip on known inputs (no network calls). Run from this folder:
+round-trip on known inputs (no network calls):
 
-    python main.py
+    python pricing_and_vol_surface/main.py
 """
+
+import os
+import sys
 
 import jax.numpy as jnp
 
-from black import (
+# Keep the script runnable from a plain clone (any cwd) without `pip install -e .`.
+_REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _REPO not in sys.path:
+    sys.path.insert(0, _REPO)
+
+from pricing_and_vol_surface.black import (  # noqa: E402
     black_scholes,
     greeks,
     diff_function,

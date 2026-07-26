@@ -7,16 +7,11 @@ yfinance chain frames into it, and the write/load round-trip across days.
 Run:  python -m pytest tests/test_snapshots.py -q
 """
 
-import os
-import sys
-
 import numpy as np
 import pandas as pd
 import pytest
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "vol_snapshots"))
-
-from capture import (  # noqa: E402
+from vol_snapshots.capture import (
     COLUMNS,
     load_snapshots,
     normalize_chain,

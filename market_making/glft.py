@@ -64,10 +64,18 @@ ergodic ones, and the closed form's accuracy against both).
 
 from __future__ import annotations
 
+import os
+import sys
 from dataclasses import dataclass
 
 import numpy as np
 from scipy.linalg import eigh_tridiagonal, expm
+
+# Keep `python market_making/glft.py` working from a plain clone: repo root on
+# the path so `import plotstyle` resolves without `pip install -e .`.
+_REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _REPO not in sys.path:
+    sys.path.insert(0, _REPO)
 
 
 @dataclass(frozen=True)
@@ -271,13 +279,10 @@ def main():
     print("   the desk actually quotes with)")
 
     try:
-        import sys
-
         import matplotlib
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
 
-        sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
         import plotstyle as ps
         ps.apply_style()
     except Exception:

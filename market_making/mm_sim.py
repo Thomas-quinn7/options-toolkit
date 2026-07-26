@@ -35,6 +35,8 @@ Design notes
 
 from __future__ import annotations
 
+import os
+import sys
 from dataclasses import dataclass, replace
 from typing import Optional
 
@@ -42,7 +44,14 @@ import numpy as np
 from scipy.special import logsumexp
 from scipy.stats import norm
 
-from glft import glft_spread_skew
+# Keep `python market_making/mm_sim.py` working from a plain clone: put the
+# repo root on the path so package-absolute imports resolve without
+# `pip install -e .`.
+_REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _REPO not in sys.path:
+    sys.path.insert(0, _REPO)
+
+from market_making.glft import glft_spread_skew  # noqa: E402
 
 
 # --------------------------------------------------------------------------- #
@@ -944,14 +953,10 @@ def experiment_hawkes_clustering(base: MMParams, branchings=(0.0, 0.3, 0.6, 0.8)
 def _try_matplotlib():
     """Return (plt, plotstyle) with the repo's shared chart style applied, or None."""
     try:
-        import os
-        import sys
-
         import matplotlib
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
 
-        sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
         import plotstyle as ps
         ps.apply_style()
         return plt, ps

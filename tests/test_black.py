@@ -9,17 +9,16 @@ impossible prices.
 Run:  python -m pytest tests/test_black.py -q
 """
 
-import os
-import sys
-
 import numpy as np
 import pytest
 
 pytest.importorskip("jax")
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "pricing_and_vol_surface"))
-
-from black import black_scholes, greeks, implied_volatility  # noqa: E402
+from pricing_and_vol_surface.black import (  # noqa: E402
+    black_scholes,
+    greeks,
+    implied_volatility,
+)
 
 # S, K, T, r, sigma, q, otype - ITM/ATM/OTM, with and without dividends
 CASES = [

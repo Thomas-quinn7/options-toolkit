@@ -52,12 +52,14 @@ import pandas as pd
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _REPO = os.path.dirname(_HERE)
-sys.path.insert(0, _HERE)
-sys.path.insert(0, _REPO)
-sys.path.insert(0, os.path.join(_REPO, "pricing_and_vol_surface"))
+# Keep `python vol_snapshots/fit_history.py` (and the scheduled task) working
+# from a plain clone: repo root on the path so package-absolute imports
+# resolve without `pip install -e .`.
+if _REPO not in sys.path:
+    sys.path.insert(0, _REPO)
 
-from capture import DATA_ROOT, load_snapshots  # noqa: E402
-from vol_surface import (  # noqa: E402
+from vol_snapshots.capture import DATA_ROOT, load_snapshots  # noqa: E402
+from pricing_and_vol_surface.vol_surface import (  # noqa: E402
     SSVIParams,
     calendar_min_gap,
     fit_ssvi_band,

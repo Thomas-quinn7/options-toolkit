@@ -27,9 +27,14 @@ from pathlib import Path
 from typing import Tuple, Optional, List, Dict
 from collections import namedtuple
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..",
-                                "pricing_and_vol_surface"))
-from vol_surface import iv_from_price  # noqa: E402
+# Keep `python skew_bubble_indicator/IV_skew.py` working from a plain clone:
+# repo root on the path so package-absolute imports resolve without
+# `pip install -e .`.
+_REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _REPO not in sys.path:
+    sys.path.insert(0, _REPO)
+
+from pricing_and_vol_surface.vol_surface import iv_from_price  # noqa: E402
 
 GLOBAL_INDICES = {
     "US_SP500_MEGA": {
@@ -835,7 +840,6 @@ def save_bubble_summary_by_index(df: pd.DataFrame) -> None:
 def plot_global_iv_skew(df: pd.DataFrame) -> None:
     """Visualize IV skew metrics by index (repo chart style; inverted skew is
     a genuine bad-state, so the bars wear status colors, not series colors)."""
-    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
     import plotstyle as ps
     ps.apply_style()
 

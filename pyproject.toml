@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "options-toolkit"
+version = "1.0.0"
+description = "Options analytics: Black-Scholes/Greeks on JAX, arbitrage-free SVI/SSVI surfaces, static no-arb scanning, an IV-skew scanner, and a delta-hedged market-making simulator"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "numpy>=1.26",
+    "pandas>=2.0",
+    "scipy>=1.11",
+    "matplotlib>=3.8",
+    "seaborn>=0.13",
+    "yfinance>=0.2",
+    "jax>=0.4.30",
+    "jaxlib>=0.4.30",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "hypothesis>=6.100"]
+
+[project.urls]
+Repository = "https://github.com/Thomas-quinn7/options-toolkit"
+
+[tool.setuptools]
+# The friendly folder names ARE the packages - no src/ shuffle, the repo you
+# browse is the package you import.
+packages = [
+    "arbitrage",
+    "market_making",
+    "pricing_and_vol_surface",
+    "skew_bubble_indicator",
+    "vol_snapshots",
+]
+py-modules = ["plotstyle"]

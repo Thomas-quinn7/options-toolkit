@@ -10,16 +10,12 @@ inventory and win on the CARA objective they optimise.
 Run:  python -m pytest tests/test_glft.py -q
 """
 
-import os
-import sys
 from dataclasses import replace
 
 import numpy as np
 import pytest
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "market_making"))
-
-from glft import (  # noqa: E402
+from market_making.glft import (
     GLFTParams,
     asymptotic_quotes,
     base_half_spread,
@@ -31,7 +27,7 @@ from glft import (  # noqa: E402
     value_function,
     value_function_expm,
 )
-from mm_sim import (  # noqa: E402
+from market_making.mm_sim import (
     MMParams,
     _regime_vols,
     certainty_equivalent,

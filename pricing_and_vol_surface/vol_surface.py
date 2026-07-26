@@ -33,11 +33,20 @@ synthetic IV quotes directly and does not exercise the inverter.
 
 from __future__ import annotations
 
+import os
+import sys
 from dataclasses import dataclass
 from typing import List, Optional, Sequence, Tuple
 
 import numpy as np
 from scipy.optimize import brentq, least_squares
+
+# Keep `python pricing_and_vol_surface/vol_surface.py` working from a plain
+# clone: repo root on the path so `import plotstyle` resolves without
+# `pip install -e .`.
+_REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _REPO not in sys.path:
+    sys.path.insert(0, _REPO)
 
 
 # --------------------------------------------------------------------------- #
@@ -529,14 +538,10 @@ def fit_weighted_vs_unweighted(slice_data):
 def _try_plt():
     """Return (plt, plotstyle) with the repo's shared chart style applied, or None."""
     try:
-        import os
-        import sys
-
         import matplotlib
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
 
-        sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
         import plotstyle as ps
         ps.apply_style()
         return plt, ps

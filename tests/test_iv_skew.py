@@ -9,18 +9,12 @@ true smile from the prices alone. No network access anywhere.
 Run:  python -m pytest tests/test_iv_skew.py -q
 """
 
-import os
-import sys
-
 import numpy as np
 import pandas as pd
 import pytest
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "skew_bubble_indicator"))
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "pricing_and_vol_surface"))
-
-import IV_skew as X  # noqa: E402
-from vol_surface import bs_call  # noqa: E402
+from skew_bubble_indicator import IV_skew as X
+from pricing_and_vol_surface.vol_surface import bs_call
 
 S, T, R = 100.0, 30.0 / 365.0, 0.03
 

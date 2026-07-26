@@ -1,9 +1,12 @@
-numpy
-pandas
-scipy
-matplotlib
-seaborn
-yfinance
-jax
-jaxlib
-hypothesis
+# Kept in sync with pyproject.toml (the canonical dependency list).
+# `pip install -e .[dev]` is the recommended setup; this file is the
+# no-install convenience for `pip install -r requirements.txt`.
+numpy>=1.26
+pandas>=2.0
+scipy>=1.11
+matplotlib>=3.8
+seaborn>=0.13
+yfinance>=0.2
+jax>=0.4.30
+jaxlib>=0.4.30
+hypothesis>=6.100

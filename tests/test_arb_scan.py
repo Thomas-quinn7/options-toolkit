@@ -9,16 +9,12 @@ profit computed at the prices you would actually trade.
 Run:  python -m pytest tests/test_arb_scan.py -q
 """
 
-import os
-import sys
 from datetime import datetime, timedelta
 
 import numpy as np
 import pytest
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "arbitrage"))
-
-from arb_scan import ArbitrageDetector, Option  # noqa: E402
+from arbitrage.arb_scan import ArbitrageDetector, Option
 
 
 EXPIRY = datetime.now() + timedelta(days=30)

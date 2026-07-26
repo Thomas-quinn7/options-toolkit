@@ -10,18 +10,13 @@ Run:  python -m pytest tests/test_fit_history.py -q
 """
 
 import datetime as dt
-import os
-import sys
 
 import numpy as np
 import pandas as pd
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "vol_snapshots"))
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "pricing_and_vol_surface"))
-
-import fit_history as F  # noqa: E402
-import vol_surface as V  # noqa: E402
-from capture import COLUMNS  # noqa: E402
+from vol_snapshots import fit_history as F
+from pricing_and_vol_surface import vol_surface as V
+from vol_snapshots.capture import COLUMNS
 
 TRUE = V.SSVIParams(rho=-0.4, eta=1.0, gamma=0.4)
 S0, R, ATM_VOL = 100.0, 0.03, 0.20

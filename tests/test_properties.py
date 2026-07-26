@@ -23,19 +23,13 @@ numerical library wants from its test suite.
 Run:  python -m pytest tests/test_properties.py -q
 """
 
-import os
-import sys
-
 import numpy as np
 from hypothesis import assume, given, settings
 from hypothesis import strategies as st
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "market_making"))
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "pricing_and_vol_surface"))
-
-import vol_surface as vs  # noqa: E402
-from glft import asymptotic_quotes, glft_spread_skew, GLFTParams, skew_unit  # noqa: E402
-from mm_sim import bs_delta, bs_gamma, bs_price  # noqa: E402
+from pricing_and_vol_surface import vol_surface as vs
+from market_making.glft import asymptotic_quotes, glft_spread_skew, GLFTParams, skew_unit
+from market_making.mm_sim import bs_delta, bs_gamma, bs_price
 
 # ---- shared strategies ----------------------------------------------------- #
 SPOT = st.floats(50.0, 200.0)

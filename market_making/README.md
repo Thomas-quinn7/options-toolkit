@@ -45,8 +45,10 @@ it takes on in engine (2).
   "hedge at the vol you marked at"). All cash flows — option fills, hedge
   trades, expiry settlement — run through a single cash account, so terminal
   cash *is* the P&L.
-* `r` is defaulted to 0 in the experiments to isolate the vol P&L from
-  financing/discounting; it is a supported parameter throughout.
+* **Financing:** cash accrues at `r`, the hedge book earns the continuous
+  dividend yield `q`, and the gamma-P&L identity below carries its `e^{r(T-t)}`
+  financing factor, so `r` and `q` are supported (and tested) — the experiments
+  just default to `r = 0` to keep the vol P&L uncluttered.
 
 ## Is it correct? (Experiment A)
 
@@ -54,7 +56,7 @@ Hedging at implied vol, a short option held to expiry has a known closed-form
 P&L — the gamma-P&L identity:
 
 ```
-PnL  ≈  0.5 * integral[ Gamma_impl(t) * S(t)^2 * (sigma_impl^2 - sigma_real^2) ] dt
+PnL  ≈  0.5 * integral[ e^{r(T-t)} * Gamma_impl(t) * S(t)^2 * (sigma_impl^2 - sigma_real^2) ] dt
 ```
 
 Experiment A runs a static short option through the hedger and compares the
@@ -76,8 +78,9 @@ imbalance, delta-hedged — swept across realised vol:
 
 ![MM P&L vs vol](figures/mm_pnl_vs_vol.png)
 
-* **Spread capture (green)** is flat — the desk earns its edge on volume
-  regardless of where vol lands.
+* **Spread capture (green)** is flat — by construction: fill intensity depends
+  only on quote distance and inventory, not on where vol lands, so the desk
+  earns its edge on volume in every scenario.
 * **Vol / hedging P&L (red)** slopes down through zero at implied vol: the
   net-short book profits when the world is calm and bleeds gamma when it is
   wild.

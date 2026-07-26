@@ -27,13 +27,15 @@ Design notes
 * Order arrival uses an Avellaneda-Stoikov style intensity, lambda = A*exp(-k*d)
   where d is the quote's distance from fair. Inventory is controlled by skewing
   the reservation price, which asymmetrically changes the two fill intensities.
-* r is defaulted to 0 in the experiments to isolate the vol P&L from financing
-  and discounting; it is a supported parameter throughout.
+* Financing is modelled: cash accrues at r, the hedge book earns the continuous
+  dividend yield q, and the analytic gamma-P&L carries the e^{r(T-t)}
+  financing factor, so the hedging identity holds for r, q != 0 (tested). The
+  experiments default to r=0 only to keep the vol P&L uncluttered.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, replace
 
 import numpy as np
 from scipy.stats import norm
@@ -203,11 +205,13 @@ def simulate_paths(
             # Uninformed flow: direction independent of the coming move.
             u_bid = rng.random(n_sims) < (1.0 - tox) * prob_bid
             u_ask = rng.random(n_sims) < (1.0 - tox) * prob_ask
-            # Informed flow: buys (lifts our ask) when the underlying is about to
-            # rise, sells (hits our bid) when it is about to fall.
+            # Informed flow: buys the option (lifts our ask) when the coming
+            # move raises its value, sells (hits our bid) when it lowers it.
+            # A call gains on an up-move; a put gains on a down-move.
             up = z > 0.0
-            i_ask = up & (rng.random(n_sims) < tox * prob_ask)
-            i_bid = (~up) & (rng.random(n_sims) < tox * prob_bid)
+            opt_gains = up if p.otype == "call" else ~up
+            i_ask = opt_gains & (rng.random(n_sims) < tox * prob_ask)
+            i_bid = (~opt_gains) & (rng.random(n_sims) < tox * prob_bid)
 
             fill_bid = u_bid | i_bid    # we BUY 1 @ bid
             fill_ask = u_ask | i_ask    # we SELL 1 @ ask
@@ -232,9 +236,18 @@ def simulate_paths(
             cash -= dH * S + p.tc_underlying * np.abs(dH) * S
             H = H_target
 
-        # analytic gamma P&L accrued over [t, t+dt] on the carried inventory
+        # Financing over [t, t+dt]: the cash balance accrues at r (borrow and
+        # lend at the same rate) and the shares held through the step earn the
+        # continuous dividend yield. The lag-1 hedge below trades at t+dt, so
+        # its cash flow correctly starts accruing only from the next step.
+        cash = cash * np.exp(p.r * dt) + H * S * (np.exp(p.q * dt) - 1.0)
+
+        # analytic gamma P&L accrued over [t, t+dt] on the carried inventory,
+        # future-valued to expiry (the e^{r(T-t)} factor in the identity)
         gamma_opt = bs_gamma(S, p.K, tau, p.r, p.sigma_impl, p.q)
-        vol_theory += 0.5 * q_inv * gamma_opt * S**2 * (sigma_real**2 - p.sigma_impl**2) * dt * m
+        vol_theory += (0.5 * q_inv * gamma_opt * S**2
+                       * (sigma_real**2 - p.sigma_impl**2) * dt * m
+                       * np.exp(p.r * (tau - 0.5 * dt)))
 
         # evolve the underlying with the REALISED vol using the pre-drawn shock
         S = S * np.exp((p.r - p.q - 0.5 * sigma_real**2) * dt + sigma_real * sqrt_dt * z)
@@ -500,7 +513,9 @@ def main():
 
     params = MMParams(flow_imbalance=0.30)
     n_sims = 4000
-    sig_grid = np.round(np.linspace(0.12, 0.30, 13), 4)
+    # Step 0.02 so the grid contains sigma_impl = 0.20 exactly — the
+    # at-implied point is sampled for the scatter/sample paths below.
+    sig_grid = np.round(np.linspace(0.12, 0.30, 10), 4)
 
     print("Options market-making simulator")
     print(f"  underlying S0={params.S0}, K={params.K}, T={params.T}y, "

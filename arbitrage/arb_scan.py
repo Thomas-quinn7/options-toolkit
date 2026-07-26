@@ -143,31 +143,31 @@ class ArbitrageDetector:
 
         pv_strike = K * np.exp(-self.r * T)
         theoretical_diff = self.spot - pv_strike
-        actual_diff = call.mid - put.mid
 
+        # Executable prices: each leg is priced at the side you'd actually trade,
+        # so ordinary bid-ask spread around a fair mid is never flagged.
         tolerance = 0.01
-        discrepancy = abs(actual_diff - theoretical_diff)
+        conversion_profit = (call.bid - put.ask) - theoretical_diff
+        reversal_profit = theoretical_diff - (call.ask - put.bid)
 
-        if discrepancy > tolerance:
-            if actual_diff > theoretical_diff:
-                strategy = "Sell Call, Buy Put, Buy Stock, Borrow PV(K)"
-                profit = actual_diff - theoretical_diff
-            else:
-                strategy = "Buy Call, Sell Put, Short Stock, Lend PV(K)"
-                profit = theoretical_diff - actual_diff
+        if conversion_profit > tolerance:
+            strategy = "Sell Call at bid, Buy Put at ask, Buy Stock, Borrow PV(K)"
+            profit = conversion_profit
+        elif reversal_profit > tolerance:
+            strategy = "Buy Call at ask, Sell Put at bid, Short Stock, Lend PV(K)"
+            profit = reversal_profit
+        else:
+            return None
 
-            return {
-                "type": "Put-Call Parity Violation",
-                "strike": K,
-                "expiry": call.expiry,
-                "theoretical_diff": theoretical_diff,
-                "actual_diff": actual_diff,
-                "discrepancy": discrepancy,
-                "strategy": strategy,
-                "estimated_profit": profit,
-            }
-
-        return None
+        return {
+            "type": "Put-Call Parity Violation",
+            "strike": K,
+            "expiry": call.expiry,
+            "theoretical_diff": theoretical_diff,
+            "mid_diff": call.mid - put.mid,
+            "strategy": strategy,
+            "estimated_profit": profit,
+        }
 
     def check_box_spread(self, call_low: Option, put_low: Option,
                          call_high: Option, put_high: Option) -> Optional[Dict]:
@@ -185,30 +185,33 @@ class ArbitrageDetector:
 
         T = self.time_to_expiry(call_low.expiry)
         theoretical_value = (K2 - K1) * np.exp(-self.r * T)
-        market_cost = (call_low.ask - call_high.bid) + (put_high.ask - put_low.bid)
+        # Each direction priced at the side you'd actually trade: buying the box
+        # lifts asks / hits bids, selling it does the reverse. Sell proceeds are
+        # always <= buy cost, so spread alone can never trigger either branch.
+        buy_box_cost = (call_low.ask - call_high.bid) + (put_high.ask - put_low.bid)
+        sell_box_proceeds = (call_low.bid - call_high.ask) + (put_high.bid - put_low.ask)
 
         tolerance = 0.01
-        discrepancy = abs(market_cost - theoretical_value)
 
-        if discrepancy > tolerance:
-            if market_cost < theoretical_value:
-                return {
-                    "type": "Box Spread Arbitrage",
-                    "strikes": f"{K1}/{K2}",
-                    "expiry": call_low.expiry,
-                    "theoretical_value": theoretical_value,
-                    "market_cost": market_cost,
-                    "strategy": "Buy Box (Long Call Spread + Long Put Spread)",
-                    "estimated_profit": theoretical_value - market_cost,
-                }
+        if buy_box_cost < theoretical_value - tolerance:
             return {
                 "type": "Box Spread Arbitrage",
                 "strikes": f"{K1}/{K2}",
                 "expiry": call_low.expiry,
                 "theoretical_value": theoretical_value,
-                "market_cost": market_cost,
+                "market_cost": buy_box_cost,
+                "strategy": "Buy Box (Long Call Spread + Long Put Spread)",
+                "estimated_profit": theoretical_value - buy_box_cost,
+            }
+        if sell_box_proceeds > theoretical_value + tolerance:
+            return {
+                "type": "Box Spread Arbitrage",
+                "strikes": f"{K1}/{K2}",
+                "expiry": call_low.expiry,
+                "theoretical_value": theoretical_value,
+                "market_proceeds": sell_box_proceeds,
                 "strategy": "Sell Box (Short Call Spread + Short Put Spread)",
-                "estimated_profit": market_cost - theoretical_value,
+                "estimated_profit": sell_box_proceeds - theoretical_value,
             }
 
         return None

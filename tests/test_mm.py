@@ -23,7 +23,13 @@ from mm_sim import (  # noqa: E402
     experiment_adverse_selection,
     experiment_hedging_validation,
     experiment_mm_vol_sweep,
+    _regime_vol_paths,
+    experiment_online_toxicity,
+    experiment_online_vol_toxicity,
     experiment_toxic_spread,
+    experiment_vol_informed_flow,
+    experiment_vol_spread_defence,
+    simulate_paths,
 )
 
 
@@ -153,6 +159,164 @@ def test_wider_spread_survives_toxic_flow():
     base = MMParams(flow_imbalance=0.0)
     grid = experiment_toxic_spread(base, [0.6], [0.10, 0.25], n_sims=3000, seed=3)
     assert grid[0.25][0] > grid[0.10][0]
+
+
+# --------------------------------------------------------------------------- #
+# Vol-informed (vega-toxic) flow                                              #
+# --------------------------------------------------------------------------- #
+def test_per_path_sigma_preserves_hedging_identity():
+    """The gamma-P&L identity must hold path-by-path with per-path realised vols."""
+    params = MMParams(n_steps=126)
+    rng = np.random.default_rng(11)
+    sig = np.where(rng.random(3000) < 0.5, 0.26, 0.14)
+    res = simulate_paths(params, sig, 3000, rng, quoting=False, init_position=-1)
+    err = abs(res["total_pnl"].mean() - res["vol_theory"].mean())
+    se = res["total_pnl"].std(ddof=1) / np.sqrt(len(res["total_pnl"]))
+    assert err < 6 * se + 1e-3
+
+
+def test_vol_informed_flow_survives_instant_hedging():
+    """Instant hedging neutralises direction-informed flow (residual ~ 0 at any
+    toxicity - its total falls only because informed flow is one-sided volume)
+    but NOT vol-informed flow, whose loss lands in the vol/hedging residual."""
+    base = MMParams(flow_imbalance=0.0)
+    rows = experiment_vol_informed_flow(base, [0.0, 0.6], vol_shock=0.06,
+                                        n_sims=3000, seed=4)
+    clean, toxic = rows[0], rows[1]
+    # direction-informed flow, hedged instantly: no systematic vol residual
+    assert abs(clean["dir_resid"]) < 0.3
+    assert abs(toxic["dir_resid"]) < 0.3
+    # vol-informed flow: a large negative residual instant hedging cannot remove
+    assert toxic["vol_resid"] < -1.5
+    # at the same toxicity (same one-sided volume geometry), the vega-toxic desk
+    # does materially worse than the direction-toxic one
+    assert toxic["vol_total"] < toxic["dir_total"] - 1.5
+
+
+def test_vol_spread_defends_against_vega_toxicity():
+    """The vol-space markup charges informed flow in its own currency: it
+    shrinks the vega adverse-selection residual, an interior markup beats no
+    defence under toxic flow, and the same markup is pure cost on clean flow."""
+    base = MMParams(flow_imbalance=0.0)
+    rows = experiment_vol_spread_defence(base, [0.0, 0.005, 0.02], tox=0.5,
+                                         vol_shock=0.06, n_sims=3000, seed=5)
+    none, small, wide = rows
+    # the residual (the vega loss itself) shrinks as the markup widens
+    assert wide["resid"] > none["resid"] + 1.0
+    # under toxic flow, a small markup beats quoting none
+    assert small["total"] > none["total"]
+    # under clean flow the markup only costs volume - no free lunch
+    assert small["clean_total"] < none["clean_total"]
+
+
+def test_flow_fractions_validated():
+    with pytest.raises(ValueError):
+        simulate_paths(MMParams(toxicity=0.7, vol_toxicity=0.6), 0.2, 10,
+                       np.random.default_rng(0))
+
+
+# --------------------------------------------------------------------------- #
+# Online toxicity estimation and adaptive quoting                             #
+# --------------------------------------------------------------------------- #
+def test_toxicity_estimator_converges():
+    """The markout EWMA must land near the true informed fraction - and near
+    zero when the flow is clean."""
+    toxic = simulate_paths(MMParams(toxicity=0.6), 0.2, 2000,
+                           np.random.default_rng(8), quoting=True)
+    clean = simulate_paths(MMParams(toxicity=0.0), 0.2, 2000,
+                           np.random.default_rng(8), quoting=True)
+    assert abs(float(toxic["tox_hat_final"].mean()) - 0.6) < 0.15
+    assert float(clean["tox_hat_final"].mean()) < 0.15
+
+
+def test_adaptive_spread_defends_without_overpaying():
+    """Under toxic flow the adaptive desk must beat the static one; under
+    clean flow it must beat the permanently-wide (oracle-for-toxic) desk,
+    because it only widens when its estimator sees toxicity."""
+    online = experiment_online_toxicity(MMParams(flow_imbalance=0.0),
+                                        tox_hi=0.6, spread_slope=0.25,
+                                        n_sims=2500, seed=6)
+    t = online["totals"]
+    assert t[("toxic", "adaptive")] > t[("toxic", "static")] + 0.3
+    assert t[("clean", "adaptive")] > t[("clean", "oracle-wide")] + 0.3
+    # when toxicity is time-varying, adapting beats BOTH fixed policies -
+    # static is too tight in the toxic half, oracle-wide too wide in the clean
+    assert t[("regime switch", "adaptive")] > t[("regime switch", "static")] + 0.2
+    assert t[("regime switch", "adaptive")] > t[("regime switch", "oracle-wide")] + 0.2
+
+
+def test_toxicity_estimator_tracks_regime_switch():
+    """After a mid-sim switch from clean to toxic, the running estimate must
+    rise materially above its clean-half level."""
+    online = experiment_online_toxicity(MMParams(flow_imbalance=0.0),
+                                        tox_hi=0.6, spread_slope=0.25,
+                                        n_sims=2500, seed=6)
+    track = online["tracks"]["regime switch"]
+    n = len(track)
+    clean_half = float(np.mean(track[n // 4: n // 2]))
+    toxic_tail = float(np.mean(track[-n // 5:]))
+    assert clean_half < 0.2
+    assert toxic_tail > clean_half + 0.15
+
+
+# --------------------------------------------------------------------------- #
+# Online VOL-toxicity estimation (vega-space markout) and adaptive markup     #
+# --------------------------------------------------------------------------- #
+def test_vega_markout_estimator_discriminates():
+    """The vega markout must read high on vol-toxic flow and low on both clean
+    and direction-toxic flow - and the two estimators must separate the two
+    kinds of toxicity from each other."""
+    base = MMParams(flow_imbalance=0.0)
+    sig = _regime_vol_paths(base, 0.06, 2500, seed=9)
+    vol_toxic = simulate_paths(MMParams(vol_toxicity=0.6), sig, 2500,
+                               np.random.default_rng(9), quoting=True)
+    clean = simulate_paths(MMParams(), sig, 2500,
+                           np.random.default_rng(9), quoting=True)
+    dir_toxic = simulate_paths(MMParams(toxicity=0.6), sig, 2500,
+                               np.random.default_rng(9), quoting=True)
+    vm_vol = float(vol_toxic["volmark_final"].mean())
+    vm_clean = float(clean["volmark_final"].mean())
+    vm_dir = float(dir_toxic["volmark_final"].mean())
+    assert vm_vol > vm_clean + 0.06
+    assert abs(vm_dir - vm_clean) < 0.02   # blind to directional toxicity
+    # cross-separation: each estimator sees only its own kind
+    assert float(dir_toxic["tox_hat_final"].mean()) > 0.4
+    assert float(vol_toxic["tox_hat_final"].mean()) < 0.2
+
+
+def test_per_step_sigma_preserves_hedging_identity():
+    """The gamma-P&L identity must hold with a full vol PATH per simulation
+    (regimes switching mid-book), not just a per-path constant."""
+    params = MMParams(n_steps=126)
+    sig = _regime_vol_paths(params, 0.06, 3000, seed=12)
+    res = simulate_paths(params, sig, 3000, np.random.default_rng(12),
+                         quoting=False, init_position=-1)
+    err = abs(res["total_pnl"].mean() - res["vol_theory"].mean())
+    se = res["total_pnl"].std(ddof=1) / np.sqrt(len(res["total_pnl"]))
+    assert err < 6 * se + 1e-3
+
+
+def test_adaptive_vol_markup_is_priced_not_free():
+    """The adaptive vol markup must (a) nearly match the static desk on clean
+    flow - unlike the oracle markup, which taxes clean flow heavily - (b)
+    improve on static under vol-toxic flow, and (c) beat the oracle when
+    toxicity switches regime. The oracle keeping an edge in stationary toxic
+    flow is expected: a single book's vega markout is too noisy to recover
+    the full oracle markup, which is the honest asymmetry vs the directional
+    case."""
+    online = experiment_online_vol_toxicity(MMParams(flow_imbalance=0.0),
+                                            n_sims=2500, seed=7)
+    t = online["totals"]
+    assert t[("clean", "adaptive")] > t[("clean", "oracle-markup")] + 0.2
+    assert t[("clean", "adaptive")] > t[("clean", "static")] - 0.15
+    assert t[("vol-toxic", "adaptive")] > t[("vol-toxic", "static")] + 0.02
+    assert t[("regime switch", "adaptive")] > t[("regime switch", "oracle-markup")] + 0.15
+    # the estimator's running mean rises after the vol-toxicity switch
+    track = online["tracks"]["regime switch"]
+    n = len(track)
+    clean_half = float(np.mean(track[n // 4: n // 2]))
+    toxic_tail = float(np.mean(track[-n // 5:]))
+    assert toxic_tail > clean_half + 0.05
 
 
 # --------------------------------------------------------------------------- #

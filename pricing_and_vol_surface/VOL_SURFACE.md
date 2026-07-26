@@ -6,7 +6,7 @@ just interpolates a single snapshot of market IVs and can imply negative
 probabilities or a total variance that falls with maturity.
 
 ```bash
-python pricing_and_vol_surface/vol_surface.py     # fit, prove, write figures/
+python pricing_and_vol_surface/vol_surface.py     # fit, prove, write charts/vol_surface/
 python -m pytest tests/test_vol_surface.py -q      # the checks, as tests
 ```
 
@@ -58,14 +58,14 @@ No-arbitrage checks on the fitted SSVI surface:
   calendar : min d(total var)/dT gap = +0.0052   -> PASS
 ```
 
-![SSVI surface](figures/ssvi_surface.png)
+![SSVI surface](../charts/vol_surface/ssvi_surface.png)
 
 **The failure it prevents.** Interpolating the noisy quotes directly with a cubic
 spline — a very common shortcut — chases the quote noise and drives `g(k)`
 negative across the smile: a butterfly arbitrage. The fitted SSVI surface removes
 it. This is the "where pricing breaks down" story made concrete:
 
-![density check](figures/density_check.png)
+![density check](../charts/vol_surface/density_check.png)
 
 The blue SSVI density proxy stays above zero everywhere; the orange spline dips
 into the red arbitrage region repeatedly. `tests/test_vol_surface.py` asserts
@@ -88,12 +88,51 @@ ATM total-variance error : unweighted=1.39e-03  weighted=8.61e-04
 liquid-region |k|<=0.2   : unweighted=1.02e-03  weighted=9.63e-04
 ```
 
-![weighted calibration](figures/weighted_calibration.png)
+![weighted calibration](../charts/vol_surface/weighted_calibration.png)
 
 Weighting nails the liquid, high-vega region — **where you actually price and
 hedge** — by deliberately not chasing the wings. It is an honest trade: the
 equal-weighted wing fit gets worse; the numbers that matter get better.
 `tests/test_vol_surface.py` asserts the ATM improvement over repeated draws.
+
+## Bid-ask band calibration: the quote structure *is* the weighting
+
+The market does not hand you a price — it hands you an **interval**. Any curve
+passing inside `[bid, ask]` is consistent with the quotes, so
+`fit_svi_slice_band()` fits to the band itself: the residual is a hinge, zero
+anywhere inside the band and the distance to the nearer edge outside it,
+**normalised by the band's half-width** — escaping a tight ATM band by a tick
+is a large error; missing a wide illiquid wing band by the same tick barely
+registers. Inside the band the problem is under-determined, so a small pull
+toward the band centre acts as a tiebreak.
+
+This reaches the same destination as vega weighting with no weighting scheme
+at all — the quote structure carries the information:
+
+```
+ATM total-variance error : mid-fit=1.39e-03  band-fit=8.89e-04
+quotes whose band the fit misses: mid-fit=0%  band-fit=0%
+```
+
+![band fit](../charts/vol_surface/band_fit.png)
+
+One subtlety the tests make explicit: quote noise can put a band entirely on
+the wrong side of value, so even the **true** smile misses some bands — that
+rate is the irreducible floor, and the band fit sits at it rather than at
+zero (`test_band_fit_respects_the_quotes`). Averaged over draws the band fit
+also beats the mid fit at ATM and across the liquid region, and with the
+butterfly penalty on, the band-fitted slice is pushed into the no-arbitrage
+region like any other slice (`test_band_fit_can_be_pushed_arbitrage_free`).
+
+The same residual also drives the **global** surface: `fit_ssvi_band()` fits
+SSVI's `(rho, eta, gamma)` to the bands of every maturity at once, with the
+Gatheral-Jacquier butterfly conditions penalised as usual. On banded quotes of
+the synthetic surface it recovers the true shape parameters markedly better
+than the mid fit — `rho -0.419 / gamma 0.445` vs the mid fit's
+`-0.375 / 0.342` against a truth of `-0.4 / 0.4` — and the fitted surface
+passes both numerical no-arbitrage checks. Tight ATM bands at every maturity
+pin the global smile shape; the wide wings, where the mid is mostly noise,
+barely constrain it.
 
 ## Talking points
 
@@ -110,6 +149,8 @@ equal-weighted wing fit gets worse; the numbers that matter get better.
 * SSVI is a *global* two-and-a-half parameter form; it cannot fit every smile
   exactly. Per-slice SVI is more flexible but must be checked (and, if needed,
   constrained) slice by slice — both are provided.
-* No smoothing of the ATM term structure `theta(T)`; it is read from the quotes.
-* Calibration supports vega/liquidity weighting (above); a further step is to
-  fit to the full bid-ask band rather than a weighted mid.
+* No smoothing of the ATM term structure `theta(T)`; it is read from the
+  quotes (and the band fit still takes `theta` from the mid — a band-implied
+  `theta` interval is a further refinement).
+* Calibration supports vega/liquidity weighting and bid-ask band fitting, per
+  slice (`fit_svi_slice_band`) and globally (`fit_ssvi_band`).

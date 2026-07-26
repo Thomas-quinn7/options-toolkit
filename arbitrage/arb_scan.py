@@ -13,14 +13,19 @@ One scanner, two modes controlled by `allow_short` (CLI: `--retail`):
                                  butterflies, and calendar mispricings you can
                                  enter long.
 
-Caveat: these are European parity/box relationships applied to American
-yfinance options with no dividend term, so flagged trades can be spurious.
-See README "Known limitations".
+Parity is checked as the AMERICAN no-arbitrage band on EXECUTABLE prices
+(cross the spread: buy at ask, sell at bid), with a trailing-dividend term:
+
+    S*e^(-qT) - K  <=  C - P  <=  S - K*e^(-rT)
+
+so a flag means the edge survives the bid/ask, early-exercise ambiguity and
+dividends. Remaining caveats (stale yfinance quotes, borrow cost on the
+reversal leg) are in README "Known limitations".
 """
 
 import argparse
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import List, Dict, Optional
 
 import numpy as np
@@ -48,6 +53,23 @@ class OptionsDataFetcher:
         self.ticker = ticker
         self.stock = None
         self.spot_price = None
+        self.div_yield = 0.0
+
+    def _trailing_dividend_yield(self) -> float:
+        """Trailing-12-month dividend yield from actual payment history.
+
+        Computed from `Ticker.dividends` rather than `info['dividendYield']`,
+        whose units (fraction vs percent) have flipped between yfinance versions.
+        """
+        try:
+            divs = self.stock.dividends
+            if divs is None or len(divs) == 0 or not self.spot_price:
+                return 0.0
+            cutoff = divs.index[-1] - timedelta(days=365)
+            paid = float(divs[divs.index > cutoff].sum())
+            return max(paid / float(self.spot_price), 0.0)
+        except Exception:
+            return 0.0
 
     def fetch_options(self) -> "tuple[Optional[float], List[Option]]":
         """Fetch all available options for the ticker.
@@ -58,17 +80,28 @@ class OptionsDataFetcher:
         try:
             self.stock = yf.Ticker(self.ticker)
 
-            hist = self.stock.history(period="1d")
-            if hist.empty:
-                raise ValueError(f"Could not fetch price data for {self.ticker}")
+            # Same-session snapshot: fast_info last_price comes from the same
+            # delayed feed as the option chains, unlike the daily-bar close
+            # (which can be a full session stale and manufactures parity
+            # "violations" on its own).
+            try:
+                self.spot_price = float(self.stock.fast_info["last_price"])
+            except (KeyError, TypeError, ValueError):
+                self.spot_price = None
+            if not self.spot_price or self.spot_price <= 0:
+                hist = self.stock.history(period="1d")
+                if hist.empty:
+                    raise ValueError(f"Could not fetch price data for {self.ticker}")
+                self.spot_price = float(hist["Close"].iloc[-1])
 
-            self.spot_price = hist["Close"].iloc[-1]
+            self.div_yield = self._trailing_dividend_yield()
 
             expirations = self.stock.options
             if not expirations:
                 raise ValueError(f"No options data available for {self.ticker}")
 
-            print(f"\n{self.ticker} - Current Price: ${self.spot_price:.2f}")
+            print(f"\n{self.ticker} - Current Price: ${self.spot_price:.2f}"
+                  f" | trailing div yield: {self.div_yield:.2%}")
             print(f"Available expirations: {len(expirations)}")
 
             all_options = []
@@ -118,20 +151,41 @@ class ArbitrageDetector:
     `allow_short`.
     """
 
-    def __init__(self, spot_price: float, risk_free_rate: float = 0.05):
+    #: US equity options expire at the 16:00 ET close of the expiry date;
+    #: yfinance expiry strings parse to midnight, which understates T by
+    #: two-thirds of a day - material at 0-3 DTE.
+    EXPIRY_HOUR = 16
+
+    def __init__(self, spot_price: float, risk_free_rate: float = 0.05,
+                 div_yield: float = 0.0, min_edge: float = 0.01):
         self.spot = spot_price
         self.r = risk_free_rate
+        self.q = div_yield
+        self.min_edge = min_edge
         self.opportunities = []
 
     def time_to_expiry(self, expiry: datetime) -> float:
-        """Time to expiry in years (floored to avoid division by zero)."""
-        days = (expiry - datetime.now()).days
-        return max(days / 365.0, 0.001)
+        """Time to expiry in years, fractional-day precision (floored > 0)."""
+        expiry_close = expiry.replace(hour=self.EXPIRY_HOUR, minute=0, second=0)
+        seconds = (expiry_close - datetime.now()).total_seconds()
+        return max(seconds / (365.0 * 24 * 3600), 1e-4)
 
     # ---------- institutional checks (assume short selling) ----------
 
     def check_put_call_parity(self, call: Option, put: Option) -> Optional[Dict]:
-        """Put-call parity: C - P = S - K*e^(-rT). Violations imply arbitrage.
+        """American put-call parity band on executable prices.
+
+        For American options on a dividend-paying stock the no-arbitrage band is
+
+            S*e^(-qT) - K  <=  C - P  <=  S - K*e^(-rT)
+
+        European mid-price parity flags "arbitrage" you cannot cross the spread
+        to capture (and, on dividend payers, mispricing that is just the
+        dividend). Here each side is tested with the prices you would actually
+        trade at:
+
+          upper breach: sell call at BID, buy put at ASK, buy stock (conversion)
+          lower breach: buy call at ASK, sell put at BID, short stock (reversal)
 
         Requires the ability to short the underlying, so institutional only.
         """
@@ -141,39 +195,45 @@ class ArbitrageDetector:
         K = call.strike
         T = self.time_to_expiry(call.expiry)
 
-        pv_strike = K * np.exp(-self.r * T)
-        theoretical_diff = self.spot - pv_strike
+        upper_bound = self.spot - K * np.exp(-self.r * T)
+        lower_bound = self.spot * np.exp(-self.q * T) - K
 
-        # Executable prices: each leg is priced at the side you'd actually trade,
-        # so ordinary bid-ask spread around a fair mid is never flagged.
-        tolerance = 0.01
-        conversion_profit = (call.bid - put.ask) - theoretical_diff
-        reversal_profit = theoretical_diff - (call.ask - put.bid)
+        conversion_edge = (call.bid - put.ask) - upper_bound
+        reversal_edge = lower_bound - (call.ask - put.bid)
 
-        if conversion_profit > tolerance:
-            strategy = "Sell Call at bid, Buy Put at ask, Buy Stock, Borrow PV(K)"
-            profit = conversion_profit
-        elif reversal_profit > tolerance:
-            strategy = "Buy Call at ask, Sell Put at bid, Short Stock, Lend PV(K)"
-            profit = reversal_profit
-        else:
-            return None
+        if conversion_edge > self.min_edge:
+            return {
+                "type": "Put-Call Parity Violation (Conversion)",
+                "strike": K,
+                "expiry": call.expiry,
+                "upper_bound": upper_bound,
+                "executable_diff": call.bid - put.ask,
+                "strategy": "Sell Call @ bid, Buy Put @ ask, Buy Stock, Borrow PV(K)",
+                "estimated_profit": conversion_edge,
+            }
 
-        return {
-            "type": "Put-Call Parity Violation",
-            "strike": K,
-            "expiry": call.expiry,
-            "theoretical_diff": theoretical_diff,
-            "mid_diff": call.mid - put.mid,
-            "strategy": strategy,
-            "estimated_profit": profit,
-        }
+        if reversal_edge > self.min_edge:
+            return {
+                "type": "Put-Call Parity Violation (Reversal)",
+                "strike": K,
+                "expiry": call.expiry,
+                "lower_bound": lower_bound,
+                "executable_diff": call.ask - put.bid,
+                "strategy": "Buy Call @ ask, Sell Put @ bid, Short Stock, Lend proceeds",
+                "estimated_profit": reversal_edge,
+            }
+
+        return None
 
     def check_box_spread(self, call_low: Option, put_low: Option,
                          call_high: Option, put_high: Option) -> Optional[Dict]:
         """Box spread: theoretical value = (K2 - K1)*e^(-rT).
 
-        Flags both buy-box (cheap) and sell-box (rich) mispricings.
+        Flags both buy-box (cheap) and sell-box (rich) mispricings, each
+        priced at the side you would actually execute: the buy box pays the
+        asks / receives the bids, the sell box receives the bids / pays the
+        asks. (Using the buy-box cost for both directions flags sell-side
+        "edge" that vanishes once you cross the spread.)
         """
         if not (call_low.expiry == put_low.expiry == call_high.expiry == put_high.expiry):
             return None
@@ -185,15 +245,10 @@ class ArbitrageDetector:
 
         T = self.time_to_expiry(call_low.expiry)
         theoretical_value = (K2 - K1) * np.exp(-self.r * T)
-        # Each direction priced at the side you'd actually trade: buying the box
-        # lifts asks / hits bids, selling it does the reverse. Sell proceeds are
-        # always <= buy cost, so spread alone can never trigger either branch.
         buy_box_cost = (call_low.ask - call_high.bid) + (put_high.ask - put_low.bid)
         sell_box_proceeds = (call_low.bid - call_high.ask) + (put_high.bid - put_low.ask)
 
-        tolerance = 0.01
-
-        if buy_box_cost < theoretical_value - tolerance:
+        if buy_box_cost < theoretical_value - self.min_edge:
             return {
                 "type": "Box Spread Arbitrage",
                 "strikes": f"{K1}/{K2}",
@@ -203,7 +258,7 @@ class ArbitrageDetector:
                 "strategy": "Buy Box (Long Call Spread + Long Put Spread)",
                 "estimated_profit": theoretical_value - buy_box_cost,
             }
-        if sell_box_proceeds > theoretical_value + tolerance:
+        if sell_box_proceeds > theoretical_value + self.min_edge:
             return {
                 "type": "Box Spread Arbitrage",
                 "strikes": f"{K1}/{K2}",
@@ -496,7 +551,9 @@ def scan_tickers(tickers: List[str], risk_free_rate: float = 0.05,
                 all_results[ticker] = []
                 continue
 
-            detector = ArbitrageDetector(spot_price=spot_price, risk_free_rate=risk_free_rate)
+            detector = ArbitrageDetector(spot_price=spot_price,
+                                         risk_free_rate=risk_free_rate,
+                                         div_yield=fetcher.div_yield)
             opportunities = detector.find_all_arbitrage(options, allow_short=allow_short)
 
             if opportunities:

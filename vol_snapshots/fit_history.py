@@ -83,6 +83,13 @@ MIN_QUOTES_PER_SLICE = 8
 MIN_SLICES = 3
 IV_MIN, IV_MAX = 0.03, 2.0
 
+# The history CSV records every captured ticker, but the chart caps at 8
+# series - the palette has 8 fixed slots (plotstyle) and more lines per panel
+# stop being readable. Priority order below; remaining slots fill from
+# whatever else is in the history, so a narrower capture list charts fully.
+CHART_PRIORITY = ["SPY", "QQQ", "IWM", "VXX", "TLT", "AAPL", "NVDA", "TSLA"]
+MAX_CHART_SERIES = 8
+
 HISTORY_COLUMNS = [
     "snapshot_date", "ticker", "spot", "riskfree", "n_expiries", "n_quotes",
     "rho", "eta", "gamma", "atm_vol_30d", "atm_vol_91d", "atm_vol_182d",
@@ -260,10 +267,20 @@ def update_history(rows: List[Dict], path: str = HISTORY_CSV) -> pd.DataFrame:
 # --------------------------------------------------------------------------- #
 # Chart                                                                        #
 # --------------------------------------------------------------------------- #
+def chart_tickers(available) -> List[str]:
+    """The <= MAX_CHART_SERIES tickers the chart shows: CHART_PRIORITY order
+    first, then whatever else the history holds, alphabetically."""
+    available = set(available)
+    ordered = [t for t in CHART_PRIORITY if t in available]
+    ordered += [t for t in sorted(available) if t not in CHART_PRIORITY]
+    return ordered[:MAX_CHART_SERIES]
+
+
 def plot_history(hist: pd.DataFrame, out: str = CHART_PATH) -> Optional[str]:
     """Four panels: ATM 30d vol, skew rho, and term slope over time, plus the
     latest day's fitted ATM term structure. Single-day histories draw as
-    markers; lines emerge as days accumulate."""
+    markers; lines emerge as days accumulate. Shows the chart_tickers()
+    subset; the full universe lives in the history CSV."""
     if hist.empty:
         return None
     try:
@@ -275,7 +292,8 @@ def plot_history(hist: pd.DataFrame, out: str = CHART_PATH) -> Optional[str]:
     from plotstyle import apply_style, series_color
 
     apply_style()
-    tickers = sorted(hist["ticker"].unique())
+    tickers = chart_tickers(hist["ticker"].unique())
+    hist = hist[hist["ticker"].isin(tickers)]
     dates = pd.to_datetime(hist["snapshot_date"])
     fig, axes = plt.subplots(2, 2, figsize=(12.5, 8))
 
@@ -286,7 +304,7 @@ def plot_history(hist: pd.DataFrame, out: str = CHART_PATH) -> Optional[str]:
             sub = hist[hist["ticker"] == t]
             y = sub[col] * (100 if pct else 1)
             ax.plot(pd.to_datetime(sub["snapshot_date"]), y, marker="o",
-                    markersize=4, color=series_color(i % 8), label=t)
+                    markersize=4, color=series_color(i), label=t)
         ax.set_xlim(dates.min() - pad, dates.max() + pad)
         ax.set_title(title)
         ax.set_ylabel(ylabel)
@@ -305,7 +323,7 @@ def plot_history(hist: pd.DataFrame, out: str = CHART_PATH) -> Optional[str]:
             continue
         xs = [d for d, c in horizons if np.isfinite(sub[c].iloc[0])]
         ys = [100 * sub[c].iloc[0] for _, c in horizons if np.isfinite(sub[c].iloc[0])]
-        ax.plot(xs, ys, marker="o", markersize=4, color=series_color(i % 8), label=t)
+        ax.plot(xs, ys, marker="o", markersize=4, color=series_color(i), label=t)
     ax.set_title(f"ATM term structure, {last_day}")
     ax.set_xlabel("days to expiry")
     ax.set_ylabel("vol (%)")

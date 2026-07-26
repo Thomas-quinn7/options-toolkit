@@ -95,6 +95,18 @@ def test_fit_day_recovers_and_is_arb_free():
     assert row["calendar_min_gap"] >= 0.0
 
 
+def test_chart_tickers_caps_and_prioritises():
+    # narrower than the cap: everything charts, priority names first
+    got = F.chart_tickers(["AAPL", "MSFT", "SPY"])
+    assert got == ["SPY", "AAPL", "MSFT"]
+    # wider than the cap: at most MAX_CHART_SERIES, priority list wins
+    wide = ["AAPL", "GLD", "IWM", "MSFT", "NVDA", "QQQ", "SPY", "TLT",
+            "TSLA", "VXX", "XLE", "XLF", "XLK"]
+    got = F.chart_tickers(wide)
+    assert len(got) == F.MAX_CHART_SERIES
+    assert got == [t for t in F.CHART_PRIORITY if t in wide]
+
+
 def test_history_upsert_dedups(tmp_path):
     path = str(tmp_path / "hist.csv")
     row = {c: 0 for c in F.HISTORY_COLUMNS}

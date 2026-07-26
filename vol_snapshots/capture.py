@@ -36,7 +36,16 @@ from typing import Iterable, Optional
 
 import pandas as pd
 
-DEFAULT_TICKERS = ["SPY", "QQQ", "IWM", "AAPL", "MSFT", "NVDA", "TSLA"]
+# Universe: index ETFs + mega-cap singles (the original core), plus the
+# macro complex - sector rotation (XLF/XLE/XLK), rates (TLT), gold (GLD) and
+# the vol complex itself (VXX) - added 2026-07-26. Data not captured now
+# never exists later, and each ETF adds only ~50-100 KB/day compressed.
+DEFAULT_TICKERS = [
+    "SPY", "QQQ", "IWM",                      # index
+    "AAPL", "MSFT", "NVDA", "TSLA",           # mega-cap singles (earnings vol)
+    "XLF", "XLE", "XLK",                      # sector rotation
+    "TLT", "GLD", "VXX",                      # rates, gold, vol complex
+]
 
 COLUMNS = ["snapshot_date", "ticker", "spot", "riskfree", "expiry", "otype",
            "strike", "bid", "ask", "last", "volume", "open_interest", "iv_yf"]

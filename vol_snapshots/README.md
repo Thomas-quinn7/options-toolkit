@@ -8,13 +8,20 @@ that no free source provides. The only way to have that dataset is to have
 been capturing it. This folder makes it a one-command daily habit:
 
 ```bash
-python vol_snapshots/capture.py                 # default: SPY QQQ IWM AAPL MSFT NVDA TSLA
+python vol_snapshots/capture.py                 # default: 13-name universe below
 python vol_snapshots/capture.py SPY TSLA        # explicit tickers
 ```
 
 Each run writes one tidy `csv.gz` per ticker under `data/<YYYY-MM-DD>/`
-(~1 MB/day for the default list) and is **idempotent per day** — already
+(~1.5 MB/day for the default list) and is **idempotent per day** — already
 captured tickers are skipped, so a scheduler double-fire is harmless.
+
+The default universe (13 names): index ETFs (SPY, QQQ, IWM), mega-cap singles
+with earnings vol (AAPL, MSFT, NVDA, TSLA), sector rotation (XLF, XLE, XLK),
+rates (TLT), gold (GLD), and the vol complex itself (VXX). The macro complex
+was added 2026-07-26 — data not captured now never exists later. The history
+chart shows a fixed-priority subset of at most 8 series (the palette's slot
+count); `surface_history.csv` always records every fitted name.
 
 ## Fitted surface history — what the snapshots are for
 

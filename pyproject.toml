@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -7,6 +7,7 @@ name = "options-toolkit"
 version = "1.0.0"
 description = "Options analytics: Black-Scholes/Greeks on JAX, arbitrage-free SVI/SSVI surfaces, static no-arb scanning, an IV-skew scanner, and a delta-hedged market-making simulator"
 readme = "README.md"
+license = "MIT"
 requires-python = ">=3.11"
 dependencies = [
     "numpy>=1.26",

@@ -1,6 +1,8 @@
 # Options Toolkit
 
 ![tests](https://github.com/Thomas-quinn7/options-toolkit/actions/workflows/tests.yml/badge.svg)
+![python](https://img.shields.io/badge/python-3.11%2B-blue)
+![license](https://img.shields.io/badge/license-MIT-green)
 
 A small set of options-analytics tools: Black-Scholes pricing with the full
 Greeks, a real-data implied-volatility skew scanner, an **arbitrage-free SVI/SSVI

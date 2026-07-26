@@ -42,6 +42,29 @@ python vol_snapshots/fit_history.py --refit     # refit everything
 The whole pipeline is pinned offline by `tests/test_fit_history.py` on a
 synthetic day priced from a known SSVI surface.
 
+## Realised-vs-implied replay — the sim's headline result, on real chains
+
+`replay.py` runs the market-making simulator's central claim through the real
+history: one short ATM straddle per ticker (25-45 DTE, entered at the quoted
+mid, entry IV inverted from the traded prices), **delta-hedged at the entry
+implied vol every snapshot day**, financing accrued, settled at expiry — then
+immediately re-entered, so positions chain through the history. Each position
+carries its own discrete gamma-P&L theory accrual, making the output
+Experiment A's sim-vs-theory comparison on market data: as positions settle,
+final P&L should line up against realised-minus-entry-implied vol.
+
+```bash
+python vol_snapshots/replay.py               # all tickers -> replay_history.csv + chart
+```
+
+Stated conventions: entry/mark at mid (the entry half-spread is recorded as
+the execution cost a real desk would pay); one snapshot a day means daily
+hedging, so single-position hedging noise is material and conclusions come
+from the accumulating cross-section; stale weekend/holiday captures (identical
+spot) are dropped. Stateless — every run recomputes from the raw data store.
+Pinned offline by `tests/test_replay.py` on GBM histories with known
+realised/implied vols (sign both ways, theory tracking, multi-expiry marking).
+
 ## Where the data lives
 
 Raw chains would grow the public repo by ~1 MB/day forever, so they live in

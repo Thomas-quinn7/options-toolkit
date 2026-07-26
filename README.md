@@ -177,9 +177,17 @@ Raw chains live in a separate data repo (nested at `vol_snapshots/data/`) so
 the growing dataset never bloats this one; the pipeline is tested offline on
 a synthetic day from a known surface (`tests/test_fit_history.py`).
 
+`replay.py` closes the loop with the market-making simulator: short ATM
+straddles on the captured chains, **delta-hedged daily at entry implied vol**
+with the same conventions the sim validates against the gamma-P&L identity —
+so as positions settle, the sim's headline result (hedged P&L tracks
+realised-minus-implied vol) accumulates on real market data, each position
+carrying its own theory comparison.
+
 ```bash
 python vol_snapshots/capture.py         # capture today's chains (default list)
 python vol_snapshots/fit_history.py     # fit surfaces, update the history
+python vol_snapshots/replay.py          # hedged realised-vs-implied replay
 ```
 
 ### `charts/`

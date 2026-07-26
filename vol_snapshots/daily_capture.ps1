@@ -68,12 +68,15 @@ if ($LASTEXITCODE -ne 0) {
     "data: nothing new to commit" | Out-File $log -Append -Encoding utf8
 }
 
-# 4) Fit the day's surfaces and update the history + chart (toolkit repo).
+# 4) Fit the day's surfaces and update the history + chart, then refresh the
+#    realised-vs-implied hedged replay (both toolkit-repo artifacts).
 & $py (Join-Path $PSScriptRoot "fit_history.py") 2>&1 | Out-File $log -Append -Encoding utf8
+& $py (Join-Path $PSScriptRoot "replay.py") 2>&1 | Out-File $log -Append -Encoding utf8
 
 # 5) Commit the derived artifacts to the toolkit repo (stage ONLY these paths
 #    so unrelated work-in-progress is never swept into an automated commit).
-git add vol_snapshots/surface_history.csv charts/vol_surface/surface_history.png 2>&1 |
+git add vol_snapshots/surface_history.csv charts/vol_surface/surface_history.png `
+    vol_snapshots/replay_history.csv charts/market_making/replay_realised_vs_implied.png 2>&1 |
     Out-File $log -Append -Encoding utf8
 git diff --cached --quiet
 if ($LASTEXITCODE -ne 0) {

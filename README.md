@@ -21,9 +21,14 @@ book. Write-up: [`market_making/README.md`](market_making/README.md).
 
 ![MM P&L vs realised vol](charts/market_making/mm_pnl_vs_vol.png)
 
-**"Arbitrage-free" is proved, not claimed.** A naive spline through noisy
+**"Arbitrage-free" is checked, not claimed.** A naive spline through noisy
 quotes admits butterfly arbitrage (negative implied density, Durrleman
-`g(k) < 0`); the fitted SSVI surface removes it, and tests pin both facts.
+`g(k) < 0`); the fitted SSVI surface removes it, verified numerically —
+`g(k) >= 0` on a dense grid across the quoted strike range and calendar
+monotonicity across fitted expiries — and tests pin both facts. (The
+Gatheral–Jacquier sufficient conditions guarantee butterfly-freedom only for
+power-law `gamma <= 1/2`; some real-data fits land above that, so the grid
+check is the guarantee, and it says nothing outside the checked window.)
 Write-up: [`pricing_and_vol_surface/VOL_SURFACE.md`](pricing_and_vol_surface/VOL_SURFACE.md).
 
 ![density check](charts/vol_surface/density_check.png)

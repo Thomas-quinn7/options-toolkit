@@ -1,12 +1,16 @@
 # Arbitrage-free volatility surface (SVI / SSVI)
 
 `vol_surface.py` fits a real, **arbitrage-free** implied-volatility surface and
-proves it is arbitrage-free — as opposed to `skew_surface()` in `black.py`, which
-just interpolates a single snapshot of market IVs and can imply negative
-probabilities or a total variance that falls with maturity.
+verifies it numerically (Durrleman `g(k) >= 0` on a dense grid across the quoted
+strike range, calendar monotonicity across fitted expiries) — as opposed to
+`skew_surface()` in `black.py`, which just interpolates a single snapshot of
+market IVs and can imply negative probabilities or a total variance that falls
+with maturity. The Gatheral–Jacquier sufficient conditions cover power-law
+`gamma <= 1/2` only; fits above that rely on the grid check, which says nothing
+outside the checked window.
 
 ```bash
-python pricing_and_vol_surface/vol_surface.py     # fit, prove, write charts/vol_surface/
+python pricing_and_vol_surface/vol_surface.py     # fit, verify, write charts/vol_surface/
 python -m pytest tests/test_vol_surface.py -q      # the checks, as tests
 ```
 

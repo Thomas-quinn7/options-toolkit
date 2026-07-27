@@ -83,6 +83,20 @@ def test_build_slice_is_otm_band():
     assert abs(built["theta"] - ATM_VOL**2 * T) < 0.15 * ATM_VOL**2 * T
 
 
+def test_build_slice_rejects_absurd_implied_carry():
+    """Stale quotes that push the parity forward far off spot imply a huge
+    dividend/borrow; the slice must be refused, not fit. (Day one of real
+    data produced AAPL q=-37% from weekend marks - this pins the gate.)"""
+    df = synthetic_day()
+    T = MATURITIES[2]
+    day = dt.date.fromisoformat(SNAP_DATE)
+    expiry = (day + dt.timedelta(days=round(T * 365))).isoformat()
+    sl = df[df["expiry"] == expiry].copy()
+    calls = sl["otype"] == "call"
+    sl.loc[calls, ["bid", "ask", "last"]] += 5.0     # C-P inflated -> F ~ +5%
+    assert F.build_slice(sl, SNAP_DATE, expiry, S0, R) is None
+
+
 def test_fit_day_recovers_and_is_arb_free():
     row = F.fit_day_ticker(synthetic_day())
     assert row is not None

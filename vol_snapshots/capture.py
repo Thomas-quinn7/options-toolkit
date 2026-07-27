@@ -2,7 +2,8 @@
 
 Free data sources have no history: yfinance serves TODAY's option chains and
 nothing else. Every study this repo wants to do next on surface DYNAMICS -
-how fitted eSSVI parameters move day to day, sticky-strike vs sticky-delta,
+how fitted SSVI parameters move day to day (eSSVI once per-expiry skew
+lands), sticky-strike vs sticky-delta,
 term-structure signals, event vol - needs a time series of chains that no
 free source provides. The only way to have one is to have been capturing it,
 so this script makes each day's chains a one-command habit:
@@ -171,7 +172,15 @@ def capture_ticker(ticker: str, snapshot_date: str, riskfree: float,
 
 
 def main(argv: Optional[list] = None) -> None:
-    tickers = (argv if argv else DEFAULT_TICKERS)
+    args = list(argv) if argv else []
+    force = "--force" in args
+    tickers = [a for a in args if a != "--force"] or DEFAULT_TICKERS
+    # Weekend captures serve Friday's after-close quotes: junk mids that once
+    # implied a -37% AAPL dividend yield downstream. Refuse unless forced.
+    if _dt.date.today().weekday() >= 5 and not force:
+        print("Market closed (weekend) - today's chains are stale after-close "
+              "quotes. Skipping capture; pass --force to capture anyway.")
+        return
     snapshot_date = _dt.date.today().isoformat()
     riskfree = _fetch_riskfree()
     print(f"Capturing option chains for {snapshot_date} "

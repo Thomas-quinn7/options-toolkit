@@ -74,6 +74,16 @@ def test_entry_selection_is_atm_and_at_market_vol():
     assert abs(entry["div_yield"]) < 5e-3           # q=0 world
 
 
+def test_entry_refused_when_implied_carry_is_absurd():
+    """Distorted call quotes drag the parity forward ~2% off spot over 35
+    days - an implied |q| far beyond any real carry. pick_entry must refuse
+    the day rather than strike a straddle off a poisoned forward."""
+    snaps = make_history(0.2, 0.25, 1, seed=0)
+    calls = snaps["otype"] == "call"
+    snaps.loc[calls, ["bid", "ask", "last"]] += 2.0
+    assert R.pick_entry(snaps, DAY0.isoformat(), RATE) is None
+
+
 def test_stale_weekend_days_are_dropped():
     snaps = make_history(0.2, 0.25, 3, seed=1)
     # append a "Saturday" serving the same spot/quotes under a new date

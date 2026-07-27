@@ -72,6 +72,9 @@ CHART_PATH = os.path.join(_REPO, "charts", "market_making",
 DTE_LO, DTE_HI = 25, 45          # entry expiry window
 DTE_TARGET = 35
 MAX_SPREAD_FRAC = 0.25           # entry legs must be this liquid at the mid
+Q_ABS_MAX = 0.08                 # parity-implied |div/borrow| above this means
+                                 # the quotes are stale, not that the carry is
+                                 # real (day one: AAPL q=-37% off weekend marks)
 
 HISTORY_COLUMNS = [
     "ticker", "entry_date", "expiry", "status", "strike", "entry_spot",
@@ -113,6 +116,8 @@ def pick_entry(day_df: pd.DataFrame, snapshot_date: str,
         if not np.isfinite(F) or F <= 0:
             continue
         q = r - np.log(F / spot) / T
+        if abs(q) > Q_ABS_MAX:
+            continue
 
         two_sided = sl[(sl["bid"] > 0) & (sl["ask"] >= sl["bid"])]
         calls = two_sided[two_sided["otype"] == "call"].set_index("strike")

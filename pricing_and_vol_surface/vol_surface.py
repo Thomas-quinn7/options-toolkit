@@ -4,7 +4,8 @@ The repo already plots a *single-snapshot* interpolated IV surface (`black.py:
 skew_surface`). That is a picture, not a surface: nothing stops it implying
 negative probabilities (butterfly arbitrage) or a total variance that falls with
 maturity (calendar arbitrage). This module fits a real, **arbitrage-free**
-surface and proves it.
+surface and verifies it numerically (Durrleman g(k) >= 0 on a dense grid
+across the quoted strike range, calendar monotonicity across fitted expiries).
 
 What it does
 ------------

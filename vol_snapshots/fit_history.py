@@ -82,6 +82,8 @@ K_ABS_MAX = 0.6              # log-moneyness window the fit is asked to explain
 MIN_QUOTES_PER_SLICE = 8
 MIN_SLICES = 3
 IV_MIN, IV_MAX = 0.03, 2.0
+Q_ABS_MAX = 0.08             # parity-implied |div/borrow| above this means the
+                             # quotes are stale, not that the carry is real
 
 # The history CSV records every captured ticker, but the chart caps at 8
 # series - the palette has 8 fixed slots (plotstyle) and more lines per panel
@@ -140,6 +142,8 @@ def build_slice(slice_df: pd.DataFrame, snapshot_date: str, expiry: str,
     # Dividend/borrow implied by the forward itself; the inverter then prices
     # with an (S, q) pair exactly consistent with F.
     q = r - np.log(F / spot) / T
+    if abs(q) > Q_ABS_MAX:
+        return None
 
     otm = slice_df[
         (slice_df["bid"] > 0) & (slice_df["ask"] >= slice_df["bid"])

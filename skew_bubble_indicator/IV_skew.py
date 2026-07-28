@@ -4,6 +4,15 @@ Scans option chains across market segments and computes the OTM put-minus-call
 IV skew per name; widespread *inverted* skew (calls richer than puts) is
 flagged as a speculative-froth signal.
 
+The OTM anchors are **delta-anchored** by default: the strikes nearest the
+target Black-Scholes deltas (25-delta put / 25-delta call, the market-standard
+skew anchors), computed from the repo's own price-inverted IVs, so the anchor
+tracks each name's vol level instead of a fixed 90%/110%-of-spot price band.
+Names whose deltas cannot be computed fall back to the moneyness bands, and
+``--anchor moneyness`` forces the old behaviour everywhere. The inversion
+thresholds' measured context against the accumulated snapshot history lives in
+``threshold_study.py`` / this folder's README.
+
 Implied vols are computed by THIS repo's Brent inverter
 (``pricing_and_vol_surface.vol_surface.iv_from_price``) from bid-ask mid
 prices - yfinance's own ``impliedVolatility`` field is kept only as a
@@ -24,7 +33,7 @@ import matplotlib.pyplot as plt
 import argparse
 from datetime import datetime
 from pathlib import Path
-from typing import Tuple, Optional, List, Dict
+from typing import Tuple, Optional, Dict
 from collections import namedtuple
 
 # Keep `python skew_bubble_indicator/IV_skew.py` working from a plain clone:
@@ -35,6 +44,7 @@ if _REPO not in sys.path:
     sys.path.insert(0, _REPO)
 
 from pricing_and_vol_surface.american import american_iv_vector  # noqa: E402
+from pricing_and_vol_surface.black import greeks  # noqa: E402
 from pricing_and_vol_surface.vol_surface import iv_from_price  # noqa: E402
 
 GLOBAL_INDICES = {
@@ -113,6 +123,23 @@ WINDOW_EXPANSION_FACTOR = 2.0
 
 OTM_PUT_BAND = 0.90
 OTM_CALL_BAND = 1.10
+
+# Strike anchoring. "delta" (default) anchors the skew at the strikes nearest
+# the target Black-Scholes deltas - the market-standard 25-delta put/call skew
+# anchors - computed from the repo's own price-inverted IVs, so the anchor
+# moves with each name's vol level and the expiry actually scanned instead of
+# sitting at a fixed 90%/110% of spot (10% OTM is ~35-delta on a high-vol name
+# and ~5-delta on a low-vol ETF: a fixed price band compares different parts
+# of the smile across names). "moneyness" is the explicit fallback path (the
+# old fixed bands above), and any name whose deltas cannot be computed falls
+# back to it automatically. Configurable via --anchor/--put-delta/--call-delta.
+ANCHOR_MODE = "delta"
+TARGET_PUT_DELTA = -0.25
+TARGET_CALL_DELTA = 0.25
+# If no listed strike gets within this of the target delta (sparse or
+# ATM-only chains), the delta anchor reports unavailable rather than silently
+# anchoring somewhere else on the smile.
+DELTA_ANCHOR_TOLERANCE = 0.10
 
 CRITICAL_INVERSION_THRESHOLD = 60
 WARNING_INVERSION_THRESHOLD = 40
@@ -470,6 +497,69 @@ def get_otm_strike_targets(spot_price: float, chain: object) -> Tuple[float, flo
         return spot_price * OTM_PUT_BAND, spot_price * OTM_CALL_BAND
 
 
+def get_delta_anchored_strike_targets(
+    puts_df: pd.DataFrame,
+    calls_df: pd.DataFrame,
+    spot: float,
+    T: float,
+    r: float,
+    put_delta: Optional[float] = None,
+    call_delta: Optional[float] = None,
+    tolerance: Optional[float] = None,
+) -> Optional[Tuple[float, float]]:
+    """OTM strikes nearest the target Black-Scholes deltas, or None.
+
+    Deltas come from the repo's own pricing machinery
+    (``pricing_and_vol_surface.black.greeks``) evaluated at each quote's own
+    price-inverted IV, so the anchor adapts to the name's vol level and the
+    scanned expiry. Defaults (None) read the module-level targets so the CLI
+    flags plumb through. A signed or unsigned put target is accepted
+    (0.25 == -0.25).
+
+    Returns None - the caller's cue to fall back to the fixed moneyness
+    bands - when either side cannot produce an anchor: no finite IVs, T<=0,
+    or no listed strike within ``tolerance`` of the target delta. Both sides
+    must succeed together; mixing a delta anchor on one side with a price
+    band on the other would compare inconsistent points on the smile.
+    """
+    put_delta = TARGET_PUT_DELTA if put_delta is None else put_delta
+    call_delta = TARGET_CALL_DELTA if call_delta is None else call_delta
+    tolerance = DELTA_ANCHOR_TOLERANCE if tolerance is None else tolerance
+    if put_delta > 0:
+        put_delta = -put_delta
+
+    if not (np.isfinite(spot) and spot > 0 and np.isfinite(T) and T > 0):
+        return None
+
+    def anchor_one_side(df: pd.DataFrame, target: float, otype: str) -> float:
+        if df is None or len(df) == 0:
+            return np.nan
+        strikes = df["strike"].astype(float).values
+        ivs = df["impliedVolatility"].astype(float).values
+        # OTM side only: a 25-delta anchor is OTM by construction, and
+        # restricting the candidates keeps a garbage ITM IV from hijacking
+        # the nearest-delta match.
+        otm = strikes <= spot if otype == "put" else strikes >= spot
+        good = otm & (strikes > 0) & np.isfinite(ivs) & (ivs > 0)
+        if not good.any():
+            return np.nan
+        deltas = np.asarray(
+            greeks(spot, strikes[good], T, r, ivs[good], 0.0, otype=otype)[0],
+            dtype=float,
+        )
+        gaps = np.abs(deltas - target)
+        best = int(np.argmin(gaps))
+        if not np.isfinite(gaps[best]) or gaps[best] > tolerance:
+            return np.nan
+        return float(strikes[good][best])
+
+    put_strike = anchor_one_side(puts_df, put_delta, "put")
+    call_strike = anchor_one_side(calls_df, call_delta, "call")
+    if np.isfinite(put_strike) and np.isfinite(call_strike):
+        return put_strike, call_strike
+    return None
+
+
 def compute_volume_weighted_iv_skew(
     puts_df: pd.DataFrame, 
     calls_df: pd.DataFrame, 
@@ -517,8 +607,19 @@ def compute_iv_skew_metric(ticker: str, expiry: str, chain: object, quality_metr
         
         if np.isnan(spot_price):
             return ticker, expiry, np.nan, np.nan, np.nan, 0.0
-        
-        otm_put_strike, otm_call_strike = get_otm_strike_targets(spot_price, chain)
+
+        # Delta anchoring first (when enabled), moneyness bands as the
+        # explicit per-name fallback whenever a delta anchor is unavailable.
+        targets = None
+        if ANCHOR_MODE == "delta":
+            _, dte = validate_expiry_date(expiry)
+            T = max(dte, 1) / 365.0
+            targets = get_delta_anchored_strike_targets(
+                puts_df, calls_df, spot_price, T, get_risk_free_rate()
+            )
+        if targets is None:
+            targets = get_otm_strike_targets(spot_price, chain)
+        otm_put_strike, otm_call_strike = targets
         
         mean_otm_put_iv = find_mean_iv_at_strike(puts_df, otm_put_strike)
         mean_otm_call_iv = find_mean_iv_at_strike(calls_df, otm_call_strike)
@@ -579,7 +680,7 @@ def print_index_summary(index_key: str, index_name: str, df: pd.DataFrame) -> No
     valid_df = df.dropna(subset=["iv_skew"])
     
     if len(valid_df) == 0:
-        print(f"  ⚠️  No valid data")
+        print("  ⚠️  No valid data")
         return
     
     # Show data quality
@@ -654,6 +755,11 @@ def run_global_iv_skew_analysis(n_workers: int = 5, show_plot: bool = False) -> 
     print(f"Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"Analyzing {len(GLOBAL_INDICES)} market segments with {sum(len(v['tickers']) for v in GLOBAL_INDICES.values())} tickers")
     print("Note: Options data availability varies by market. US markets have the most complete data.")
+    if ANCHOR_MODE == "delta":
+        print(f"Strike anchors: {abs(TARGET_PUT_DELTA)*100:.0f}-delta put / "
+              f"{TARGET_CALL_DELTA*100:.0f}-delta call (moneyness-band fallback per name)")
+    else:
+        print(f"Strike anchors: fixed moneyness bands ({OTM_PUT_BAND:.0%} / {OTM_CALL_BAND:.0%} of spot)")
     print(f"Data Quality Filters: Vol≥{MIN_VOLUME}, OI≥{MIN_OPEN_INTEREST}, {MIN_DTE}≤DTE≤{MAX_DTE}, {MIN_IV*100}%≤IV≤{MAX_IV*100}%\n")
     
     all_results = []
@@ -887,6 +993,28 @@ if __name__ == "__main__":
         help="Display IV skew visualizations"
     )
     parser.add_argument(
+        "--anchor",
+        choices=["delta", "moneyness"],
+        default=ANCHOR_MODE,
+        help="OTM strike anchoring: 'delta' picks the strikes nearest the "
+             "target Black-Scholes deltas (falling back per name to the "
+             "moneyness bands when deltas are unavailable); 'moneyness' "
+             "forces the fixed 90%%/110%%-of-spot bands everywhere"
+    )
+    parser.add_argument(
+        "--put-delta",
+        type=float,
+        default=TARGET_PUT_DELTA,
+        help="Target put delta for the skew anchor (sign optional: "
+             "0.25 == -0.25)"
+    )
+    parser.add_argument(
+        "--call-delta",
+        type=float,
+        default=TARGET_CALL_DELTA,
+        help="Target call delta for the skew anchor"
+    )
+    parser.add_argument(
         "--american",
         action="store_true",
         help="Invert IVs with the CRR American pricer instead of the European "
@@ -898,5 +1026,9 @@ if __name__ == "__main__":
 
     if args.american:
         IV_STYLE = "american"
+
+    ANCHOR_MODE = args.anchor
+    TARGET_PUT_DELTA = -abs(args.put_delta)
+    TARGET_CALL_DELTA = abs(args.call_delta)  # sign-normalized like the put side
 
     run_global_iv_skew_analysis(n_workers=args.workers, show_plot=args.plot)

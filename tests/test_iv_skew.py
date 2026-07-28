@@ -11,7 +11,6 @@ Run:  python -m pytest tests/test_iv_skew.py -q
 
 import numpy as np
 import pandas as pd
-import pytest
 
 from skew_bubble_indicator import IV_skew as X
 from pricing_and_vol_surface.vol_surface import bs_call
@@ -108,3 +107,90 @@ def test_skew_metric_reads_the_price_implied_skew():
     assert np.isfinite(put_iv) and np.isfinite(call_iv)
     assert put_iv - call_iv > 0.02           # the built-in put skew
     assert abs(put_iv - true_smile(0.90 * S)) < 0.02
+
+
+# ---------------------------------------------------------------------------
+# Delta-anchored strike selection
+# ---------------------------------------------------------------------------
+def flat_iv_chain(sigma: float = 0.20, strikes=None) -> pd.DataFrame:
+    """A validated-shape chain with KNOWN flat IVs, so target deltas map to
+    analytically checkable strikes (the selector reads strike + IV only)."""
+    if strikes is None:
+        strikes = np.arange(80.0, 121.0, 2.5)
+    return pd.DataFrame({"strike": strikes, "impliedVolatility": sigma})
+
+
+def expected_delta_strike(strikes, sigma, target, otype):
+    """Independent Black-Scholes delta computed in the test (scipy), so the
+    selector is checked against math it does not share code with."""
+    from scipy.stats import norm
+    strikes = np.asarray(strikes, dtype=float)
+    d1 = (np.log(S / strikes) + (R + 0.5 * sigma**2) * T) / (sigma * np.sqrt(T))
+    delta = norm.cdf(d1) if otype == "call" else norm.cdf(d1) - 1.0
+    return float(strikes[np.argmin(np.abs(delta - target))])
+
+
+def test_delta_anchor_picks_known_strikes_on_flat_vol():
+    sigma = 0.20
+    puts, calls = flat_iv_chain(sigma), flat_iv_chain(sigma)
+    got = X.get_delta_anchored_strike_targets(puts, calls, S, T, R)
+    assert got is not None
+    put_k, call_k = got
+    otm_puts = puts["strike"][puts["strike"] <= S]
+    otm_calls = calls["strike"][calls["strike"] >= S]
+    assert put_k == expected_delta_strike(otm_puts, sigma, -0.25, "put")
+    assert call_k == expected_delta_strike(otm_calls, sigma, 0.25, "call")
+    assert put_k < S < call_k                # anchors are OTM by construction
+
+
+def test_delta_targets_are_configurable_and_signed_or_not():
+    puts, calls = flat_iv_chain(), flat_iv_chain()
+    k25 = X.get_delta_anchored_strike_targets(puts, calls, S, T, R)
+    k10 = X.get_delta_anchored_strike_targets(
+        puts, calls, S, T, R, put_delta=-0.10, call_delta=0.10)
+    assert k10[0] < k25[0] and k10[1] > k25[1]   # 10-delta sits further OTM
+    # an unsigned put target means the same thing as the signed one
+    unsigned = X.get_delta_anchored_strike_targets(
+        puts, calls, S, T, R, put_delta=0.10, call_delta=0.10)
+    assert unsigned == k10
+
+
+def test_delta_target_constants_plumb_through(monkeypatch):
+    """Module-level targets (what the CLI flags set) are read at call time."""
+    puts, calls = flat_iv_chain(), flat_iv_chain()
+    k25 = X.get_delta_anchored_strike_targets(puts, calls, S, T, R)
+    monkeypatch.setattr(X, "TARGET_PUT_DELTA", -0.10)
+    monkeypatch.setattr(X, "TARGET_CALL_DELTA", 0.10)
+    k10 = X.get_delta_anchored_strike_targets(puts, calls, S, T, R)
+    assert k10[0] < k25[0] and k10[1] > k25[1]
+
+
+def test_delta_anchor_unavailable_falls_back_to_none():
+    good = flat_iv_chain()
+    # no finite IVs on one side -> whole selection unavailable
+    bad = flat_iv_chain(sigma=np.nan)
+    assert X.get_delta_anchored_strike_targets(bad, good, S, T, R) is None
+    assert X.get_delta_anchored_strike_targets(good, bad, S, T, R) is None
+    # ATM-only strikes: nearest delta is beyond the tolerance -> unavailable
+    atm_only = flat_iv_chain(strikes=np.array([99.0, 100.0, 101.0]))
+    assert X.get_delta_anchored_strike_targets(atm_only, atm_only, S, T, R) is None
+    # degenerate inputs
+    assert X.get_delta_anchored_strike_targets(good, good, S, 0.0, R) is None
+    assert X.get_delta_anchored_strike_targets(good, good, np.nan, T, R) is None
+
+
+def test_delta_anchored_skew_reads_the_smile_end_to_end():
+    """Full pipeline on the synthetic put-skewed smile: prices -> own IVs ->
+    delta anchors -> positive skew, without any moneyness fallback. The smile
+    is flat above 0.95*S, where the 25-delta put sits, so the 10-delta pair -
+    whose put anchor is inside the skewed wing - is what has signal here."""
+    puts = X.validate_option_data(make_chain("put"), S, T, R, "put")
+    calls = X.validate_option_data(make_chain("call"), S, T, R, "call")
+    got = X.get_delta_anchored_strike_targets(
+        puts, calls, S, T, R, put_delta=-0.10, call_delta=0.25)
+    assert got is not None
+    assert got[0] < 0.95 * S                 # the anchor reached the wing
+    put_iv = X.find_mean_iv_at_strike(puts, got[0])
+    call_iv = X.find_mean_iv_at_strike(calls, got[1])
+    assert np.isfinite(put_iv) and np.isfinite(call_iv)
+    assert put_iv - call_iv > 0.005          # the built-in put skew, delta-anchored

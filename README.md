@@ -94,14 +94,23 @@ spread, IV sanity, DTE window), and computes the OTM put-minus-call IV skew per
 name. Implied vols are **inverted from bid-ask mid prices by the repo's own
 Brent solver** (`vol_surface.iv_from_price`); yfinance's `impliedVolatility`
 field is kept only as a diagnostic column, and a mid outside the no-arbitrage
-price bounds fails inversion and drops out — a free data-quality gate. Inverted
-skew (calls richer than puts) across enough names is flagged as a
-speculative-froth signal. Snapshots are appended to CSV
+price bounds fails inversion and drops out — a free data-quality gate. The OTM
+anchors are **delta-anchored** (25-delta put/call by default, the market
+convention, computed from the repo's own IVs so every name is measured at the
+same point of its own smile), with the fixed 90%/110% moneyness bands as the
+explicit per-name fallback. Inverted skew (calls richer than puts) across
+enough names is flagged as a speculative-froth signal, and
+`threshold_study.py` measures the alert thresholds against the accumulated
+daily snapshot history — see
+[`skew_bubble_indicator/README.md`](skew_bubble_indicator/README.md) for the
+dated study table and its honest scope. Snapshots are appended to CSV
 (`daily_IV_skew_snapshot.csv`, `bubble_summary.csv`). The pipeline's IV logic is
-unit-tested offline on synthetic chains (`tests/test_iv_skew.py`).
+unit-tested offline on synthetic chains (`tests/test_iv_skew.py`,
+`tests/test_threshold_study.py`).
 
 ```bash
 python skew_bubble_indicator/IV_skew.py --workers 5 --plot
+python skew_bubble_indicator/threshold_study.py   # thresholds vs snapshot history
 ```
 
 ### `arbitrage/`
@@ -138,7 +147,15 @@ fixed policies when toxicity switches regime, and a vega-space markout (fills
 scored against the next bars' realised variance, marked up only above a
 calibrated null threshold) detects vol-informed flow — cleanly, though one
 book's vega markout is noisy enough that per-book repricing recovers only part
-of the oracle markup's edge, the honest asymmetry between the two kinds.
+of the oracle markup's edge, the honest asymmetry between the two kinds. The
+vega markout therefore **pools across books** (`pool_books`): each book quotes
+off an empirical-Bayes blend of its own estimate and the evidence-weighted
+pool mean, with shrinkage that releases as a book's own markouts accumulate —
+so a thin book borrows strength while a genuinely different book still
+separates — and a null threshold recalibrated to the pooled noise floor, which
+recovers materially more of the oracle's edge at a lower clean-flow tax (best
+case measured honestly: the pooled books face exchangeable flow by
+construction).
 `glft.py` adds a **GLFT quoting engine** (Gueant-Lehalle-Fernandez-Tapia, the
 tractable successor to Avellaneda-Stoikov): the exact finite-horizon solution
 via the linearised HJB's matrix exponential, the exact stationary quotes from
@@ -235,11 +252,16 @@ only).
   single-snapshot `griddata` interpolation of market IVs. Use `vol_surface.py`
   for the fitted, butterfly/calendar-arbitrage-free SVI/SSVI surface;
   `skew_surface()` is kept only as the naive-interpolation contrast.
-- **`IV_skew.py`'s skew/inversion thresholds are unvalidated heuristics** (the
-  IVs themselves now come from the repo's own price inverter), and the OTM
-  strikes are fixed price bands (90%/110% of spot), not delta-anchored.
-  Inversion defaults to European exercise for speed; the resulting error is
-  *measured*, not assumed — under 1 vol point for the OTM quotes consumed
+- **`IV_skew.py`'s inversion thresholds are heuristics with measured context,
+  not validated predictors** (the IVs themselves come from the repo's own
+  price inverter, and the OTM strikes are now delta-anchored with a
+  moneyness-band fallback). `threshold_study.py` measures where the
+  thresholds sit against the accumulated snapshot history — with only days of
+  history that calibrates the metric's *range* in a calm regime; it cannot
+  yet say anything about bubble-prediction power, and the study table in
+  `skew_bubble_indicator/README.md` says exactly that. Inversion defaults to
+  European exercise for speed; the resulting error is *measured*, not
+  assumed — under 1 vol point for the OTM quotes consumed
   (`tests/test_american.py`) — and `--american` switches to exercise-correct
   CRR inversion.
 - **The arbitrage scanner runs on delayed yfinance quotes.** Parity is now the
@@ -251,11 +273,11 @@ only).
   never been measured. This is a teaching/diagnostic tool, not a live signal.
 
 ## Planned
-- Pooling toxicity markouts across books/instruments in the MM simulator —
-  the step that makes per-book-noisy vega toxicity actionable.
-- Delta-anchored (rather than fixed-price-band) strike selection in
-  `IV_skew.py`, and validating its inversion thresholds against the
-  historical snapshots it has been accumulating.
+- Re-running `skew_bubble_indicator/threshold_study.py` as the snapshot
+  history grows past the current handful of days — the point where the
+  threshold table stops being range calibration and starts carrying
+  regime information. (Delta-anchored strike selection and the first
+  measured threshold context shipped 2026-07-28.)
 
 ## Note
 Research and learning code - not investment advice. Data is pulled live from

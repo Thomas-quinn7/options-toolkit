@@ -207,12 +207,62 @@ Two structural points the experiment surfaces:
   beating it when toxicity switches regime. This is the honest asymmetry
   against the directional case, where ~30 clean binary markouts per book were
   enough to nearly match the oracle: acting on vega toxicity at scale needs
-  pooling across books, which a single-option simulator cannot show.
+  **pooling across books** — which is exactly what the fourth desk below does.
 
 ![online vol toxicity](../charts/market_making/online_vol_toxicity.png)
 
+### Pooling markouts across books
+
+The vega markout is already vega-normalised — relative-variance units,
+`side * (realised var / implied var − 1)` — so its magnitudes are comparable
+across books and strikes, and it pools. With `pool_books = B > 1`, each group
+of B consecutive Monte-Carlo paths becomes the B books of **one desk**: every
+book keeps its own markout EWMA, and quotes off an empirical-Bayes blend of
+its own estimate and the evidence-weighted pool mean,
+
+```
+shrunk_i = w_i * own_i + (1 - w_i) * pooled,     w_i = n_i / (n_i + pool_shrinkage)
+```
+
+(`pool_vega_markouts` in `mm_sim.py`). A thin book borrows the pool's
+strength; a book whose own markouts keep disagreeing with the pool takes its
+weight back as its markout count `n_i` grows past `pool_shrinkage` (~one EWMA
+effective window by default) — so a genuinely different book *separates* from
+the pool instead of being averaged away. The read is causal (a cross-section
+of states built only from resolved fills), and `pool_books = 1` — the default —
+reproduces the per-book behaviour bit-for-bit.
+
+Where the edge actually comes from is worth stating precisely: pooling ten
+books cuts the estimate's dispersion by roughly a third-to-half, and that lets
+the desk **recalibrate its null threshold down** (~0.05 vs the per-book 0.10
+— the deadband exists purely to reject the clipped estimator's noise floor,
+and the pooled floor is lower). Same markup rule, same slope, same cap: the
+pooled desk recovers roughly **twice the per-book desk's share** of the
+oracle's stationary-toxic edge at about **half its clean-flow tax**, and
+keeps the adaptive desk's win over the oracle on the regime switch. The
+recovered share is still partial, not total — the estimate's own attenuation
+(netting, regime turnover inside the markout window, the zero-anchored EWMA)
+is untouched by pooling — and the tests pin the ordering, not a headline
+percentage.
+
+What pooling assumes, honestly: **cross-book exchangeability** of
+vega-normalised toxicity — the pooled books differ only in noise, not in
+clientele. Here that holds *by construction* (every path faces the same
+`vol_toxicity` schedule), so the experiment measures pooling's best case,
+deliberately. A real desk's book with structurally different flow violates
+it, and until that book accumulates ~`pool_shrinkage` of its own markouts the
+pool actively drags its estimate toward the crowd: pooling trades per-book
+variance for cross-book contamination bias, and `pool_shrinkage` is the
+exchange rate. The borrow-then-release mechanics are tested directly at the
+estimator level (the simulator cannot yet give one book its own toxicity
+in-path).
+
 `tests/test_mm.py` asserts the discrimination (both directions), the
-gamma-P&L identity under full vol paths, and the three desk-comparison facts.
+gamma-P&L identity under full vol paths, the three desk-comparison facts,
+and for pooling: the faster convergence on exchangeable flow, the
+borrow-then-release shrinkage, causality of the pooled estimate, the pooled
+desk's recovered edge, and that the default (`pool_books = 1`) path is
+byte-identical to the per-book estimator.
 
 ## Deriving the quotes instead of picking them (Experiment G)
 
@@ -331,10 +381,16 @@ uninformed flow with uncertain realised vol:
 
 * One option, constant implied vol, Gaussian GBM — no vol surface, no jumps, no
   stochastic vol, so no vanna/volga or skew dynamics.
-* Both toxicity kinds are now estimated online (Experiments E and F), but
-  each book learns only from its own fills. The realistic next step is
-  pooling markouts across books/instruments, which is where per-book-noisy
-  vega toxicity becomes actionable.
+* Both toxicity kinds are estimated online (Experiments E and F), and the
+  vega markout now pools across books with shrinkage (`pool_books`) — but the
+  pooled books here share one toxicity process by construction, so the
+  simulator demonstrates pooling's exchangeable best case only. Giving one
+  book its own toxicity in-path (to price the contamination cost of pooling
+  a structurally different book, rather than bounding it via
+  `pool_shrinkage`) needs per-book flow processes the simulator doesn't have
+  yet. The directional markout stays per-book on purpose: ~30 binary
+  markouts already nearly match the oracle there, so pooling has nothing
+  material to add.
 * Experiment H adds *self*-excitation (fills breeding same-side fills on one
   book); the other half of the Baldacci gap is *cross*-excitation — a fill on
   one strike exciting flow on neighbouring strikes — which needs the

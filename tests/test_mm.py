@@ -24,6 +24,7 @@ from market_making.mm_sim import (
     experiment_toxic_spread,
     experiment_vol_informed_flow,
     experiment_vol_spread_defence,
+    pool_vega_markouts,
     simulate_paths,
 )
 
@@ -312,6 +313,157 @@ def test_adaptive_vol_markup_is_priced_not_free():
     clean_half = float(np.mean(track[n // 4: n // 2]))
     toxic_tail = float(np.mean(track[-n // 5:]))
     assert toxic_tail > clean_half + 0.05
+
+
+# --------------------------------------------------------------------------- #
+# Cross-book pooling of the vega markout                                      #
+# --------------------------------------------------------------------------- #
+def test_pooling_off_is_identical():
+    """pool_books=1 (the default) must be the pre-pooling per-book path
+    bit-for-bit - same RNG stream, same arithmetic, same outputs. And with
+    the adaptive markup OFF, pooling is a read-only layer: turning it on must
+    not change a single P&L number either."""
+    base = MMParams(flow_imbalance=0.0)
+    sig = _regime_vol_paths(base, 0.06, 800, seed=9)
+    kw = dict(flow_imbalance=0.0, vol_toxicity=0.6,
+              adaptive_vol_spread=True, vol_spread_slope=0.06)
+    a = simulate_paths(MMParams(**kw), sig, 800,
+                       np.random.default_rng(3), quoting=True)
+    b = simulate_paths(MMParams(**kw, pool_books=1, pool_shrinkage=5.0), sig, 800,
+                       np.random.default_rng(3), quoting=True)
+    for key in ("total_pnl", "spread_capture", "fills", "volmark_final",
+                "volmark_pooled_final", "volmark_track", "tox_hat_final"):
+        assert np.array_equal(a[key], b[key]), key
+    # pooling off: the acting estimate IS the per-book estimate
+    assert np.array_equal(a["volmark_final"], a["volmark_pooled_final"])
+    # adaptive markup off: pooling only reads state, so P&L is untouched
+    c = simulate_paths(MMParams(flow_imbalance=0.0, vol_toxicity=0.6), sig, 800,
+                       np.random.default_rng(3), quoting=True)
+    d = simulate_paths(MMParams(flow_imbalance=0.0, vol_toxicity=0.6,
+                                pool_books=8), sig, 800,
+                       np.random.default_rng(3), quoting=True)
+    for key in ("total_pnl", "spread_capture", "fills", "volmark_final"):
+        assert np.array_equal(c[key], d[key]), key
+    # config validation: path count must group evenly into books
+    with pytest.raises(ValueError):
+        simulate_paths(MMParams(pool_books=7), 0.2, 10, np.random.default_rng(0))
+
+
+def test_pooled_estimate_converges_faster_synthetic():
+    """On synthetic common-toxicity markouts (every book sees noisy draws of
+    the SAME mean - the exchangeable case), the pooled/shrunk estimate must
+    converge faster than the per-book EWMA: materially less dispersed at
+    every horizon, and closer to the truth once the shared zero-anchor bias
+    (the conservative prior, which pooling deliberately keeps) has washed
+    out. The update rule mirrors the simulator's."""
+    rng = np.random.default_rng(0)
+    B, alpha, kappa, mu = 10, 0.08, 20.0, 0.3
+    n_desks = 200
+    x = np.zeros(n_desks * B)
+    nobs = np.zeros(n_desks * B)
+    for step in range(1, 31):
+        obs = mu + rng.normal(0.0, np.sqrt(2.0 / 5.0), n_desks * B)  # K=5 markout noise
+        x += alpha * (obs - x)
+        nobs += 1.0
+        if step in (10, 30):
+            pooled = pool_vega_markouts(x, nobs, B, kappa, alpha)
+            assert float(pooled.std()) < 0.7 * float(x.std()), step
+    rmse_own = float(np.sqrt(np.mean((x - mu) ** 2)))
+    rmse_pool = float(np.sqrt(np.mean((pooled - mu) ** 2)))
+    assert rmse_pool < 0.8 * rmse_own
+
+
+def test_pooled_estimate_less_noisy_in_sim():
+    """Inside the simulator, on flow with one COMMON vol-toxicity, the pooled
+    acting estimate must be materially less dispersed across books than the
+    per-book one at the same horizon, without losing the signal - and on
+    clean flow its phantom-toxicity floor (the clipped noise) must drop."""
+    base = MMParams(flow_imbalance=0.0)
+    sig = _regime_vol_paths(base, 0.06, 2000, seed=9)
+    toxic = simulate_paths(MMParams(vol_toxicity=0.6, pool_books=10), sig, 2000,
+                           np.random.default_rng(9), quoting=True)
+    per_book, pooled = toxic["volmark_final"], toxic["volmark_pooled_final"]
+    assert float(pooled.std()) < 0.75 * float(per_book.std())
+    assert float(pooled.mean()) > 0.75 * float(per_book.mean())   # signal kept
+    clean = simulate_paths(MMParams(pool_books=10), sig, 2000,
+                           np.random.default_rng(9), quoting=True)
+    assert (float(clean["volmark_pooled_final"].mean())
+            < 0.8 * float(clean["volmark_final"].mean()))
+
+
+def test_pool_shrinkage_borrows_then_releases():
+    """A thin book's acting estimate must sit near the pool (borrowing
+    strength); as its own markout count grows, the weight returns to its own
+    estimate - a genuinely different book separates from the pool instead of
+    being averaged away, and the clean books are barely contaminated."""
+    B, alpha, kappa = 8, 0.08, 20.0
+    own = 0.5                       # one book persistently reads vega-toxic
+    counts = [0.0, 5.0, 20.0, 60.0, 300.0]
+    ests = []
+    for n_own in counts:
+        x = np.concatenate([[own], np.zeros(B - 1)])
+        n = np.concatenate([[n_own], np.full(B - 1, 60.0)])
+        est = pool_vega_markouts(x, n, B, kappa, alpha)
+        ests.append(float(est[0]))
+        clean_books = est[1:]
+        # the outlier's contamination of the clean books stays small
+        assert float(np.max(clean_books)) < 0.05
+    # no own evidence: act on the pool (its own unsupported EWMA is ignored)
+    assert ests[0] < 0.02
+    # thin book: still mostly pooled
+    assert ests[1] < 0.5 * own
+    # evidence accumulates: weight released back to the book's own estimate
+    assert np.all(np.diff(ests) > 0)
+    assert ests[-1] > 0.9 * own * (300.0 / (300.0 + kappa))
+    assert ests[-1] > 0.4
+
+
+def test_pooled_estimate_is_causal():
+    """The acting (pooled) estimate at step t may use only fills resolved
+    before t: two runs whose flow differs only from step m onward must show
+    identical estimate tracks up to and including m, then diverge."""
+    base = MMParams(flow_imbalance=0.0)
+    n = base.n_steps
+    m = n // 2
+    sched_a = np.zeros(n)
+    sched_b = np.where(np.arange(n) < m, 0.0, 0.6)
+    sig = _regime_vol_paths(base, 0.06, 400, seed=9)
+    kw = dict(flow_imbalance=0.0, adaptive_vol_spread=True,
+              vol_spread_slope=0.06, volmark_deadband=0.05, pool_books=8)
+    ra = simulate_paths(MMParams(**kw, vol_toxicity_schedule=sched_a), sig, 400,
+                        np.random.default_rng(21), quoting=True)
+    rb = simulate_paths(MMParams(**kw, vol_toxicity_schedule=sched_b), sig, 400,
+                        np.random.default_rng(21), quoting=True)
+    assert np.array_equal(ra["volmark_track"][: m + 1],
+                          rb["volmark_track"][: m + 1])
+    assert not np.array_equal(ra["volmark_track"], rb["volmark_track"])
+
+
+def test_pooled_markup_recovers_more_of_the_oracle_edge():
+    """The point of pooling (the README's planned item, now implemented): one
+    book's vega markout is too noisy to act on aggressively; ten books'
+    pooled markout - with the null threshold recalibrated to the pooled
+    noise floor - is not. Same markup rule, same slope and cap."""
+    online = experiment_online_vol_toxicity(MMParams(flow_imbalance=0.0),
+                                            n_sims=2500, seed=7, pool_books=10)
+    t = online["totals"]
+    # stationary vol-toxic flow: pooled beats per-book adaptive and static
+    assert t[("vol-toxic", "adaptive-pooled")] > t[("vol-toxic", "adaptive")] + 0.015
+    assert t[("vol-toxic", "adaptive-pooled")] > t[("vol-toxic", "static")] + 0.05
+    # clean flow: the pooled desk's phantom-toxicity tax is SMALLER than the
+    # per-book desk's, despite its lower deadband - less noise to rectify
+    assert t[("clean", "adaptive-pooled")] > t[("clean", "adaptive")]
+    assert (t[("clean", "static")] - t[("clean", "adaptive-pooled")]
+            < 0.75 * (t[("clean", "static")] - t[("clean", "adaptive")]))
+    # regime switch: pooling keeps the adaptive desk's edge over the oracle
+    assert (t[("regime switch", "adaptive-pooled")]
+            > t[("regime switch", "oracle-markup")] + 0.15)
+    # and the pooled acting estimate still tracks the switch
+    track = online["tracks"]["regime switch (pooled)"]
+    n = len(track)
+    clean_half = float(np.mean(track[n // 4: n // 2]))
+    toxic_tail = float(np.mean(track[-n // 5:]))
+    assert toxic_tail > clean_half + 0.04
 
 
 # --------------------------------------------------------------------------- #

@@ -84,6 +84,24 @@ MIN_SLICES = 3
 IV_MIN, IV_MAX = 0.03, 2.0
 Q_ABS_MAX = 0.08             # parity-implied |div/borrow| above this means the
                              # quotes are stale, not that the carry is real
+DIV_ABS_ALLOWANCE = 0.006    # ...but allow one discrete dividend (~60bp of
+                             # spot) through on top: see build_slice.
+
+# Fit-quality gates. The no-arb diagnostics are still RECORDED on every row
+# (that is the point of the history); `fit_ok` only marks the rows whose
+# surface is too degenerate for a downstream consumer to read a skew or a term
+# structure off, so the diagnostics stay visible without poisoning the studies.
+RHO_AT_BOUND = 0.998         # fit_ssvi_band bounds rho at +-0.999; landing on
+                             # the bound means the optimiser ran out of room
+CAL_GAP_FRAC = 0.50          # calendar gap may dip this far (relative to the
+                             # largest theta) before the surface is unusable.
+                             # Real fits separate cleanly: the worst honest
+                             # violation seen is XLE at -15% of theta (a wing
+                             # imperfection you can still read skew through),
+                             # while a collapsed fit is -183% (XLK, 07-30/31) -
+                             # total variance nearly 2x theta lower at the long
+                             # end than the short. Anything under half a theta
+                             # is recorded and used; past that it is unreadable.
 
 # The history CSV records every captured ticker, but the chart caps at 8
 # series - the palette has 8 fixed slots (plotstyle) and more lines per panel
@@ -95,8 +113,32 @@ MAX_CHART_SERIES = 8
 HISTORY_COLUMNS = [
     "snapshot_date", "ticker", "spot", "riskfree", "n_expiries", "n_quotes",
     "rho", "eta", "gamma", "atm_vol_30d", "atm_vol_91d", "atm_vol_182d",
-    "term_slope", "min_butterfly_g", "calendar_min_gap",
+    "term_slope", "min_butterfly_g", "calendar_min_gap", "fit_ok",
 ]
+
+
+def fit_is_usable(rho: float, min_g: float, cal_gap: float,
+                  theta_scale: float) -> bool:
+    """Is this fitted surface solid enough to read skew/term structure off?
+
+    Not a re-check of the no-arb diagnostics - those are recorded either way -
+    but a check that the OPTIMISER converged to something interpretable:
+
+    * ``|rho|`` on ``fit_ssvi_band``'s bound means the fit ran out of room
+      rather than settling, and the wings blow up with it.
+    * A calendar gap materially below zero means total variance FALLS with
+      maturity somewhere on the surface, so no term structure can be read.
+
+    Both fire on thin chains where only long-dated slices survive - XLK fitted
+    rho = +0.999 with a calendar gap of -1.31 on 2026-07-30 and 07-31.
+    """
+    if not np.isfinite(rho) or abs(rho) >= RHO_AT_BOUND:
+        return False
+    if not np.isfinite(cal_gap) or cal_gap < -CAL_GAP_FRAC * theta_scale:
+        return False
+    if not np.isfinite(min_g) or min_g < 0.0:
+        return False
+    return True
 
 
 # --------------------------------------------------------------------------- #
@@ -142,7 +184,15 @@ def build_slice(slice_df: pd.DataFrame, snapshot_date: str, expiry: str,
     # Dividend/borrow implied by the forward itself; the inverter then prices
     # with an (S, q) pair exactly consistent with F.
     q = r - np.log(F / spot) / T
-    if abs(q) > Q_ABS_MAX:
+    # Gate the forward BASIS, not q itself. q is a continuous-yield abstraction,
+    # so a single discrete dividend inside a short window annualises into a huge
+    # |q| even when the quotes are perfect: TLT's monthly distribution put
+    # |q| = 15% on the 16d slice and 10% on the 23d slice, and a flat |q| <= 8%
+    # bound then deleted every expiry inside ~45 days for the dividend payers -
+    # which is exactly where the 30d ATM vol has to be read. Bounding
+    # |ln(F/S) - rT| keeps the staleness test the gate was added for (a forward
+    # several percent off spot is still refused) without the 1/T amplification.
+    if abs(np.log(F / spot) - r * T) > Q_ABS_MAX * T + DIV_ABS_ALLOWANCE:
         return None
 
     otm = slice_df[
@@ -239,6 +289,8 @@ def fit_day_ticker(df: pd.DataFrame) -> Optional[Dict]:
         "term_slope": round(v182 - v30, 6),
         "min_butterfly_g": round(float(min_g), 6),
         "calendar_min_gap": round(float(cal_gap), 8),
+        "fit_ok": fit_is_usable(float(p.rho), float(min_g), float(cal_gap),
+                                float(np.max(thetas))),
     }
 
 
@@ -247,8 +299,34 @@ def fit_day_ticker(df: pd.DataFrame) -> Optional[Dict]:
 # --------------------------------------------------------------------------- #
 def load_history(path: str = HISTORY_CSV) -> pd.DataFrame:
     if os.path.exists(path):
-        return pd.read_csv(path, dtype={"snapshot_date": str, "ticker": str})
+        hist = pd.read_csv(path, dtype={"snapshot_date": str, "ticker": str})
+        if "fit_ok" not in hist.columns:
+            # History written before the fit-quality flag existed: recover it
+            # from the diagnostics already stored on each row rather than
+            # assuming those rows were fine (two of them were not).
+            hist["fit_ok"] = [
+                fit_is_usable(row.rho, row.min_butterfly_g,
+                              row.calendar_min_gap,
+                              # theta scale isn't stored; the 182d ATM variance
+                              # is the closest proxy the row carries.
+                              (row.atm_vol_182d ** 2) * (182 / 365)
+                              if np.isfinite(row.atm_vol_182d) else 0.0)
+                for row in hist.itertuples(index=False)
+            ]
+        return hist
     return pd.DataFrame(columns=HISTORY_COLUMNS)
+
+
+def usable_history(hist: pd.DataFrame) -> pd.DataFrame:
+    """History rows a dynamics study may read: the non-degenerate fits.
+
+    The degenerate rows stay in the CSV - the whole point of recording the
+    no-arb diagnostics is that a bad day is visible - but a skew or
+    term-structure study must not treat them as observations.
+    """
+    if hist.empty or "fit_ok" not in hist.columns:
+        return hist
+    return hist[hist["fit_ok"].astype(bool)].reset_index(drop=True)
 
 
 def update_history(rows: List[Dict], path: str = HISTORY_CSV) -> pd.DataFrame:
@@ -377,7 +455,8 @@ def main(argv: Optional[List[str]] = None) -> None:
               f"atm30={row['atm_vol_30d']:.4f}  slope={row['term_slope']:+.4f}  "
               f"min_g={row['min_butterfly_g']:+.4f}  "
               f"cal_gap={row['calendar_min_gap']:+.6f}  "
-              f"({row['n_quotes']} quotes / {row['n_expiries']} expiries)")
+              f"({row['n_quotes']} quotes / {row['n_expiries']} expiries)"
+              f"{'' if row['fit_ok'] else '  [DEGENERATE FIT - excluded]'}")
     for day, ticker in skipped:
         print(f"  {day} {ticker}: not enough usable slices - skipped")
 

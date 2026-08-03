@@ -56,7 +56,9 @@ _REPO = os.path.dirname(_HERE)
 if _REPO not in sys.path:
     sys.path.insert(0, _REPO)
 
-from vol_snapshots.fit_history import HISTORY_CSV, load_history  # noqa: E402
+from vol_snapshots.fit_history import (  # noqa: E402
+    HISTORY_CSV, load_history, usable_history,
+)
 
 EVENTS_CSV = os.path.join(_HERE, "event_vol.csv")
 CHART_PATH = os.path.join(_REPO, "charts", "vol_surface", "event_vol.png")
@@ -214,7 +216,7 @@ def main(argv: Optional[List[str]] = None) -> None:
     ap.add_argument("--no-chart", action="store_true")
     args = ap.parse_args(argv)
 
-    hist = load_history(args.history)
+    hist = usable_history(load_history(args.history))
     if hist.empty:
         print("no surface history yet - run vol_snapshots/fit_history.py first")
         return

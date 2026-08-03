@@ -7,16 +7,33 @@ yfinance chain frames into it, and the write/load round-trip across days.
 Run:  python -m pytest tests/test_snapshots.py -q
 """
 
+import datetime as dt
+
 import numpy as np
 import pandas as pd
 import pytest
 
+from vol_snapshots import capture
 from vol_snapshots.capture import (
     COLUMNS,
     load_snapshots,
     normalize_chain,
     save_snapshot,
 )
+
+
+class _FixedDate:
+    """Stand-in for the ``datetime`` module whose ``date.today()`` is pinned,
+    so the non-trading-day guard can be tested on a chosen weekday or holiday
+    without waiting for one to come round.
+
+    Patched over ``capture._dt`` rather than over ``datetime.date`` itself:
+    the latter is a shared module attribute, and mutating it would pin
+    ``today()`` for the whole test session, not just this module.
+    """
+
+    def __init__(self, fixed):
+        self.date = type("_D", (), {"today": staticmethod(lambda: fixed)})
 
 
 def fake_yf_chain(strikes, bids, asks, iv=0.2):
@@ -83,3 +100,65 @@ def test_load_empty_root_is_empty_frame(tmp_path):
     out = load_snapshots(str(tmp_path / "nothing_here"))
     assert list(out.columns) == COLUMNS
     assert len(out) == 0
+
+
+# --------------------------------------------------------------------------- #
+# Non-trading-day guard                                                        #
+# --------------------------------------------------------------------------- #
+def test_capture_skips_weekend_without_touching_the_network(monkeypatch, capsys):
+    """Saturday short-circuits before any fetch: no network call at all."""
+    monkeypatch.setattr(capture, "_dt", _FixedDate(dt.date(2026, 8, 1)))
+    monkeypatch.setattr(capture, "last_session_date",
+                        lambda *a, **k: pytest.fail("should not query the market"))
+    monkeypatch.setattr(capture, "capture_ticker",
+                        lambda *a, **k: pytest.fail("should not capture"))
+    capture.main([])
+    assert "weekend" in capsys.readouterr().out.lower()
+
+
+def test_capture_skips_market_holiday(monkeypatch, capsys):
+    """A holiday is a WEEKDAY, so the weekend guard alone would have written
+    a stale snapshot. The last-session check is what refuses it: on Labor Day
+    2026-09-07 the freshest bar is still Friday the 4th."""
+    monkeypatch.setattr(capture, "_dt", _FixedDate(dt.date(2026, 9, 7)))
+    monkeypatch.setattr(capture, "last_session_date",
+                        lambda *a, **k: dt.date(2026, 9, 4))
+    monkeypatch.setattr(capture, "capture_ticker",
+                        lambda *a, **k: pytest.fail("should not capture"))
+    capture.main([])
+    out = capsys.readouterr().out
+    assert "not a trading session" in out and "2026-09-04" in out
+
+
+def test_capture_proceeds_on_a_normal_session(monkeypatch):
+    monkeypatch.setattr(capture, "_dt", _FixedDate(dt.date(2026, 9, 8)))
+    monkeypatch.setattr(capture, "last_session_date",
+                        lambda *a, **k: dt.date(2026, 9, 8))
+    monkeypatch.setattr(capture, "_fetch_riskfree", lambda: 0.04)
+    seen = []
+    monkeypatch.setattr(capture, "capture_ticker",
+                        lambda t, d, r, **k: seen.append((t, d)))
+    capture.main(["SPY"])
+    assert seen == [("SPY", "2026-09-08")]
+
+
+def test_capture_proceeds_when_the_session_check_is_unavailable(monkeypatch):
+    """Network trouble must not cost a real trading day - fail open."""
+    monkeypatch.setattr(capture, "_dt", _FixedDate(dt.date(2026, 9, 8)))
+    monkeypatch.setattr(capture, "last_session_date", lambda *a, **k: None)
+    monkeypatch.setattr(capture, "_fetch_riskfree", lambda: 0.04)
+    seen = []
+    monkeypatch.setattr(capture, "capture_ticker",
+                        lambda t, d, r, **k: seen.append(t))
+    capture.main(["SPY"])
+    assert seen == ["SPY"]
+
+
+def test_force_overrides_the_guard(monkeypatch):
+    monkeypatch.setattr(capture, "_dt", _FixedDate(dt.date(2026, 8, 1)))
+    monkeypatch.setattr(capture, "_fetch_riskfree", lambda: 0.04)
+    seen = []
+    monkeypatch.setattr(capture, "capture_ticker",
+                        lambda t, d, r, **k: seen.append(t))
+    capture.main(["SPY", "--force"])
+    assert seen == ["SPY"]

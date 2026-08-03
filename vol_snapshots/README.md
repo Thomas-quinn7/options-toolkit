@@ -16,6 +16,14 @@ Each run writes one tidy `csv.gz` per ticker under `data/<YYYY-MM-DD>/`
 (~1.5 MB/day for the default list) and is **idempotent per day** — already
 captured tickers are skipped, so a scheduler double-fire is harmless.
 
+A run on a **non-trading day refuses to capture** unless given `--force`,
+because what yfinance serves then is the previous session's after-close
+marks: stale mids that once implied a −37% AAPL dividend yield downstream.
+Whether today is a session is decided by asking if a daily bar exists for it,
+not from a holiday table — so market holidays (a holiday is a *weekday*, and
+a weekend-only guard would have written a stale Labor Day snapshot) and
+unscheduled closures are both covered, and there is no table to keep current.
+
 The default universe (13 names): index ETFs (SPY, QQQ, IWM), mega-cap singles
 with earnings vol (AAPL, MSFT, NVDA, TSLA), sector rotation (XLF, XLE, XLK),
 rates (TLT), gold (GLD), and the vol complex itself (VXX). The macro complex
@@ -33,6 +41,24 @@ calendar gap) are recorded in the row — a day the fit could *not* be made
 arb-free is visible in the data, not assumed away. The accumulated history
 (ATM vol, skew `rho`, term-structure slope per ticker over time) is charted to
 `charts/vol_surface/surface_history.png`.
+
+Two gates are worth knowing about, because both were tightened by what real
+chains actually did:
+
+- **Stale-quote gate on the forward basis, not on `q`.** A forward far from
+  spot means stale marks, but `q = r - ln(F/S)/T` is a *continuous*-yield
+  reading, so one discrete dividend inside a short window annualises into a
+  huge `|q|` even when the quotes are perfect — TLT's monthly distribution
+  showed up as `|q| = 15%` on the 16d slice. Bounding `|ln(F/S) - rT|` instead
+  keeps the staleness test without the `1/T` blow-up that was silently
+  deleting every near-dated expiry of the dividend payers, and with them the
+  30d ATM vol the history exists to record.
+- **`fit_ok`** marks rows whose fit *collapsed* — `|rho|` on the optimiser's
+  bound, or total variance falling with maturity by more than half a theta.
+  These are still written to the CSV with their diagnostics intact; the
+  dynamics studies just refuse to read them as observations. Thin chains
+  (XLF, XLK) are where this fires: when only long-dated slices survive, the
+  fit has nothing pinning the short end and runs to its bound.
 
 ```bash
 python vol_snapshots/fit_history.py             # fit all unfitted days

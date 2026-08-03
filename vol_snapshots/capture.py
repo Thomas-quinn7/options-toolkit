@@ -14,7 +14,13 @@ so this script makes each day's chains a one-command habit:
 Each run writes one tidy csv.gz per ticker under
 ``vol_snapshots/data/<YYYY-MM-DD>/`` and is idempotent per day (already
 captured tickers are skipped, so a cron/Task-Scheduler double-fire is
-harmless). Captured columns are exactly what the repo's fitters need later:
+harmless). Runs on a non-trading day refuse to capture unless ``--force``:
+the quotes served would be the previous session's stale after-close marks.
+Trading days are detected by asking whether a daily bar exists for today
+rather than from a holiday table, so market holidays and unscheduled
+closures are both covered and nothing expires.
+
+Captured columns are exactly what the repo's fitters need later:
 bid/ask (band calibration fits the quoted interval, not a mid), strike,
 expiry, spot at capture, volume/open-interest (liquidity gates), and
 yfinance's own IV field kept only for cross-checking - the repo inverts its
@@ -134,6 +140,28 @@ def _fetch_riskfree() -> float:
         return float("nan")
 
 
+def last_session_date(reference: str = "SPY") -> Optional[_dt.date]:
+    """Date of the most recent daily bar for ``reference``, in exchange time.
+
+    A daily bar exists only for a day the market actually traded, so this
+    answers "did the US market trade today?" without carrying a holiday table
+    that would silently expire - and it covers unscheduled closures (weather,
+    days of mourning) that a hardcoded table would miss entirely.
+
+    Returns None if the fetch failed, in which case the caller should proceed:
+    a network problem shows up as per-ticker failures with their own messages,
+    and refusing to capture on an unreachable network would lose a real day.
+    """
+    try:
+        import yfinance as yf
+        h = yf.Ticker(reference).history(period="7d")
+        if h.empty:
+            return None
+        return h.index[-1].date()
+    except Exception:
+        return None
+
+
 def capture_ticker(ticker: str, snapshot_date: str, riskfree: float,
                    root: str = DATA_ROOT) -> Optional[str]:
     """Fetch and store all expiries for one ticker; returns the path written,
@@ -149,6 +177,14 @@ def capture_ticker(ticker: str, snapshot_date: str, riskfree: float,
         print(f"  {ticker}: no spot price - skipped")
         return None
     spot = float(hist.iloc[-1])
+    # A per-ticker stale bar on a day the market DID trade means this name
+    # halted or stopped trading. Its chains are still worth keeping, but the
+    # spot they are paired with is from another session, which shows up
+    # downstream as a forward/spot basis that is not carry - so say so.
+    spot_date = hist.index[-1].date().isoformat()
+    if spot_date != snapshot_date:
+        print(f"  {ticker}: WARNING spot is from {spot_date}, not "
+              f"{snapshot_date} - implied forward will be off by the move")
     parts = []
     for expiry in tk.options:
         try:
@@ -175,13 +211,26 @@ def main(argv: Optional[list] = None) -> None:
     args = list(argv) if argv else []
     force = "--force" in args
     tickers = [a for a in args if a != "--force"] or DEFAULT_TICKERS
-    # Weekend captures serve Friday's after-close quotes: junk mids that once
-    # implied a -37% AAPL dividend yield downstream. Refuse unless forced.
-    if _dt.date.today().weekday() >= 5 and not force:
+    # Captures on a non-trading day serve the previous session's after-close
+    # quotes: junk mids that once implied a -37% AAPL dividend yield
+    # downstream. Refuse unless forced.
+    today = _dt.date.today()
+    if today.weekday() >= 5 and not force:
+        # Cheap short-circuit: no network call needed to know it's a weekend.
         print("Market closed (weekend) - today's chains are stale after-close "
               "quotes. Skipping capture; pass --force to capture anyway.")
         return
-    snapshot_date = _dt.date.today().isoformat()
+    if not force:
+        # Weekdays still need the check: a market holiday is a weekday, and
+        # the weekend guard alone would have written a stale Labor Day /
+        # Thanksgiving / Christmas snapshot as if it were a session.
+        last = last_session_date()
+        if last is not None and last != today:
+            print(f"Market closed ({today} is not a trading session - last was "
+                  f"{last}) - today's chains are stale after-close quotes. "
+                  "Skipping capture; pass --force to capture anyway.")
+            return
+    snapshot_date = today.isoformat()
     riskfree = _fetch_riskfree()
     print(f"Capturing option chains for {snapshot_date} "
           f"(riskfree ^IRX = {riskfree if riskfree == riskfree else 'n/a'})")

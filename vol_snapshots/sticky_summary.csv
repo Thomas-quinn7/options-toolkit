@@ -1,0 +1,2 @@
+ticker,n_pairs,rms_strike,rms_delta,beta,beta_se,verdict
+MSFT,15,0.008121,0.004101,-0.157321,0.612585,sticky-delta

@@ -1,4 +1,7 @@
 ticker,n_pairs,rms_strike,rms_delta,beta,beta_se,verdict
-MSFT,16,0.00769,0.003921,-0.159094,0.591901,sticky-delta
+AAPL,15,0.00417,0.001561,1.447662,0.471583,sticky-delta
+GLD,15,0.00371,0.003482,1.562437,1.170847,sticky-delta
+IWM,15,0.001727,0.00213,0.214224,0.302786,sticky-strike
+MSFT,17,0.007362,0.003739,-0.16343,0.572755,sticky-delta
 QQQ,15,0.002706,0.003174,0.453164,0.254344,sticky-strike
-TSLA,15,0.004203,0.003344,-1.303595,1.244389,sticky-delta
+TSLA,16,0.004707,0.003304,-0.983546,1.259322,sticky-delta

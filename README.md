@@ -33,8 +33,10 @@ Write-up: [`pricing_and_vol_surface/VOL_SURFACE.md`](pricing_and_vol_surface/VOL
 
 ![density check](charts/vol_surface/density_check.png)
 
-**And it runs on real data, daily.** A scheduled capture snapshots live option
-chains every close; the SSVI band surface is fitted to each day's chains
+**And it runs on real data.** I capture live option chains myself, since free
+data has no history. The capture ran every trading day from 25 July to 4
+September 2026 and only occasionally after that (11 and 25 September, 2
+October), so the history is 35 capture days with gaps in it. The SSVI band surface is fitted to each captured day's chains
 (forwards implied from put-call parity, IVs inverted from prices, no-arb
 diagnostics recorded per fit) and the fitted parameters accumulate into a
 surface-dynamics time series. Details: [`vol_snapshots/README.md`](vol_snapshots/README.md).
@@ -101,7 +103,7 @@ same point of its own smile), with the fixed 90%/110% moneyness bands as the
 explicit per-name fallback. Inverted skew (calls richer than puts) across
 enough names is flagged as a speculative-froth signal, and
 `threshold_study.py` measures the alert thresholds against the accumulated
-daily snapshot history — see
+snapshot history — see
 [`skew_bubble_indicator/README.md`](skew_bubble_indicator/README.md) for the
 dated study table and its honest scope. Snapshots are appended to CSV
 (`daily_IV_skew_snapshot.csv`, `bubble_summary.csv`). The pipeline's IV logic is
@@ -192,7 +194,7 @@ sticky-delta, term-structure signals), none of which can be studied without a
 time series that only accumulates if capture starts now. Schema and IO are
 covered offline by `tests/test_snapshots.py`; see `vol_snapshots/README.md`.
 
-`fit_history.py` is the daily consumer: it fits the repo's **SSVI band
+`fit_history.py` is the consumer: it fits the repo's **SSVI band
 surface** to every captured chain (forwards from put-call parity, IVs
 inverted from prices, no-arb diagnostics recorded per fit) and accumulates
 the fitted parameters — ATM vol, skew `rho`, term-structure slope — in

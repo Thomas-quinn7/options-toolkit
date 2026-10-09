@@ -30,15 +30,16 @@ from dragging the fit off the reliable ATM quotes.
 
 **Surface history** — the SSVI band fit applied to each day's captured real
 chains (`python vol_snapshots/fit_history.py`): ATM vol, skew `rho` and term
-slope per ticker over time, arb-checked daily.
+slope per ticker over time, arb-checked on every fit. Captures ran every trading
+day from 25 July to 4 September 2026 and only occasionally since, so the series has gaps.
 ![surface history](vol_surface/surface_history.png)
 
 **Realised-vs-implied replay** — short ATM straddles on the captured chains,
-delta-hedged daily at entry IV (`python vol_snapshots/replay.py`). Once positions
-have aged it will show hedged P&L paths against their gamma-P&L theory, and final
-P&L vs realised-minus-implied vol as positions settle; with the capture history
-currently at day 0, the chart below is an empty frame by construction — the
-nightly scheduled run fills it in as the dataset accrues.
+delta-hedged daily at entry IV (`python vol_snapshots/replay.py`). It shows hedged
+P&L paths against their gamma-P&L theory, and final P&L vs realised-minus-implied vol
+for settled positions. As of 2 October 2026, 15 positions have settled. The other 11,
+opened between 31 August and 11 September, are still marked open because the capture gaps
+after 4 September left them without marks, so treat them as incomplete.
 ![replay](market_making/replay_realised_vs_implied.png)
 
 **Band fit** — calibrating to the bid-ask interval instead of a point mid.

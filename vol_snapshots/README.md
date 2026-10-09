@@ -135,9 +135,15 @@ outputs `event_vol.csv` + `charts/vol_surface/event_vol.png`.
 effect** (a name's ATM vol vs its own return — expected beta < 0), reported
 in vol points per 1% move with 2-s.e. bars. Gated at 15 matched day-pairs per
 ticker; outputs `skew_dynamics.csv` + `charts/vol_surface/skew_dynamics.png`.
+Day-pairs that span a single-name earnings release are dropped (an explicit
+calendar, `EARNINGS` in the script): the post-earnings vol crush otherwise
+dominates, and on its own it turned MSFT into the strongest "leverage effect"
+in the set (-0.63, which is -0.14 and not significant without that one day).
 
-Both studies (like `sticky.py`) run in the scheduled task every night and stay
-silent apart from an "accumulating" log line until their data threshold trips.
+Both studies (like `sticky.py`) run as part of the scheduled capture task and
+stay silent apart from an "accumulating" log line until their data threshold
+trips. The capture has not run every day since 4 September 2026, so the
+current results cover 25 July to 4 September.
 Pinned offline by `tests/test_event_vol.py` (injected synthetic event + flat
 control) and `tests/test_skew_dynamics.py` (known injected dynamics).
 

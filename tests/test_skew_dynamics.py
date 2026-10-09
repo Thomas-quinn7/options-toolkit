@@ -69,3 +69,23 @@ def test_known_dynamics_are_recovered():
 def test_skew_measure_sign_matches_rho():
     steep = make_history(n_days=1, rho_sens=0.0).iloc[0]
     assert SD.skew_measure(steep) > 0                  # rho<0 -> puts richer
+
+
+def test_earnings_pairs_are_excluded(monkeypatch):
+    """An injected post-earnings vol crush on a big up day distorts the
+    leverage slope; listed in EARNINGS, that pair is dropped and the injected
+    slope comes back."""
+    hist = make_history(n_days=40)
+    i = 20
+    d0, d1 = hist.loc[i - 1, "snapshot_date"], hist.loc[i, "snapshot_date"]
+    hist.loc[i:, "spot"] *= 1.15                        # +14% gap up ...
+    hist.loc[i:, "atm_vol_30d"] -= 0.12                 # ... with a 12-pt crush
+    monkeypatch.setattr(SD, "EARNINGS", {})
+    (dirty,), _ = SD.run_study(hist)
+    monkeypatch.setattr(SD, "EARNINGS", {"SPY": (d1,)})
+    (clean,), _ = SD.run_study(hist)
+    assert SD.spans_earnings("SPY", d0, d1)
+    assert not SD.spans_earnings("SPY", d1, d1)
+    assert clean.n_pairs == dirty.n_pairs - 1
+    assert abs(clean.beta_lev - (-1.5)) < 2 * clean.se_lev + 0.15
+    assert abs(dirty.beta_lev - clean.beta_lev) > 0.3

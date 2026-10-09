@@ -19,6 +19,14 @@ is waiting for) until then; near-zero-move days carry no signal and are
 excluded; SPY's skew regression is on its own return (that is the classic
 index-skew fact, not a bug).
 
+Earnings day-pairs are dropped. The day after a release, short-dated vol
+collapses whichever way the stock moved (MSFT, 30 Jul 2026: +14.4% with 30d ATM
+vol 44.8 -> 32.8), and that one pair on its own made MSFT read as the strongest
+leverage effect in the set. ``EARNINGS`` is an explicit calendar of release
+dates, known in advance. Excluding pairs because the vol dropped (as
+``event_vol.py`` detects events) would select on the regression's own
+dependent variable, so it is not used here.
+
     python vol_snapshots/skew_dynamics.py
 
 Pinned offline by ``tests/test_skew_dynamics.py`` on histories with KNOWN
@@ -56,6 +64,21 @@ DK = 0.05                # fixed-moneyness wing for the skew measure
 MIN_MOVE = 0.001         # a pair needs at least a 0.1% move to carry signal
 MAX_GAP_DAYS = 4
 MIN_PAIRS = 15
+
+# First session that trades on each single-name earnings release in the
+# captured window (releases after the close on the day before): MSFT 29 Jul,
+# AAPL 30 Jul, NVDA 26 Aug 2026. TSLA reported 22 Jul, before capture began.
+# Add the next season's dates here before re-running over it.
+EARNINGS: Dict[str, Tuple[str, ...]] = {
+    "MSFT": ("2026-07-30",),
+    "AAPL": ("2026-07-31",),
+    "NVDA": ("2026-08-27",),
+}
+
+
+def spans_earnings(ticker: str, d0: str, d1: str) -> bool:
+    """True if the pair (d0, d1] contains an earnings reaction session."""
+    return any(d0 < d <= d1 for d in EARNINGS.get(ticker, ()))
 
 
 def skew_measure(row) -> float:
@@ -109,6 +132,8 @@ def run_study(hist: pd.DataFrame) -> Tuple[List[TickerDynamics], List[str]]:
         d_skew, r_mkt, d_atm, r_own = [], [], [], []
         for a, b in day_pairs(hist_t):
             key = (str(a["snapshot_date"]), str(b["snapshot_date"]))
+            if spans_earnings(str(ticker), *key):
+                continue
             own = float(np.log(b["spot"] / a["spot"]))
             if abs(own) >= MIN_MOVE and np.isfinite(a["atm_vol_30d"]) \
                     and np.isfinite(b["atm_vol_30d"]):
@@ -169,8 +194,8 @@ def plot_dynamics(studies: List[TickerDynamics],
         ax.set_title(title)
         ax.set_ylabel("vol pts per 1% move")
 
-    fig.suptitle("Skew and vol dynamics on the fitted daily surfaces "
-                 "(2 s.e. bars)", fontweight="bold")
+    fig.suptitle("Skew and vol dynamics on the fitted surfaces "
+                 "(2 s.e. bars, earnings days excluded)", fontweight="bold")
     fig.tight_layout()
     os.makedirs(os.path.dirname(out), exist_ok=True)
     fig.savefig(out, dpi=150)

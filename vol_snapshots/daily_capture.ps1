@@ -29,6 +29,26 @@ $dataRemote = "https://github.com/Thomas-quinn7/options-toolkit-data.git"
 
 "=== $(Get-Date -Format s) capture starting ===" | Out-File $log -Append -Encoding utf8
 
+# 0) Rebase onto origin before running anything. The toolkit is also pushed
+#    from the other machine; committing without pulling first diverged main
+#    (2026-10-09). Pulling first also means the studies run the latest code and
+#    regenerate their outputs on top of the latest committed versions. Local
+#    daily commits are unpushed by design, so this must rebase, not --ff-only.
+#    On any failure, abort and carry on: today's commit still lands locally and
+#    sync.ps1 flags the divergence.
+git fetch -q origin 2>&1 | Out-File $log -Append -Encoding utf8
+if ($LASTEXITCODE -ne 0) {
+    "WARNING: git fetch failed (network/auth?) - skipping pull, running on local code" |
+        Out-File $log -Append -Encoding utf8
+} else {
+    git rebase -q --autostash origin/main 2>&1 | Out-File $log -Append -Encoding utf8
+    if ($LASTEXITCODE -ne 0) {
+        git rebase --abort 2>&1 | Out-File $log -Append -Encoding utf8
+        "ERROR: rebase onto origin/main FAILED - aborted, running on local code; resolve by hand" |
+            Out-File $log -Append -Encoding utf8
+    }
+}
+
 # 1) Capture today's chains (idempotent per day).
 & $py (Join-Path $PSScriptRoot "capture.py") 2>&1 | Out-File $log -Append -Encoding utf8
 

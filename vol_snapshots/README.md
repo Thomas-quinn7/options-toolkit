@@ -1,4 +1,4 @@
-# Daily option-chain snapshots
+# Option-chain snapshots
 
 Free data has no history: yfinance serves **today's** option chains and
 nothing else. Everything this repo wants to do next on surface *dynamics* —

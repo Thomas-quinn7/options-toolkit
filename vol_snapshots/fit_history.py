@@ -258,9 +258,16 @@ def fit_day_ticker(df: pd.DataFrame) -> Optional[Dict]:
 
     Ts = np.array([s["T"] for s in slices])
     thetas = np.array([s["theta"] for s in slices])
-    p = fit_ssvi_band([s["k"] for s in slices],
-                      [s["w_bid"] for s in slices],
-                      [s["w_ask"] for s in slices], thetas)
+    fit = fit_ssvi_band([s["k"] for s in slices],
+                        [s["w_bid"] for s in slices],
+                        [s["w_ask"] for s in slices], thetas)
+    if not fit.success:
+        # The optimiser gave up: the parameters are junk, so record nothing
+        # rather than a row whose diagnostics would silently mislead.
+        print(f"  {ticker} {snapshot_date}: SSVI band fit did not converge "
+              f"(cost={fit.cost:.3g}) - skipped")
+        return None
+    p = fit.params
 
     k_grid = np.linspace(-K_ABS_MAX, K_ABS_MAX, 241)
     min_g = min_butterfly_g_ssvi(thetas, p, k_grid)
@@ -446,7 +453,11 @@ def main(argv: Optional[List[str]] = None) -> None:
     for (day, ticker), df in snaps.groupby(["snapshot_date", "ticker"]):
         if (str(day), str(ticker)) in done:
             continue
-        row = fit_day_ticker(df)
+        try:
+            row = fit_day_ticker(df)
+        except Exception as e:  # one malformed day must not kill the batch
+            print(f"  {day} {ticker}: fit failed ({e}) - skipped")
+            continue
         if row is None:
             skipped.append((day, ticker))
             continue

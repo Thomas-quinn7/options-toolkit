@@ -92,13 +92,35 @@ def durrleman_g_from_w(k_grid, w, wp, wpp):
     return (1.0 - k_grid * wp / (2.0 * w)) ** 2 - (wp**2) / 4.0 * (1.0 / w + 0.25) + wpp / 2.0
 
 
-def fit_svi_slice(k, w_market, weights=None, butterfly_penalty: float = 0.0) -> SVIParams:
+@dataclass
+class FitResult:
+    """A calibration outcome plus the diagnostics that say whether to trust it.
+
+    Every fitter in this module returns one. ``params`` is the fitted
+    parameter dataclass; ``success`` is scipy's convergence flag (a False
+    here means the optimiser gave up - the parameters are junk); ``cost`` is
+    the final objective (0.5 * sum of squared residuals); ``butterfly_min``
+    is the minimum Durrleman g over a grid spanning the fitted data, so
+    >= 0 means the fit is butterfly-free on that grid - the grid check, not
+    a theorem, is the guarantee (VOL_SURFACE.md).
+    """
+    params: SVIParams | SSVIParams
+    success: bool
+    cost: float
+    butterfly_min: float
+
+
+def fit_svi_slice(k, w_market, weights=None, butterfly_penalty: float = 0.0) -> FitResult:
     """Least-squares fit of a raw-SVI slice to (k, w_market) points.
 
     ``weights`` (per point) scale the residuals - pass vega/bid-ask weights to
     let liquid, reliable quotes dominate noisy illiquid wings. If
-    butterfly_penalty > 0, negative Durrleman g is penalised so the fit is
+    ``butterfly_penalty`` > 0, negative Durrleman g is penalised so the fit is
     pushed into the no-arbitrage region.
+
+    Returns a ``FitResult``; ``butterfly_min`` is evaluated on a grid
+    spanning the data (margin 0.1, 120 points) whether or not the penalty
+    was on.
     """
     k = np.asarray(k, dtype=float)
     w_market = np.asarray(w_market, dtype=float)
@@ -121,7 +143,9 @@ def fit_svi_slice(k, w_market, weights=None, butterfly_penalty: float = 0.0) -> 
     lb = [1e-8, 1e-8, -0.999, -2.0, 1e-4]
     ub = [np.inf, np.inf, 0.999, 2.0, 5.0]
     sol = least_squares(resid, x0, bounds=(lb, ub), max_nfev=5000)
-    return SVIParams(*sol.x)
+    p = SVIParams(*sol.x)
+    return FitResult(params=p, success=bool(sol.success), cost=float(sol.cost),
+                     butterfly_min=float(_min_durrleman_g_svi(p, k_grid)))
 
 
 # --------------------------------------------------------------------------- #
@@ -177,17 +201,23 @@ def ssvi_butterfly_conditions(theta_grid, p: SSVIParams) -> Tuple[bool, float]:
 
 def fit_ssvi(ks: Sequence[np.ndarray], ws: Sequence[np.ndarray], thetas: Sequence[float],
              weights: Optional[Sequence[np.ndarray]] = None,
-             butterfly_penalty: float = 50.0) -> SSVIParams:
+             butterfly_penalty: float = 50.0) -> FitResult:
     """Fit global SSVI (rho, eta, gamma) to per-maturity (k, w) data.
 
     thetas are the ATM total variances per maturity (theta_T = w(0, T)).
     ``weights`` is an optional list of per-slice weight arrays (e.g. vega/bid-ask).
     Negative-density (butterfly) violations are penalised.
+
+    Returns a ``FitResult``; ``butterfly_min`` is the min Durrleman g over a
+    grid spanning all slices, evaluated after the fit regardless of whether
+    the penalty was active.
     """
     thetas = np.asarray(thetas, dtype=float)
     theta_dense = np.linspace(thetas.min(), thetas.max(), 40)
     if weights is None:
         weights = [np.ones_like(k) for k in ks]
+    k_grid = np.linspace(min(float(np.min(k)) for k in ks) - 0.1,
+                         max(float(np.max(k)) for k in ks) + 0.1, 120)
 
     def resid(x):
         p = SSVIParams(rho=x[0], eta=x[1], gamma=x[2])
@@ -204,13 +234,15 @@ def fit_ssvi(ks: Sequence[np.ndarray], ws: Sequence[np.ndarray], thetas: Sequenc
     lb = [-0.999, 1e-3, 1e-3]
     ub = [0.999, 10.0, 0.999]
     sol = least_squares(resid, x0, bounds=(lb, ub), max_nfev=8000)
-    return SSVIParams(rho=sol.x[0], eta=sol.x[1], gamma=sol.x[2])
+    p = SSVIParams(rho=sol.x[0], eta=sol.x[1], gamma=sol.x[2])
+    return FitResult(params=p, success=bool(sol.success), cost=float(sol.cost),
+                     butterfly_min=float(min_butterfly_g_ssvi(thetas, p, k_grid)))
 
 
 def fit_ssvi_band(ks: Sequence[np.ndarray], w_bids: Sequence[np.ndarray],
                   w_asks: Sequence[np.ndarray], thetas: Sequence[float],
                   butterfly_penalty: float = 50.0,
-                  mid_pull: float = 1e-2) -> SSVIParams:
+                  mid_pull: float = 1e-2) -> FitResult:
     """Fit global SSVI to the bid-ask BANDS of every maturity at once.
 
     The same band-first residual as ``fit_svi_slice_band`` - a hinge, zero
@@ -220,11 +252,16 @@ def fit_ssvi_band(ks: Sequence[np.ndarray], w_bids: Sequence[np.ndarray],
     ``fit_ssvi``. Tight ATM bands at every maturity pin the global shape; the
     wide illiquid wings constrain it only loosely. Warm-starts from the plain
     mid fit.
+
+    Returns a ``FitResult``; ``butterfly_min`` is the min Durrleman g over a
+    grid spanning all slices, evaluated after the fit.
     """
     thetas = np.asarray(thetas, dtype=float)
     theta_dense = np.linspace(thetas.min(), thetas.max(), 40)
     w_mids = [0.5 * (b + a) for b, a in zip(w_bids, w_asks)]
     half_widths = [np.maximum(0.5 * (a - b), 1e-12) for b, a in zip(w_bids, w_asks)]
+    k_grid = np.linspace(min(float(np.min(k)) for k in ks) - 0.1,
+                         max(float(np.max(k)) for k in ks) + 0.1, 120)
 
     def resid(x):
         p = SSVIParams(rho=x[0], eta=x[1], gamma=x[2])
@@ -240,13 +277,15 @@ def fit_ssvi_band(ks: Sequence[np.ndarray], w_bids: Sequence[np.ndarray],
         r = np.append(r, butterfly_penalty * max(-slack, 0.0))
         return r
 
-    p0 = fit_ssvi(ks, w_mids, thetas)
+    p0 = fit_ssvi(ks, w_mids, thetas).params
     x0 = [p0.rho, p0.eta, p0.gamma]
     lb = [-0.999, 1e-3, 1e-3]
     ub = [0.999, 10.0, 0.999]
     x0 = np.clip(x0, lb, ub)
     sol = least_squares(resid, x0, bounds=(lb, ub), max_nfev=8000)
-    return SSVIParams(rho=sol.x[0], eta=sol.x[1], gamma=sol.x[2])
+    p = SSVIParams(rho=sol.x[0], eta=sol.x[1], gamma=sol.x[2])
+    return FitResult(params=p, success=bool(sol.success), cost=float(sol.cost),
+                     butterfly_min=float(min_butterfly_g_ssvi(thetas, p, k_grid)))
 
 
 # --------------------------------------------------------------------------- #
@@ -410,7 +449,7 @@ def heteroskedastic_slice(seed=0, T=0.5, n=25, atm_vol=0.20):
 
 def fit_svi_slice_band(k, w_bid, w_ask, weights=None,
                        butterfly_penalty: float = 0.0,
-                       mid_pull: float = 1e-2) -> SVIParams:
+                       mid_pull: float = 1e-2) -> FitResult:
     """Fit a raw-SVI slice to the full bid-ask BAND rather than a point mid.
 
     The market does not give you a price, it gives you an interval: any curve
@@ -427,6 +466,9 @@ def fit_svi_slice_band(k, w_bid, w_ask, weights=None,
     band centre (and keeps the least-squares gradient alive).
     ``butterfly_penalty`` > 0 pushes the fit into the no-arbitrage region
     exactly as in ``fit_svi_slice``.
+
+    Returns a ``FitResult``; ``butterfly_min`` is evaluated on a grid
+    spanning the data whether or not the penalty was on.
     """
     k = np.asarray(k, dtype=float)
     w_bid = np.asarray(w_bid, dtype=float)
@@ -450,13 +492,15 @@ def fit_svi_slice_band(k, w_bid, w_ask, weights=None,
 
     # Warm-start from the plain mid fit so the band fit refines rather than
     # searches from scratch.
-    p0 = fit_svi_slice(k, w_mid, weights=weights)
+    p0 = fit_svi_slice(k, w_mid, weights=weights).params
     x0 = [p0.a, p0.b, p0.rho, p0.m, p0.sigma]
     lb = [1e-8, 1e-8, -0.999, -2.0, 1e-4]
     ub = [np.inf, np.inf, 0.999, 2.0, 5.0]
     x0 = np.clip(x0, lb, ub)
     sol = least_squares(resid, x0, bounds=(lb, ub), max_nfev=5000)
-    return SVIParams(*sol.x)
+    p = SVIParams(*sol.x)
+    return FitResult(params=p, success=bool(sol.success), cost=float(sol.cost),
+                     butterfly_min=float(_min_durrleman_g_svi(p, k_grid)))
 
 
 def band_violation_fraction(k, w_bid, w_ask, p: SVIParams, tol: float = 1e-9) -> float:
@@ -483,8 +527,8 @@ def fit_band_vs_mid(slice_data):
     w_ask = iv_ask**2 * T
     w_mid_obs = s["iv_obs"] ** 2 * T
 
-    p_mid = fit_svi_slice(s["k"], w_mid_obs)
-    p_band = fit_svi_slice_band(s["k"], w_bid, w_ask)
+    p_mid = fit_svi_slice(s["k"], w_mid_obs).params
+    p_band = fit_svi_slice_band(s["k"], w_bid, w_ask).params
 
     liq = np.abs(s["k"]) <= 0.2
 
@@ -517,8 +561,8 @@ def fit_weighted_vs_unweighted(slice_data):
     s = slice_data
     w_obs = s["iv_obs"] ** 2 * s["T"]
     wts = vega_spread_weights(s["k"], s["iv_obs"], s["T"], s["spread_iv"])
-    p_unw = fit_svi_slice(s["k"], w_obs)
-    p_wt = fit_svi_slice(s["k"], w_obs, weights=wts)
+    p_unw = fit_svi_slice(s["k"], w_obs).params
+    p_wt = fit_svi_slice(s["k"], w_obs, weights=wts).params
 
     def rms(x):
         return float(np.sqrt(np.mean(x**2)))
@@ -565,17 +609,23 @@ def main():
           f"rho={true.rho}, eta={true.eta}, gamma={true.gamma}\n")
 
     # Per-slice SVI
-    svi_ps = [fit_svi_slice(k, w, butterfly_penalty=10.0) for k, w in zip(ks, ws)]
+    svi_fits = [fit_svi_slice(k, w, butterfly_penalty=10.0) for k, w in zip(ks, ws)]
+    svi_ps = [f.params for f in svi_fits]
     svi_rmse = np.sqrt(np.mean(np.concatenate(
         [(svi_w(k, p) - w) ** 2 for k, w, p in zip(ks, ws, svi_ps)])))
 
     # Global SSVI
-    ssvi_p = fit_ssvi(ks, ws, theta_fit)
+    ssvi_fit = fit_ssvi(ks, ws, theta_fit)
+    ssvi_p = ssvi_fit.params
     ssvi_rmse = np.sqrt(np.mean(np.concatenate(
         [(ssvi_w(k, th, ssvi_p) - w) ** 2 for k, w, th in zip(ks, ws, theta_fit)])))
 
-    print(f"  per-slice SVI  fit RMSE (total var) = {svi_rmse:.2e}")
-    print(f"  global   SSVI  fit RMSE (total var) = {ssvi_rmse:.2e}")
+    print(f"  per-slice SVI  fit RMSE (total var) = {svi_rmse:.2e}   "
+          f"(converged {sum(f.success for f in svi_fits)}/{len(svi_fits)}, "
+          f"worst slice min g = {min(f.butterfly_min for f in svi_fits):+.4f})")
+    print(f"  global   SSVI  fit RMSE (total var) = {ssvi_rmse:.2e}   "
+          f"(converged: {ssvi_fit.success}, cost = {ssvi_fit.cost:.2e}, "
+          f"min g on fit grid = {ssvi_fit.butterfly_min:+.4f})")
     print(f"  recovered SSVI: rho={ssvi_p.rho:+.3f}, eta={ssvi_p.eta:.3f}, gamma={ssvi_p.gamma:.3f}")
 
     # No-arbitrage proof
@@ -626,8 +676,8 @@ def main():
     bw_asks = [iv**2 * T for iv, T in zip(b_asks, b_mats)]
     bw_mids = [0.5 * (b + a) for b, a in zip(bw_bids, bw_asks)]
     b_thetas = np.array([float(np.interp(0.0, k, w)) for k, w in zip(b_ks, bw_mids)])
-    p_ssvi_mid = fit_ssvi(b_ks, bw_mids, b_thetas)
-    p_ssvi_band = fit_ssvi_band(b_ks, bw_bids, bw_asks, b_thetas)
+    p_ssvi_mid = fit_ssvi(b_ks, bw_mids, b_thetas).params
+    p_ssvi_band = fit_ssvi_band(b_ks, bw_bids, bw_asks, b_thetas).params
 
     k_grid_b = np.linspace(-0.8, 0.6, 400)
     print("\n  Global SSVI fitted to the bid-ask bands of all maturities at once:")

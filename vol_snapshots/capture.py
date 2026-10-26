@@ -94,20 +94,35 @@ def _snapshot_path(root: str, snapshot_date: str, ticker: str) -> str:
 
 
 def save_snapshot(df: pd.DataFrame, root: str = DATA_ROOT) -> str:
-    """Write one ticker's normalized rows for one day; returns the path."""
+    """Write one ticker's normalized rows for one day; returns the path.
+
+    The write is atomic (temp file, then ``os.replace``): an interrupted run
+    can leave a stray ``.tmp`` behind but never a half-written ``csv.gz``,
+    which load_snapshots would otherwise treat as a captured day forever
+    after. ``.tmp`` files end in something other than ``.csv.gz`` so every
+    consumer's filename filter already ignores them.
+    """
     if list(df.columns) != COLUMNS:
         raise ValueError(f"snapshot frame must have columns {COLUMNS}")
     date = str(df["snapshot_date"].iloc[0])
     ticker = str(df["ticker"].iloc[0])
     path = _snapshot_path(root, date, ticker)
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    df.to_csv(path, index=False, compression="gzip")
+    tmp = path + ".tmp"
+    df.to_csv(tmp, index=False, compression="gzip")
+    os.replace(tmp, path)
     return path
 
 
 def load_snapshots(root: str = DATA_ROOT, tickers: Optional[Iterable[str]] = None
                    ) -> pd.DataFrame:
-    """Load every captured day into one tidy DataFrame (empty if none yet)."""
+    """Load every captured day into one tidy DataFrame (empty if none yet).
+
+    A file that fails to read - a truncated csv.gz from an interrupted
+    capture, say - is skipped with a printed warning rather than raised, so
+    one bad file cannot crash every nightly consumer; it is visible in the
+    log instead of silently missing.
+    """
     frames = []
     want = {t.upper() for t in tickers} if tickers is not None else None
     if os.path.isdir(root):
@@ -120,7 +135,11 @@ def load_snapshots(root: str = DATA_ROOT, tickers: Optional[Iterable[str]] = Non
                     continue
                 if want is not None and fn[:-len(".csv.gz")].upper() not in want:
                     continue
-                frames.append(pd.read_csv(os.path.join(day_dir, fn)))
+                path = os.path.join(day_dir, fn)
+                try:
+                    frames.append(pd.read_csv(path))
+                except Exception as e:
+                    print(f"WARNING: skipping unreadable snapshot {path} ({e})")
     if not frames:
         return pd.DataFrame(columns=COLUMNS)
     out = pd.concat(frames, ignore_index=True)

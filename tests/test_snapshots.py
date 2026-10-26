@@ -103,6 +103,44 @@ def test_load_empty_root_is_empty_frame(tmp_path):
 
 
 # --------------------------------------------------------------------------- #
+# Corruption / atomicity                                                       #
+# --------------------------------------------------------------------------- #
+def _one_day_frame(ticker: str, day: str = "2026-07-24") -> pd.DataFrame:
+    raw = fake_yf_chain([95.0, 105.0], [1.0, 0.5], [1.2, 0.7])
+    return normalize_chain(raw, ticker=ticker, spot=100.0, expiry="2026-09-18",
+                           otype="call", snapshot_date=day, riskfree=0.04)
+
+
+def test_load_skips_a_corrupt_file_and_warns(tmp_path, capsys):
+    """One truncated csv.gz (an interrupted capture) must not crash the load:
+    it is skipped with a printed warning and the good files still come
+    through, so the nightly consumers survive a poisoned store."""
+    save_snapshot(_one_day_frame("AAA"), str(tmp_path))
+    bad = tmp_path / "2026-07-24" / "BBB.csv.gz"
+    bad.write_bytes(b"definitely not gzip")
+    out = load_snapshots(str(tmp_path))
+    assert set(out["ticker"]) == {"AAA"}
+    assert len(out) == 2
+    assert "BBB.csv.gz" in capsys.readouterr().out
+
+
+def test_save_snapshot_leaves_no_temp_file(tmp_path):
+    """The atomic write cleans up after itself: only the final csv.gz."""
+    save_snapshot(_one_day_frame("AAA"), str(tmp_path))
+    assert list((tmp_path / "2026-07-24").glob("*.tmp")) == []
+    assert load_snapshots(str(tmp_path))["strike"].tolist() == [95.0, 105.0]
+
+
+def test_capture_ticker_skips_an_already_captured_day(tmp_path, capsys):
+    """The idempotency the README advertises: a second run on the same day
+    returns before touching the network (yfinance is never imported here)."""
+    save_snapshot(_one_day_frame("SPY"), str(tmp_path))
+    out = capture.capture_ticker("SPY", "2026-07-24", 0.04, root=str(tmp_path))
+    assert out is None
+    assert "already captured" in capsys.readouterr().out
+
+
+# --------------------------------------------------------------------------- #
 # Non-trading-day guard                                                        #
 # --------------------------------------------------------------------------- #
 def test_capture_skips_weekend_without_touching_the_network(monkeypatch, capsys):

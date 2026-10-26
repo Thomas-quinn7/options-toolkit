@@ -216,3 +216,27 @@ def test_history_upsert_dedups(tmp_path):
     row3 = dict(row, ticker="OTHER")                     # new key appends
     hist = F.update_history([row3], path)
     assert len(hist) == 2
+
+
+def test_main_survives_one_bad_day(tmp_path, monkeypatch, capsys):
+    """An exception on one (day, ticker) - malformed spot, optimiser blowup -
+    must not kill the batch: the failing day is reported and skipped, the
+    good ones still land in the history."""
+    from vol_snapshots import capture
+
+    root = str(tmp_path / "data")
+    for tkr in ("GOOD", "BAD"):
+        capture.save_snapshot(synthetic_day(tkr), root)
+    real = F.fit_day_ticker
+
+    def flaky(df):
+        if str(df["ticker"].iloc[0]) == "BAD":
+            raise RuntimeError("optimizer exploded")
+        return real(df)
+
+    monkeypatch.setattr(F, "fit_day_ticker", flaky)
+    hist_path = str(tmp_path / "hist.csv")
+    F.main(["--data-root", root, "--history", hist_path, "--no-chart"])
+    hist = F.load_history(hist_path)
+    assert list(hist["ticker"]) == ["GOOD"]
+    assert "BAD" in capsys.readouterr().out

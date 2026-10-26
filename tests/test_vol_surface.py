@@ -33,7 +33,8 @@ def test_svi_recovers_known_slice():
     k = np.linspace(-0.5, 0.4, 25)
     w = V.svi_w(k, p)
     fit = V.fit_svi_slice(k, w)
-    assert np.sqrt(np.mean((V.svi_w(k, fit) - w) ** 2)) < 1e-4
+    assert fit.success
+    assert np.sqrt(np.mean((V.svi_w(k, fit.params) - w) ** 2)) < 1e-4
 
 
 # --------------------------------------------------------------------------- #
@@ -59,7 +60,11 @@ def test_ssvi_recovers_and_is_arbitrage_free():
     mats, ks, ivs, true, thetas = V.synthetic_surface(seed=1, noise=0.002)
     ws = [iv**2 * T for iv, T in zip(ivs, mats)]
     theta_fit = np.array([float(np.interp(0.0, k, w)) for k, w in zip(ks, ws)])
-    p = V.fit_ssvi(ks, ws, theta_fit)
+    res = V.fit_ssvi(ks, ws, theta_fit)
+    p = res.params
+    # the fit must report convergence and a butterfly-free fit grid
+    # (FitResult diagnostics - the check is computed, not assumed)
+    assert res.success and res.butterfly_min >= 0.0
 
     # parameter recovery
     assert abs(p.rho - true.rho) < 0.1
@@ -161,7 +166,7 @@ def test_band_fit_can_be_pushed_arbitrage_free():
     T = s["T"]
     w_bid = np.maximum(s["iv_obs"] - 0.5 * s["spread_iv"], 1e-4) ** 2 * T
     w_ask = (s["iv_obs"] + 0.5 * s["spread_iv"]) ** 2 * T
-    p = V.fit_svi_slice_band(s["k"], w_bid, w_ask, butterfly_penalty=10.0)
+    p = V.fit_svi_slice_band(s["k"], w_bid, w_ask, butterfly_penalty=10.0).params
     k_grid = np.linspace(s["k"].min() - 0.1, s["k"].max() + 0.1, 300)
     w, wp, wpp = V.svi_derivatives(k_grid, p)
     assert V.durrleman_g_from_w(k_grid, w, wp, wpp).min() >= -1e-9
@@ -175,7 +180,9 @@ def test_ssvi_band_fit_recovers_and_is_arb_free():
     w_asks = [iv**2 * T for iv, T in zip(iv_asks, mats)]
     w_mids = [0.5 * (b + a) for b, a in zip(w_bids, w_asks)]
     thetas = np.array([float(np.interp(0.0, k, w)) for k, w in zip(ks, w_mids)])
-    p = V.fit_ssvi_band(ks, w_bids, w_asks, thetas)
+    res = V.fit_ssvi_band(ks, w_bids, w_asks, thetas)
+    assert res.success and res.butterfly_min >= 0.0
+    p = res.params
 
     assert abs(p.rho - true.rho) < 0.15
     assert abs(p.gamma - true.gamma) < 0.2
@@ -201,8 +208,9 @@ def test_ssvi_band_fit_not_worse_than_mid_against_truth():
         w_asks = [iv**2 * T for iv, T in zip(iv_asks, mats)]
         w_mids = [0.5 * (b + a) for b, a in zip(w_bids, w_asks)]
         thetas = np.array([float(np.interp(0.0, k, w)) for k, w in zip(ks, w_mids)])
-        rmse_mid.append(true_rmse(V.fit_ssvi(ks, w_mids, thetas), mats, ks, true))
-        rmse_band.append(true_rmse(V.fit_ssvi_band(ks, w_bids, w_asks, thetas), mats, ks, true))
+        rmse_mid.append(true_rmse(V.fit_ssvi(ks, w_mids, thetas).params, mats, ks, true))
+        rmse_band.append(true_rmse(V.fit_ssvi_band(ks, w_bids, w_asks, thetas).params,
+                                   mats, ks, true))
     assert np.mean(rmse_band) <= np.mean(rmse_mid) * 1.05
 
 

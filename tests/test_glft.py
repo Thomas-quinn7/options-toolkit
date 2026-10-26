@@ -253,6 +253,40 @@ def test_hawkes_validation():
                        10, np.random.default_rng(0))
 
 
+def test_mm_params_validation():
+    """MMParams must reject nonsense loudly (a negative A or k would give
+    exp(+k*d) intensities - fills everywhere) instead of simulating it."""
+    for bad in (dict(S0=-1.0), dict(T=0.0), dict(n_steps=0), dict(A=-5.0),
+                dict(k=0.0), dict(sigma_impl=0.0), dict(half_spread=-0.1),
+                dict(vol_spread=-0.01), dict(tox_ewma_alpha=0.0),
+                dict(volmark_ewma_alpha=1.5), dict(volmark_horizon=0),
+                dict(contract_multiplier=0.0), dict(tc_underlying=-0.001)):
+        with pytest.raises(ValueError):
+            MMParams(**bad)
+
+
+def test_lam_dt_saturation_warns_in_the_excited_regime():
+    """High branching with a fast decay pushes lambda*dt toward 1, where the
+    one-fill-per-side-per-step booking under-counts volume - the simulator
+    must say so instead of printing a quietly biased table."""
+    p = replace(MMParams(flow_imbalance=0.0), hawkes_branching=0.9,
+                hawkes_decay=600.0)
+    with pytest.warns(UserWarning, match="lambda"):
+        r = simulate_paths(p, 0.2, 500, np.random.default_rng(3), quoting=True)
+    assert r["max_lam_dt"] > 0.3
+
+
+def test_no_saturation_warning_without_skew_or_imbalance(recwarn):
+    """A symmetric, skew-less desk never approaches the cap (lambda*dt stays
+    ~0.15 at the base quote), so no warning. (A SKewed default desk DOES
+    warn once its book builds - the skew pulls one quote toward fair - and
+    that firing is the honest behaviour the guard exists for.)"""
+    p = replace(MMParams(flow_imbalance=0.0), skew_coef=0.0)
+    r = simulate_paths(p, 0.2, 500, np.random.default_rng(3), quoting=True)
+    assert r["max_lam_dt"] < 0.3
+    assert not [w for w in recwarn.list if "lambda" in str(w.message)]
+
+
 def test_hawkes_clustering_raises_inventory_risk():
     """Volume-matched clustering must raise peak inventory and P&L dispersion
     - the cost the independent-fills assumption hides - while realised volume
@@ -269,13 +303,24 @@ def test_hawkes_clustering_raises_inventory_risk():
     assert clust["fills"].mean() > 0.7 * indep["fills"].mean()
 
 
-def test_hawkes_flips_the_desk_ranking():
-    """Under independent flow the hand-tuned desk out-CEs the (conservative)
-    GLFT desk; under heavy clustering the ranking must flip - the hand-tuned
-    point was tuned for the assumption that just failed."""
+def test_hawkes_clustering_costs_but_no_ranking_flip():
+    """Under Poisson multi-fill booking, clustering costs volume (the skew
+    extinguishes runs) and raises P&L dispersion - but the CE ranking does
+    NOT flip: the hand-tuned desk keeps its edge at every branching. (An
+    earlier Bernoulli one-fill-per-step booking showed a flip to the GLFT
+    desk at high branching - that was the booking cap saturating in exactly
+    the clustered regime the experiment measured, an artifact the Poisson
+    rework removed; verified stable across seeds.)"""
     res = experiment_hawkes_clustering(MMParams(flow_imbalance=0.0),
                                        branchings=(0.0, 0.8), n_sims=2500,
                                        seed=10)
     ce = {(r["branching"], r["desk"]): r["ce"] for r in res["rows"]}
+    fl = {(r["branching"], r["desk"]): r["avg_fills"] for r in res["rows"]}
+    st = {(r["branching"], r["desk"]): r["std"] for r in res["rows"]}
+    # volume falls: the skew extinguishes clusters (the defence working)
+    assert fl[(0.8, "hand-tuned")] < 0.75 * fl[(0.0, "hand-tuned")]
+    # and what leaks through is inventory risk / dispersion
+    assert st[(0.8, "hand-tuned")] > 1.5 * st[(0.0, "hand-tuned")]
+    # no flip at either end of the sweep
     assert ce[(0.0, "hand-tuned")] > ce[(0.0, "GLFT g=0.1")]
-    assert ce[(0.8, "GLFT g=0.1")] > ce[(0.8, "hand-tuned")]
+    assert ce[(0.8, "hand-tuned")] > ce[(0.8, "GLFT g=0.1")]

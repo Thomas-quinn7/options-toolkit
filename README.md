@@ -71,7 +71,10 @@ network.
 - **`vol_surface.py`** - a real **arbitrage-free** IV surface: fits SVI per
   expiry and a global SSVI (Gatheral-Jacquier), and checks numerically, on a grid, that there is no butterfly
   arbitrage (Durrleman `g(k) >= 0`, i.e. non-negative density) and no calendar
-  arbitrage (total variance rising with maturity). Demonstrates that a naive
+  arbitrage (total variance rising with maturity). Every fitter returns a
+  `FitResult` - parameters plus convergence flag, cost, and the minimum
+  Durrleman `g` on the fitted grid - so a silently non-converged fit is
+  impossible to miss. Demonstrates that a naive
   spline through noisy quotes admits butterfly arbitrage that SSVI removes.
   Supports **vega/liquidity-weighted calibration** so noisy illiquid wings don't
   drag the fit off the reliable ATM quotes, and **bid-ask band calibration**
@@ -154,10 +157,11 @@ vega markout therefore **pools across books** (`pool_books`): each book quotes
 off an empirical-Bayes blend of its own estimate and the evidence-weighted
 pool mean, with shrinkage that releases as a book's own markouts accumulate  - 
 so a thin book borrows strength while a genuinely different book still
-separates - and a null threshold recalibrated to the pooled noise floor, which
-recovers materially more of the oracle's edge at a lower clean-flow tax (best
-case measured honestly: the pooled books face exchangeable flow by
-construction).
+separates - and a null threshold recalibrated to the pooled noise floor.
+The P&L translation is real but small (~0.03-0.06, measured at high path
+counts): in stationary toxic flow the pooled desk recovers roughly twice
+the per-book desk's share of the oracle markup's edge, at about half the
+per-book desk's clean-flow tax.
 `glft.py` adds a **GLFT quoting engine** (Gueant-Lehalle-Fernandez-Tapia, the
 tractable successor to Avellaneda-Stoikov): the exact finite-horizon solution
 via the linearised HJB's matrix exponential, the exact stationary quotes from
@@ -165,15 +169,16 @@ its ground eigenvector, and the closed-form constant-spread-plus-linear-skew
 approximation desks actually implement - cross-checked against each other in
 tests. With `quote_policy="glft"` the simulator *derives* its spread and skew
 from the fill model instead of hand-picking them, and Experiment G measures
-what that buys under uncertain realised vol (inventory control is worth ~4 CE
-points over none; risk aversion is the only free dial). Experiment H then
+what that buys under uncertain realised vol (inventory control is worth ~7
+CE points over none; risk aversion is the only free dial). Experiment H then
 breaks the assumption every one of these models shares: fills arriving
 **independently**. A volume-matched Hawkes mechanism makes flow self-excite
 into same-side clusters (the realism gap the option-MM literature itself
-flags - Baldacci 2020 §4.1.1), inventory excursions and P&L dispersion grow
-with clustering, and the desk ranking **flips**: the hand-tuned quotes win in
-the arena they were tuned for and lose to the derived conservative quotes
-when the independence assumption fails. See `market_making/README.md` for the
+flags - Baldacci 2020 §4.1.1): inventory excursions and P&L dispersion grow
+with clustering, and the skew pays for part of the cost in extinguished
+volume - but the desk ranking does **not** flip (an earlier version's flip
+was an artifact of one-fill-per-step Bernoulli booking, removed by Poisson
+count booking). See `market_making/README.md` for the
 write-up and figures. Charts across the repo share one colorblind-validated
 style (`plotstyle.py`).
 

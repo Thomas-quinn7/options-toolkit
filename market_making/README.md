@@ -232,26 +232,37 @@ the pool instead of being averaged away. The read is causal (a cross-section
 of states built only from resolved fills), and `pool_books = 1` — the default —
 reproduces the per-book behaviour bit-for-bit.
 
-Where the edge actually comes from is worth stating precisely: pooling ten
-books cuts the estimate's dispersion by roughly a third-to-half, and that lets
-the desk **recalibrate its null threshold down** (~0.05 vs the per-book 0.10
-— the deadband exists purely to reject the clipped estimator's noise floor,
-and the pooled floor is lower). Same markup rule, same slope, same cap: the
-pooled desk recovers roughly **twice the per-book desk's share** of the
-oracle's stationary-toxic edge at about **half its clean-flow tax**, and
-keeps the adaptive desk's win over the oracle on the regime switch. The
-recovered share is still partial, not total — the estimate's own attenuation
-(netting, regime turnover inside the markout window, the zero-anchored EWMA)
-is untouched by pooling — and the tests pin the ordering, not a headline
-percentage.
+Where the edge actually comes from, and how big it honestly is: pooling ten
+books cuts the estimate's dispersion and lets the desk **recalibrate its
+null threshold down** (~0.05 vs the per-book 0.10 — the deadband exists
+purely to reject the clipped estimator's noise floor, and the pooled floor
+is lower: ~0.047 vs ~0.071 measured on clean flow). Same markup rule, same
+slope, same cap. The P&L translation, measured at 25,000 paths per run, is
+real but small (~0.03–0.06 per scenario, seed-consistent at that size but
+*below the single-seed noise floor* of the 4,000-path tables above — do not
+expect to see it in them):
+
+* **Stationary vol-toxic flow** — the pooled desk recovers roughly **twice
+  the per-book desk's share** of the oracle markup's edge (~half of it vs
+  ~a fifth), though the oracle keeps the rest: a finite-window vega markout
+  cannot fully price the toxicity it detects.
+* **Clean flow** — the pooled desk's phantom-toxicity tax is about **half
+  the per-book desk's**: the tighter estimate rectifies less noise above
+  the threshold.
+* **Regime switch** — the adaptive desks beat the oracle's fixed markup
+  (which pays its clean-flow tax for nothing); they do not beat static
+  here, the honest small print: on this switch the markup's value is
+  avoiding the oracle's mistake, not beating no defence.
 
 What pooling assumes, honestly: **cross-book exchangeability** of
 vega-normalised toxicity — the pooled books differ only in noise, not in
-clientele. Here that holds *by construction* (every path faces the same
-`vol_toxicity` schedule), so the experiment measures pooling's best case,
-deliberately. A real desk's book with structurally different flow violates
-it, and until that book accumulates ~`pool_shrinkage` of its own markouts the
-pool actively drags its estimate toward the crowd: pooling trades per-book
+clientele. Here that holds for the toxicity *schedule* by construction
+(every path faces the same `vol_toxicity`), though each book rides its own
+vol regime, so the arena is exchangeable-ish rather than exactly — one
+reason the recovered edge stays partial. A real desk's book with
+structurally different flow violates the assumption outright, and until
+that book accumulates ~`pool_shrinkage` of its own markouts the pool
+actively drags its estimate toward the crowd: pooling trades per-book
 variance for cross-book contamination bias, and `pool_shrinkage` is the
 exchange rate. The borrow-then-release mechanics are tested directly at the
 estimator level (the simulator cannot yet give one book its own toxicity
@@ -260,9 +271,10 @@ in-path).
 `tests/test_mm.py` asserts the discrimination (both directions), the
 gamma-P&L identity under full vol paths, the three desk-comparison facts,
 and for pooling: the faster convergence on exchangeable flow, the
-borrow-then-release shrinkage, causality of the pooled estimate, the pooled
-desk's recovered edge, and that the default (`pool_books = 1`) path is
-byte-identical to the per-book estimator.
+borrow-then-release shrinkage, causality of the pooled estimate, the P&L
+edge measured at 25k paths (`test_pooling_edge_measured_at_power`), and
+that the default (`pool_books = 1`) path is byte-identical to the per-book
+estimator.
 
 ## Deriving the quotes instead of picking them (Experiment G)
 
@@ -333,10 +345,11 @@ makes another more likely. That literature itself flags the gap (Baldacci,
 [arXiv:2012.10875](https://arxiv.org/pdf/2012.10875) §4.1.1): real client
 flow self-excites and clusters on a side (herding, order splitting), which is
 precisely what hurts a desk that warehouses inventory. Experiment H adds a
-Hawkes-style mechanism — each executed fill boosts its *own side's* arrival
-intensity with a ~3-day half-life, `hawkes_branching` = expected follow-on
-fills per fill — and, crucially, **volume-matches** the flow: the base
-intensity is scaled by `1 - branching`, so clustering changes the *timing* of
+Hawkes-style mechanism — each executed fill breeds follow-on fills on its
+*own side*, with a ~3-day excitement half-life, `hawkes_branching` = expected
+children per fill *at the quote the parent filled at* — and, crucially,
+**volume-matches** the flow: the base intensity is scaled by
+`1 - branching`, so at any fixed quote clustering changes the *timing* of
 the same flow, not its amount. Sweeping branching from 0 (the literature's
 assumption) to 0.8 for both a hand-tuned and a GLFT desk, under symmetric
 uninformed flow with uncertain realised vol:
@@ -349,14 +362,25 @@ uninformed flow with uncertain realised vol:
   `sigma` alone is understated. This is the cost the independence assumption
   hides, made measurable.
 * **Realised volume falls even though the flow is volume-matched** — the
-  inventory skew actively *extinguishes* one-sided runs (each fill in a run
-  faces a worse quote than the last). Part of the clustering cost is paid in
-  volume (the defence working), part in inventory risk (what leaks through).
-* **The desk ranking flips.** Under independent flow the hand-tuned desk
-  out-CEs the more conservative GLFT desk — it was tuned for exactly that
-  arena. Under heavy clustering the ordering reverses: the quotes derived
-  from a risk model survive the failure of an assumption the hand-tuned point
-  had silently baked in. Both rankings are asserted in `tests/test_glft.py`.
+  inventory skew actively *extinguishes* one-sided runs: each fill breeds
+  follow-on flow at the quote it filled at, and the post-fill skew makes
+  that quote worse for the children than it was for the parent. At branching
+  0.8 the desk books roughly a third less volume than the independent-flow
+  desk (`fills_refused` stays ~0 throughout — the extinguishing is the
+  skew's own work, not the inventory cap refusing flow). The residual
+  caveat is within-step batching: every fill in a step executes at the one
+  quote set before it (`max_lam_dt` reports each run's worst step; the
+  simulator warns past 0.3), so the measured extinguishing is a lower bound
+  on what continuous repricing would achieve.
+* **The desk ranking does NOT flip.** The hand-tuned desk keeps its CE edge
+  over the more conservative GLFT desk at every branching. An earlier
+  version of this experiment, run under one-fill-per-side Bernoulli
+  booking, showed a flip to the GLFT desk at high branching — re-deriving
+  the booking as Poisson counts showed that flip was an artifact of the
+  booking cap saturating in exactly the clustered regime being measured,
+  and it disappears. The honest lesson survives, smaller: clustering is a
+  real cost (the volume and dispersion above), not a ranking reversal.
+  The findings are asserted in `tests/test_glft.py`.
 
 ## Talking points
 
@@ -382,15 +406,20 @@ uninformed flow with uncertain realised vol:
 * One option, constant implied vol, Gaussian GBM — no vol surface, no jumps, no
   stochastic vol, so no vanna/volga or skew dynamics.
 * Both toxicity kinds are estimated online (Experiments E and F), and the
-  vega markout now pools across books with shrinkage (`pool_books`) — but the
-  pooled books here share one toxicity process by construction, so the
-  simulator demonstrates pooling's exchangeable best case only. Giving one
-  book its own toxicity in-path (to price the contamination cost of pooling
-  a structurally different book, rather than bounding it via
-  `pool_shrinkage`) needs per-book flow processes the simulator doesn't have
-  yet. The directional markout stays per-book on purpose: ~30 binary
+  vega markout now pools across books with shrinkage (`pool_books`) — but
+  the pooled books share one toxicity *schedule* by construction while each
+  rides its own vol regime, so the arena is exchangeable-ish rather than
+  exactly, and a structurally-different-flow book (the real contamination
+  risk) needs per-book flow processes the simulator doesn't have yet. The
+  directional markout stays per-book on purpose: ~30 binary
   markouts already nearly match the oracle there, so pooling has nothing
   material to add.
+* The booking model discretises at the step: fills are Poisson counts, all
+  executed at the step's single quote — no intra-step repricing (warned and
+  reported as `max_lam_dt` past `lambda*dt` = 0.3) — and arrivals through
+  fair are floored at the at-fair rate instead of extrapolating the
+  exponential arrival law below zero. The GLFT policy caps its skew at fair
+  because the closed form it implements is derived for distances ≥ 0.
 * Experiment H adds *self*-excitation (fills breeding same-side fills on one
   book); the other half of the Baldacci gap is *cross*-excitation — a fill on
   one strike exciting flow on neighbouring strikes — which needs the

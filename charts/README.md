@@ -82,11 +82,12 @@ constant-spread + linear-skew claim against the exact answer.
 ![GLFT quotes](market_making/glft_quotes.png)
 
 **GLFT vs hand-tuned quoting (Experiment G)** — inventory control is worth
-~4 CE points over none under uncertain realised vol; one derived dial spans
+~7 CE points over none under uncertain realised vol; one derived dial spans
 the mean-risk frontier.
 ![GLFT vs static](market_making/glft_vs_static.png)
 
 **Hawkes clustered flow (Experiment H)** — volume-matched self-exciting flow
-raises inventory risk, and the hand-tuned-vs-derived desk ranking flips when
-the independence assumption fails.
+raises inventory risk and costs extinguished volume (the skew's defence);
+the desk ranking does not flip (an earlier version's flip was a
+one-fill-per-step booking artifact).
 ![Hawkes clustering](market_making/hawkes_clustering.png)

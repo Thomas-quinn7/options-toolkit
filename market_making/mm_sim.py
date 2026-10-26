@@ -31,12 +31,21 @@ Design notes
   dividend yield q, and the analytic gamma-P&L carries the e^{r(T-t)}
   financing factor, so the hedging identity holds for r, q != 0 (tested). The
   experiments default to r=0 only to keep the vol P&L uncluttered.
+* Fills are booked as Poisson COUNTS per side per step - uninformed,
+  direction-informed and vol-informed thinnings of the same intensity, so the
+  expected count lambda*dt is exact at any intensity - then clipped at the
+  inventory cap, whose refused demand is counted (``fills_refused``) but never
+  booked. The residual discretisation: all of a step's fills execute at the
+  one quote set before them (no intra-step repricing), which understates the
+  skew's protection inside a clustered step - warned past ``_LAM_DT_WARN``
+  and reported per run as ``max_lam_dt``.
 """
 
 from __future__ import annotations
 
 import os
 import sys
+import warnings
 from dataclasses import dataclass, replace
 from typing import Optional
 
@@ -239,6 +248,39 @@ class MMParams:
 
     contract_multiplier: float = 1.0
 
+    def __post_init__(self):
+        """Reject nonsense inputs loudly instead of simulating them silently.
+
+        A negative A or k would give exp(+k*d) intensities - fills everywhere;
+        a non-positive contract multiplier would flip every cash flow; a
+        zero EWMA alpha would freeze an estimator at its prior. The knobs
+        that need simulation context (quote_policy, gamma_risk,
+        hawkes_branching, pool_books, ...) stay validated in simulate_paths.
+        """
+        if self.S0 <= 0 or self.K <= 0 or self.T <= 0:
+            raise ValueError("S0, K and T must be positive")
+        if self.n_steps < 1:
+            raise ValueError("n_steps must be >= 1")
+        if self.sigma_impl <= 0:
+            raise ValueError("sigma_impl must be positive")
+        if self.A <= 0 or self.k <= 0:
+            raise ValueError("fill-model A and k must be positive")
+        if self.max_inventory < 0:
+            raise ValueError("max_inventory must be >= 0")
+        if self.half_spread < 0 or self.vol_spread < 0:
+            raise ValueError("half_spread and vol_spread must be >= 0 "
+                             "(a negative spread crosses the quote)")
+        if not 0 < self.tox_ewma_alpha <= 1:
+            raise ValueError("tox_ewma_alpha must be in (0, 1]")
+        if not 0 < self.volmark_ewma_alpha <= 1:
+            raise ValueError("volmark_ewma_alpha must be in (0, 1]")
+        if self.volmark_horizon < 1:
+            raise ValueError("volmark_horizon must be >= 1")
+        if self.contract_multiplier <= 0:
+            raise ValueError("contract_multiplier must be positive")
+        if self.tc_underlying < 0:
+            raise ValueError("tc_underlying must be >= 0")
+
 
 def pool_vega_markouts(volmark, n_obs, pool_books, pool_shrinkage, ewma_alpha):
     """Cross-book pooling of per-book vega-markout EWMAs, with shrinkage.
@@ -293,6 +335,13 @@ def pool_vega_markouts(volmark, n_obs, pool_books, pool_shrinkage, ewma_alpha):
     w = np.where(denom > 0.0, ng / np.maximum(denom, 1e-12), 0.0)
     shrunk = w * xg + (1.0 - w) * pooled
     return shrunk.reshape(x.shape)
+
+
+# lambda*dt past which a step routinely books multiple fills, all at the one
+# quote set before the batch: expected volume is still exact (Poisson
+# booking), but intra-step repricing is not modelled, so the skew's
+# protection inside a clustered step is understated there.
+_LAM_DT_WARN = 0.3
 
 
 def simulate_paths(
@@ -371,26 +420,23 @@ def simulate_paths(
         H = H_target
 
     # Clustered flow setup. hawkes_branching n is the expected number of
-    # follow-on FILLS each fill triggers on its own side, with children
-    # counted at the desk's base quote - so the intensity kick per fill is
-    # pre-inflated by exp(+k*hs0) to undo the quote-distance thinning children
-    # face, and the stationary fill rate inflates by exactly 1/(1-n). Scaling
-    # the base intensity by (1-n) keeps the desk's long-run average volume
-    # equal to the independent-flow desk's: clustering changes the timing of
-    # the same flow, not its amount (skew/adaptive width shifts are second
-    # order; the experiment tables report realised fills to keep this honest).
+    # follow-on fills each fill triggers on its own side, counted AT THE
+    # QUOTE THE PARENT FILLED AT: the per-fill intensity kick is
+    # n*decay*exp(k*d_t), pre-inflated to undo the thinning children face at
+    # distance d_t, so reproduction is exactly n at any FIXED quote and the
+    # process is subcritical everywhere (n < 1) - no quote distance can make
+    # a cluster self-sustain (an earlier fixed-quote calibration went
+    # supercritical exactly when the inventory skew tightened quotes, and
+    # the one-fill Bernoulli cap silently stabilised it). Scaling the base
+    # intensity by (1-n) then matches the independent-flow desk's volume at
+    # every quote distance: clustering changes the timing of the same flow,
+    # not its amount. What breaks the geometric reproduction in practice is
+    # the desk's own skew: each fill shifts the quote away from fair, so a
+    # cluster's children face a worse quote than their parent did - that
+    # thinning below n IS the skew's run-extinguishing effect the experiment
+    # measures (realised fills are reported per run to keep the
+    # volume-matching claim honest).
     n_h = p.hawkes_branching
-    if n_h > 0.0:
-        if p.quote_policy == "glft":
-            delta0 = float(bs_delta(p.S0, p.K, p.T, p.r, p.sigma_impl, p.q, p.otype))
-            hs0, _ = glft_spread_skew(abs(delta0) * p.sigma_impl * p.S0,
-                                      p.A, p.k, p.gamma_risk)
-            hs0 = float(hs0)
-        else:
-            hs0 = p.half_spread
-        excite_jump = n_h * p.hawkes_decay * np.exp(p.k * hs0)
-    else:
-        excite_jump = 0.0
     base_scale = 1.0 - n_h
     A_ask = p.A * (1.0 + p.flow_imbalance) * base_scale   # client buys lift our ask
     A_bid = p.A * (1.0 - p.flow_imbalance) * base_scale
@@ -442,6 +488,9 @@ def simulate_paths(
         return 2.0 * f_hat / (1.0 + f_hat)
 
     var_gap = p.sigma_impl**2 - SR[:, 0]**2
+    lam_dt_max = 0.0
+    lam_dt_warned = False
+    fills_refused = 0.0
 
     for t in range(p.n_steps):
         sig_t = SR[:, t]
@@ -502,58 +551,100 @@ def simulate_paths(
                                        if p.adaptive_spread else 0.0)
 
             skew_shift = skew_unit_v * q_inv
+            if p.quote_policy == "glft":
+                # The GLFT closed form is derived for distances delta >= 0
+                # (quotes at or outside fair); its linear skew extrapolates
+                # negative for large |q|, outside its own domain. The GLFT
+                # desk therefore caps its skid at fair - it quotes
+                # aggressively, never through. (The static desk keeps its
+                # AS-style reservation shift, which may cross fair.)
+                skew_shift = np.clip(skew_shift, -base_half, base_half)
             bid = bid_base - skew_shift - half_spread
             ask = ask_base - skew_shift + half_spread
             d_bid = theo - bid          # distance from fair (drives fill intensity)
             d_ask = ask - theo
+            # Arrival-distance floor: lambda = A exp(-k d) is calibrated for
+            # quotes at or outside fair (d >= 0); a large inventory skew can
+            # push a quote THROUGH fair, and extrapolating the exponential
+            # below zero makes the intensity explode (the old one-fill
+            # Bernoulli cap used to hide this). A through-fair quote is
+            # treated as at-fair for arrivals - the model's most aggressive
+            # anchored rate - and the inventory cap bounds the cluster, with
+            # the refused demand reported as fills_refused.
+            lam_bid = (A_bid + E_bid) * np.exp(-p.k * np.maximum(d_bid, 0.0))
+            lam_ask = (A_ask + E_ask) * np.exp(-p.k * np.maximum(d_ask, 0.0))
 
-            lam_bid = (A_bid + E_bid) * np.exp(-p.k * d_bid)
-            lam_ask = (A_ask + E_ask) * np.exp(-p.k * d_ask)
-            prob_bid = np.clip(1.0 - np.exp(-lam_bid * dt), 0.0, 1.0)
-            prob_ask = np.clip(1.0 - np.exp(-lam_ask * dt), 0.0, 1.0)
+            # Saturation guard: Poisson booking keeps the expected count exact
+            # at any intensity, but every fill in a step still executes at the
+            # one quote set before the batch - the desk cannot reprice between
+            # fills inside a step - so the skew's protection within a
+            # clustered step is understated there.
+            step_lam_dt = max(float(np.max(lam_bid * dt)), float(np.max(lam_ask * dt)))
+            lam_dt_max = max(lam_dt_max, step_lam_dt)
+            if step_lam_dt > _LAM_DT_WARN and not lam_dt_warned:
+                lam_dt_warned = True
+                warnings.warn(
+                    f"fill intensity reaches lambda*dt = {step_lam_dt:.2f} "
+                    f"(> {_LAM_DT_WARN}): multiple fills per step are booked, "
+                    "all at the single pre-step quote (no intra-step "
+                    "repricing), so the skew's protection inside a clustered "
+                    "step is understated. More steps would resolve it.")
 
             tox = (float(p.toxicity_schedule[t]) if p.toxicity_schedule is not None
                    else p.toxicity)
             vtox = (float(p.vol_toxicity_schedule[t])
                     if p.vol_toxicity_schedule is not None else p.vol_toxicity)
-            # Uninformed flow: direction independent of the coming move.
-            u_bid = rng.random(n_sims) < (1.0 - tox - vtox) * prob_bid
-            u_ask = rng.random(n_sims) < (1.0 - tox - vtox) * prob_ask
+            # Fill COUNTS per side: independent Poisson thinnings of the same
+            # intensity - uninformed, direction-informed, vol-informed - so
+            # superposition gives the exact expected count lambda*dt at any
+            # intensity. (The previous Bernoulli-per-type booking capped a
+            # step at one fill per side and merged simultaneous types, which
+            # under-counted volume exactly where the intensity was highest.)
+            n_u_bid = rng.poisson((1.0 - tox - vtox) * lam_bid * dt)
+            n_u_ask = rng.poisson((1.0 - tox - vtox) * lam_ask * dt)
             # Direction-informed flow: buys the option (lifts our ask) when the
             # coming move raises its value, sells (hits our bid) when it lowers
             # it. A call gains on an up-move; a put gains on a down-move.
             up = z > 0.0
             opt_gains = up if p.otype == "call" else ~up
-            i_ask = opt_gains & (rng.random(n_sims) < tox * prob_ask)
-            i_bid = (~opt_gains) & (rng.random(n_sims) < tox * prob_bid)
+            n_i_ask = np.where(opt_gains, rng.poisson(tox * lam_ask * dt), 0)
+            n_i_bid = np.where(~opt_gains, rng.poisson(tox * lam_bid * dt), 0)
             # Vol-informed flow: an option is long vega on either side, so vol
             # buyers lift our ask on paths whose realised vol will exceed the
             # implied they pay, and sell options to us on low-vol paths.
             # Delta-hedging cannot neutralise this - it selects which vol
             # regime each side of our book rides.
             hi_vol = sig_t > p.sigma_impl
-            v_ask = hi_vol & (rng.random(n_sims) < vtox * prob_ask)
-            v_bid = (~hi_vol) & (rng.random(n_sims) < vtox * prob_bid)
+            n_v_ask = np.where(hi_vol, rng.poisson(vtox * lam_ask * dt), 0)
+            n_v_bid = np.where(~hi_vol, rng.poisson(vtox * lam_bid * dt), 0)
 
-            fill_bid = u_bid | i_bid | v_bid    # we BUY 1 @ bid
-            fill_ask = u_ask | i_ask | v_ask    # we SELL 1 @ ask
-            fill_bid &= q_inv < p.max_inventory
-            fill_ask &= q_inv > -p.max_inventory
+            n_bid_raw = n_u_bid + n_i_bid + n_v_bid   # contracts clients SELL to us @ bid
+            n_ask_raw = n_u_ask + n_i_ask + n_v_ask   # contracts clients BUY from us @ ask
+            # The inventory cap is a risk limit, not a modelling artifact:
+            # demand beyond it is REFUSED (counted, never booked, and it
+            # excites nothing downstream - no trade happened).
+            n_bid = np.minimum(n_bid_raw, np.maximum(p.max_inventory - q_inv, 0.0))
+            n_ask = np.minimum(n_ask_raw, np.maximum(q_inv + p.max_inventory, 0.0))
+            fills_refused += float(np.sum(n_bid_raw - n_bid) + np.sum(n_ask_raw - n_ask))
 
-            q_inv += fill_bid
-            cash -= fill_bid * bid * m
-            spread_capture += fill_bid * (theo - bid) * m
-            q_inv -= fill_ask
-            cash += fill_ask * ask * m
-            spread_capture += fill_ask * (ask - theo) * m
-            fills += fill_bid + fill_ask
+            q_inv += n_bid
+            cash -= n_bid * bid * m
+            spread_capture += n_bid * (theo - bid) * m
+            q_inv -= n_ask
+            cash += n_ask * ask * m
+            spread_capture += n_ask * (ask - theo) * m
+            fills += n_bid + n_ask
 
-            # Clustered flow: an executed fill excites more flow on its own
-            # side from the NEXT step on (causal). Blocked quotes (inventory
-            # cap) excite nothing - no trade happened.
+            # Clustered flow: each executed fill breeds n expected children
+            # AT ITS OWN FILL QUOTE (kick pre-inflated by exp(k*d_t) to undo
+            # the children's thinning; floored at fair with the arrivals),
+            # from the NEXT step on (causal). Refused demand excites
+            # nothing - no trade happened.
             if n_h > 0.0:
-                E_bid = E_bid * hawkes_fade + excite_jump * fill_bid
-                E_ask = E_ask * hawkes_fade + excite_jump * fill_ask
+                kick_bid = n_h * p.hawkes_decay * np.exp(p.k * np.maximum(d_bid, 0.0))
+                kick_ask = n_h * p.hawkes_decay * np.exp(p.k * np.maximum(d_ask, 0.0))
+                E_bid = E_bid * hawkes_fade + kick_bid * n_bid
+                E_ask = E_ask * hawkes_fade + kick_ask * n_ask
 
         # Hedge BEFORE the move (delta-neutral into it) unless a hedge lag is set,
         # in which case newly-acquired inventory rides the move unhedged - the
@@ -589,9 +680,8 @@ def simulate_paths(
             # Directional: did the option move the client's way? (For a put,
             # an option buyer is "right" on a down-move - same opt_gains
             # convention as the informed-flow generator above.)
-            n_fills_step = fill_bid.astype(float) + fill_ask.astype(float)
-            agree_count = ((fill_ask & opt_gains).astype(float)
-                           + (fill_bid & ~opt_gains).astype(float))
+            n_fills_step = n_bid + n_ask
+            agree_count = n_ask * opt_gains + n_bid * (~opt_gains)
             has_fill = n_fills_step > 0
             obs = np.where(has_fill, agree_count / np.maximum(n_fills_step, 1.0), 0.0)
             step_sz = np.clip(p.tox_ewma_alpha * n_fills_step, 0.0, 1.0)
@@ -603,7 +693,7 @@ def simulate_paths(
             # Netted per step so a both-sides print (no information)
             # contributes nothing. The fill K bars ago is scored against the
             # variance window that just completed.
-            side_net = fill_ask.astype(float) - fill_bid.astype(float)
+            side_net = n_ask - n_bid
             var_ratio = log_ret**2 / (p.sigma_impl**2 * dt)
             slot = t % K_mark
             vr_sum = vr_sum + var_ratio - vr_buf[:, slot]
@@ -650,6 +740,8 @@ def simulate_paths(
         "vol_hedge_pnl": vol_hedge_pnl,
         "vol_theory": vol_theory,
         "fills": fills,
+        "max_lam_dt": lam_dt_max,
+        "fills_refused": fills_refused,
         "final_inventory": q_inv,
         "max_abs_inventory": q_absmax,
         "inv_track": inv_track,
@@ -932,13 +1024,21 @@ def experiment_online_vol_toxicity(base: MMParams, vtox_hi=0.6, vol_shock=0.06,
     consecutive paths as one desk's books - and, crucially, recalibrates its
     null threshold to ``pooled_deadband``: the deadband exists to reject the
     clipped estimator's noise floor, and the pooled floor is lower (measured
-    on clean flow: mean clipped estimate ~0.04 at expiry for 10 pooled books
-    vs ~0.065 per book). That recalibration is where pooling's edge cashes
-    in; with the per-book deadband the tighter estimate is mostly eaten by a
-    threshold sized for noise it no longer has. Every path here faces the
-    same toxicity schedule, so the pooling assumption (cross-book
-    exchangeability) holds by construction - this measures the *best case*
-    for pooling, deliberately.
+    on clean flow under Poisson booking: mean clipped estimate ~0.047 at
+    expiry for 10 pooled books vs ~0.071 per book). That recalibration is
+    where pooling's edge cashes in; with the per-book deadband the tighter
+    estimate is mostly eaten by a threshold sized for noise it no longer has.
+
+    Where the edge shows up, and how big it honestly is (measured at 25k
+    paths; the P&L effects are ~0.03-0.06 - real and seed-consistent at
+    that size, but below the single-seed noise floor of smaller runs, so
+    2.5k-path tables will not resolve them): in stationary vol-toxic flow
+    the pooled desk recovers roughly TWICE the per-book desk's share of the
+    oracle markup's edge, though the oracle keeps the rest; on clean flow
+    its phantom-toxicity tax is about half the per-book desk's; on a regime
+    switch the adaptive desks beat the oracle's fixed markup (but not the
+    static desk - the markup's value there is avoiding the oracle's
+    mistake, not beating no defence).
     """
     n = base.n_steps
     schedules = {
@@ -1038,17 +1138,31 @@ def experiment_hawkes_clustering(base: MMParams, branchings=(0.0, 0.3, 0.6, 0.8)
     uncertain realised vol - the only thing swept is HOW the same flow
     arrives: independently (branching 0, the assumption in Avellaneda-Stoikov,
     GLFT and the option-MM literature) or in self-exciting same-side clusters
-    (a fill breeds more fills on its side, ~3-day excitement half-life).
+    (each fill breeds fills at its own quote, ~3-day excitement half-life).
     Clustering makes one-sided runs endogenous: the book gets pushed further,
     stays displaced longer, and the inventory-risk term every quoting model
     prices from sigma alone is understated. Both a hand-tuned desk and a GLFT
-    desk run the sweep. Two things to watch in the output: realised fills FALL
-    with clustering even though the flow is volume-matched at the base quote -
-    the skew actively extinguishes one-sided runs, so part of the clustering
-    cost is paid in volume (the defence) and part in inventory risk (what
-    leaks through) - and the CE ranking between the desks flips as clustering
-    rises: the hand-tuned point was tuned under independence, the derived
-    conservative quotes are what survive the assumption failing.
+    desk run the sweep. What the output shows: realised fills FALL with
+    clustering even though the flow is volume-matched - the skew actively
+    extinguishes one-sided runs (each fill's children face a worse quote than
+    their parent), so part of the clustering cost is paid in volume (the
+    defence) and the rest in inventory risk and P&L dispersion (what leaks
+    through). The CE ranking does NOT flip: the hand-tuned desk keeps its
+    edge at every branching. An earlier version of this experiment, run under
+    one-fill-per-side Bernoulli booking, showed a flip to the GLFT desk at
+    high branching - that was an artifact of the booking cap saturating in
+    exactly the clustered regime the experiment was measuring (see the
+    module docstring); under Poisson counts it disappears.
+
+    Booking note, so the volume row is read honestly: fills are Poisson
+    counts (expected volume exact at any intensity), clipped at the
+    inventory cap - refused demand is real desk policy, and fills_refused
+    reports it (it stays ~0 here: the extinguishing is the skew's, not the
+    cap's). The residual caveat is within-step batching: every fill in a
+    step executes at the one quote set before it, so the skew cannot
+    reprice INTO a cluster - the extinguishing effect measured here is a
+    lower bound on what continuous repricing would achieve. max_lam_dt
+    reports each run's worst step for reading against that.
     """
     desks = {"hand-tuned": {},
              "GLFT g=0.1": dict(quote_policy="glft", gamma_risk=0.1)}
@@ -1063,6 +1177,8 @@ def experiment_hawkes_clustering(base: MMParams, branchings=(0.0, 0.3, 0.6, 0.8)
             rows.append({
                 "branching": n_h, "desk": dname,
                 "avg_fills": float(r["fills"].mean()),
+                "max_lam_dt": float(r["max_lam_dt"]),
+                "fills_refused": float(r["fills_refused"] / n_sims),
                 "abs_inv": float(np.abs(r["final_inventory"]).mean()),
                 "peak_inv": float(r["max_abs_inventory"].mean()),
                 "std": float(pnl.std(ddof=1)),
@@ -1358,24 +1474,30 @@ def _plot_glft_quoting(glft_res, plt, ps, outdir):
 
 
 def _plot_hawkes_clustering(hres, plt, ps, outdir):
-    fig, (axA, axB) = plt.subplots(1, 2, figsize=(13, 5))
+    fig, (axA, axB, axC) = plt.subplots(1, 3, figsize=(16, 4.6))
     ns = hres["branchings"]
     for i, desk in enumerate(hres["desks"]):
         rows = [r for r in hres["rows"] if r["desk"] == desk]
         axA.plot(ns, [r["peak_inv"] for r in rows], "-o", color=ps.series_color(i),
                  label=desk)
-        axB.plot(ns, [r["ce"] for r in rows], "-o", color=ps.series_color(i),
+        axB.plot(ns, [r["avg_fills"] for r in rows], "-o", color=ps.series_color(i),
                  label=desk)
-    axA.set_xlabel("flow branching (follow-on fills per fill)")
+        axC.plot(ns, [r["ce"] for r in rows], "-o", color=ps.series_color(i),
+                 label=desk)
+    axA.set_xlabel("flow branching (children per fill)")
     axA.set_ylabel("mean peak |inventory| (contracts)")
     axA.set_title("Clustered flow pushes the book further than the\n"
                   "independent-fills assumption predicts")
     axA.legend(fontsize=8)
-    axB.set_xlabel("flow branching (follow-on fills per fill)")
-    axB.set_ylabel(f"certainty equivalent (g={hres['gamma_ref']})")
-    axB.set_title("The desk tuned under independence wins when it holds -\n"
-                  "and loses to the conservative derived quotes when it fails")
-    axB.legend(fontsize=8)
+    axB.set_xlabel("flow branching (children per fill)")
+    axB.set_ylabel("mean fills per book")
+    axB.set_title("...and costs volume: the skew extinguishes\n"
+                  "one-sided runs (fills_refused stays ~0)")
+    axC.set_xlabel("flow branching (children per fill)")
+    axC.set_ylabel(f"certainty equivalent (g={hres['gamma_ref']})")
+    axC.set_title("The ranking does not flip: the hand-tuned desk\n"
+                  "keeps its edge at every branching")
+    axC.legend(fontsize=8)
     fig.tight_layout()
     fig.savefig(f"{outdir}/hawkes_clustering.png", dpi=130)
     plt.close(fig)
@@ -1487,12 +1609,15 @@ def main():
     print("  clean-flow tax and beats it when toxicity is time-varying. The pooled desk")
     print("  (10 books, shrinkage toward the evidence-weighted pool mean) runs the")
     print("  same markup rule on a far less noisy estimate, and recalibrates its null")
-    print("  threshold to the pooled floor - which is where the extra edge cashes in:")
-    print("  more of the oracle's stationary edge at roughly half the per-book desk's")
-    print("  clean-flow tax. Caveat stated: every book here faces the same flow by")
-    print("  construction - the exchangeable best case for pooling. A book with")
-    print("  structurally different clientele would be dragged toward the crowd until")
-    print("  its own markouts (~pool_shrinkage of them) buy its weight back.")
+    print("  threshold to the pooled floor. The P&L translation is real but small")
+    print("  (~0.03-0.06, measured at 25k paths - below this table's 4k-path")
+    print("  single-seed noise floor): in stationary toxic flow the pooled desk")
+    print("  recovers roughly twice the per-book desk's share of the oracle's")
+    print("  edge, at about half the per-book desk's clean-flow phantom tax; on a")
+    print("  regime switch the adaptive desks beat the oracle's fixed markup. A")
+    print("  book with structurally different clientele would be dragged toward")
+    print("  the crowd until its own markouts (~pool_shrinkage of them) buy its")
+    print("  weight back.")
 
     # Experiment G - GLFT-derived quotes vs hand-tuned quotes
     glft_res = experiment_glft_quoting(MMParams(flow_imbalance=0.30),
@@ -1527,9 +1652,12 @@ def main():
     print("  independently (the assumption in A-S/GLFT and the option-MM literature,")
     print("  a gap that literature itself flags - Baldacci 2020, sec 4.1.1). Peak")
     print("  inventory and P&L dispersion grow with clustering; realised volume falls")
-    print("  because the skew actively extinguishes one-sided runs. And the CE ranking")
-    print("  FLIPS: hand-tuned wins under independence (what it was tuned for), the")
-    print("  more conservative derived quotes win when the assumption fails.")
+    print("  because the skew actively extinguishes one-sided runs (fills_refused")
+    print("  stays ~0 - the extinguishing is the skew's, not the cap's). The CE")
+    print("  ranking does NOT flip: the hand-tuned desk keeps its edge at every")
+    print("  branching. (An earlier Bernoulli one-fill-per-step booking showed a")
+    print("  flip at high branching - that was the booking cap saturating in the")
+    print("  clustered regime, an artifact the Poisson count booking removed.)")
 
     res = _try_matplotlib()
     if res is None:

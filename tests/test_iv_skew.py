@@ -9,6 +9,8 @@ true smile from the prices alone. No network access anywhere.
 Run:  python -m pytest tests/test_iv_skew.py -q
 """
 
+from datetime import datetime, timedelta
+
 import numpy as np
 import pandas as pd
 
@@ -194,3 +196,104 @@ def test_delta_anchored_skew_reads_the_smile_end_to_end():
     call_iv = X.find_mean_iv_at_strike(calls, got[1])
     assert np.isfinite(put_iv) and np.isfinite(call_iv)
     assert put_iv - call_iv > 0.005          # the built-in put skew, delta-anchored
+
+
+# --------------------------------------------------------------------------- #
+# Persistence: idempotent snapshot, quality-gated summary columns             #
+# --------------------------------------------------------------------------- #
+def test_snapshot_save_is_idempotent_per_day(tmp_path, monkeypatch):
+    """A same-day re-run must REPLACE that day's rows rather than append a
+    second copy of the same delayed session (which silently doubled days in
+    every downstream average); earlier days are kept."""
+    csv = str(tmp_path / "snap.csv")
+    monkeypatch.setattr(X, "DAILY_SNAPSHOT_CSV", csv)
+    X.save_iv_skew_snapshot(pd.DataFrame({"ticker": ["AAA", "BBB"],
+                                          "iv_skew": [0.10, -0.05]}))
+    X.save_iv_skew_snapshot(pd.DataFrame({"ticker": ["AAA", "BBB", "CCC"],
+                                          "iv_skew": [0.11, -0.06, 0.02]}))
+    out = pd.read_csv(csv)
+    assert len(out) == 3 and set(out["ticker"]) == {"AAA", "BBB", "CCC"}
+
+    stale = pd.DataFrame({"ticker": ["OLD"], "iv_skew": [0.0],
+                          "timestamp": [datetime.now() - timedelta(days=1)]})
+    stale.to_csv(csv, index=False)
+    X.save_iv_skew_snapshot(pd.DataFrame({"ticker": ["NEW"], "iv_skew": [0.1]}))
+    out = pd.read_csv(csv)
+    assert set(out["ticker"]) == {"OLD", "NEW"}
+
+
+def test_bubble_summary_records_reliable_only_companion_columns(tmp_path, monkeypatch):
+    """The summary CSV carries the quality-gated companion statistics next to
+    the headline ones, and the ALERT fires on the reliable-only rate when
+    enough reliable rows exist (recorded as alert_basis). Here only 2 of 4
+    rows are reliable - below MIN_RELIABLE_FOR_ALERT - so the alert falls
+    back to the all-valid basis."""
+    csv = str(tmp_path / "bubble.csv")
+    monkeypatch.setattr(X, "BUBBLE_SUMMARY_CSV", csv)
+    df = pd.DataFrame({
+        "ticker": ["A", "B", "C", "D", "E"],
+        "index": ["tech"] * 5,
+        "index_name": ["Tech"] * 5,
+        "iv_skew": [0.10, -0.05, np.nan, -0.02, 0.30],
+        "is_reliable": [True, True, True, False, False],
+    })
+    X.save_bubble_summary_by_index(df)
+    out = pd.read_csv(csv)
+    row = out[out["index"] == "tech"].iloc[0]
+    assert row["valid_measurements"] == 4          # NaN row excluded
+    assert row["inverted_count"] == 2              # B and D are negative
+    assert row["reliable_measurements"] == 2       # A and B
+    assert row["inverted_reliable"] == 1           # B only
+    assert row["inversion_pct_reliable"] == 50.0
+    assert row["alert_basis"] == "all"             # too few reliable rows
+    assert row["alert_level"] == "WARNING"         # 2/4 = 50% on all-valid
+    grow = out[out["index"] == "GLOBAL"].iloc[0]
+    assert grow["reliable_measurements"] == 2
+    assert grow["inversion_pct_reliable"] == 50.0
+    assert grow["alert_basis"] == "all"
+
+
+def test_alert_fires_on_reliable_basis_when_supported():
+    """With enough reliable rows, the alert level follows the reliable-only
+    rate even when the all-valid rate sits in a different band; below the
+    minimum it falls back to all-valid."""
+    def frame(skews, reliable):
+        return pd.DataFrame({"iv_skew": skews, "is_reliable": reliable})
+
+    # 6 reliable rows, 4 of them inverted (66.7% > 60 -> CRITICAL); the 4
+    # unreliable rows pull the all-valid rate to 50% (WARNING band).
+    df = frame([0.1, -0.05, -0.02, 0.3, -0.01, -0.03] + [0.2, -0.04, 0.25, 0.15],
+               [True] * 6 + [False] * 4)
+    pct, basis = X.alert_inversion_rate(df)
+    assert (pct, basis) == (4 / 6 * 100, "reliable")
+
+    # 3 reliable rows only (all clean) - below MIN_RELIABLE_FOR_ALERT, so
+    # the alert uses the all-valid rate (5/10 inverted).
+    df = frame([-0.05, -0.02, -0.01, -0.03, -0.04] + [0.1, 0.2, 0.3, 0.25, 0.15],
+               [True, True, True] + [False] * 7)
+    pct, basis = X.alert_inversion_rate(df)
+    assert (pct, basis) == (5 / 10 * 100, "all")
+
+
+def test_parity_implied_q_recovers_a_known_dividend():
+    """Chains priced under parity with a 2% dividend yield must give the
+    yield back; absurd implied carry (stale quotes) must refuse to 0.0."""
+    q_true = 0.02
+    calls, puts = [], []
+    for K in np.arange(90.0, 111.0, 2.5):
+        C = max(0.5 * (S - K) + 5.0, 0.4)          # arbitrary but sane mids
+        P = C - S * np.exp(-q_true * T) + K * np.exp(-R * T)
+        calls.append({"strike": K, "bid": C - 0.05, "ask": C + 0.05})
+        puts.append({"strike": K, "bid": P - 0.05, "ask": P + 0.05})
+    q_hat = X.parity_implied_q(pd.DataFrame(calls), pd.DataFrame(puts), S, T, R)
+    assert abs(q_hat - q_true) < 1e-6
+
+    # a huge C-P gap implies absurd carry -> refused to 0.0
+    bad = pd.DataFrame([{"strike": K, "bid": P + 5.0, "ask": P + 5.1}
+                        for K in (97.5, 100.0, 102.5)])
+    good_calls = pd.DataFrame(calls)
+    assert X.parity_implied_q(good_calls, bad, S, T, R) == 0.0
+
+    # fewer than two matched pairs -> 0.0
+    one = pd.DataFrame([calls[4]])
+    assert X.parity_implied_q(one, pd.DataFrame([puts[4]]), S, T, R) == 0.0

@@ -156,6 +156,17 @@ MAX_IV = 3.0
 MIN_DTE = 7
 MAX_DTE = 60
 
+# Parity-implied dividend yields beyond this are stale-quote noise, not
+# carry: refuse the adjustment and invert at q=0 (the pipeline's old,
+# documented behaviour) rather than at a value we cannot trust.
+Q_PARITY_MAX = 0.15
+
+# Alert levels are computed on the reliable-only inversion rate when at
+# least this many reliable measurements exist; below it the rate is noise
+# and the alert falls back to the all-valid basis (recorded per row as
+# alert_basis so the time series is self-describing).
+MIN_RELIABLE_FOR_ALERT = 5
+
 DEFAULT_RISK_FREE = 0.04
 _RISK_FREE_CACHE: Dict[str, float] = {}
 
@@ -187,7 +198,7 @@ IV_STYLE = "european"
 
 
 def add_own_iv(options_df: pd.DataFrame, spot: float, T: float, r: float,
-               otype: str) -> pd.DataFrame:
+               otype: str, q: float = 0.0) -> pd.DataFrame:
     """Recompute implied vol from bid-ask mid prices with the repo's inverter.
 
     yfinance's ``impliedVolatility`` is preserved as ``yf_iv`` for diagnostics;
@@ -196,6 +207,8 @@ def add_own_iv(options_df: pd.DataFrame, spot: float, T: float, r: float,
     two-sided market (bid<=0 or crossed) and mids outside the no-arbitrage
     price bounds invert to NaN and fall out in validation. ``IV_STYLE``
     selects European (Brent closed-form) or American (CRR tree) inversion.
+    ``q`` is the dividend yield used in inversion (see ``parity_implied_q``;
+    0 when the caller has no parity view).
     """
     df = options_df.copy()
     df["yf_iv"] = df.get("impliedVolatility", np.nan)
@@ -209,16 +222,50 @@ def add_own_iv(options_df: pd.DataFrame, spot: float, T: float, r: float,
     if IV_STYLE == "american":
         if good.any():
             own[good] = american_iv_vector(mid[good], spot, strikes[good], T, r,
-                                           otype=otype)
+                                           q=q, otype=otype)
     else:
         for i in np.flatnonzero(good):
-            own[i] = iv_from_price(mid[i], spot, strikes[i], T, r, otype=otype)
+            own[i] = iv_from_price(mid[i], spot, strikes[i], T, r, q,
+                                   otype=otype)
     df["impliedVolatility"] = own
     return df
 
 
+def parity_implied_q(calls_df: pd.DataFrame, puts_df: pd.DataFrame,
+                     spot: float, T: float, r: float,
+                     n_pairs: int = 5) -> float:
+    """Dividend yield implied by put-call parity on the raw chain.
+
+    C - P = e^{-rT}(F - K) with F = S e^{(r-q)T}: every matched strike with a
+    two-sided quote on both sides implies its own forward; the median over
+    the ``n_pairs`` strikes nearest spot gives q = r - ln(F/S)/T. Returns 0.0
+    when fewer than two usable pairs exist, and 0.0 when the implied |q|
+    exceeds Q_PARITY_MAX (stale quotes imply absurd carry) - an adjustment
+    we cannot trust is worse than none, and q=0 is the documented fallback
+    the pipeline always had.
+    """
+    try:
+        two_sided = lambda d: d[(d["bid"] > 0) & (d["ask"] >= d["bid"])]
+        c = two_sided(calls_df).set_index("strike")
+        p = two_sided(puts_df).set_index("strike")
+        ks = c.index.intersection(p.index)
+        if len(ks) < 2 or T <= 0 or not np.isfinite(spot) or spot <= 0:
+            return 0.0
+        ks = np.asarray(sorted(ks.values), dtype=float)
+        nearest = ks[np.argsort(np.abs(ks - spot))[:n_pairs]]
+        c_mid = 0.5 * (c.loc[nearest, "bid"] + c.loc[nearest, "ask"]).values
+        p_mid = 0.5 * (p.loc[nearest, "bid"] + p.loc[nearest, "ask"]).values
+        fwd = nearest + np.exp(r * T) * (c_mid - p_mid)
+        if not np.all(np.isfinite(fwd)) or np.any(fwd <= 0):
+            return 0.0
+        q = float(np.median(r - np.log(fwd / spot) / T))
+        return q if abs(q) <= Q_PARITY_MAX else 0.0
+    except Exception:
+        return 0.0
+
+
 def validate_option_data(options_df: pd.DataFrame, spot: float, T: float,
-                         r: float, otype: str) -> pd.DataFrame:
+                         r: float, otype: str, q: float = 0.0) -> pd.DataFrame:
     """Filter options data to ensure quality, then recompute IV from prices."""
     if options_df.empty:
         return options_df
@@ -242,7 +289,7 @@ def validate_option_data(options_df: pd.DataFrame, spot: float, T: float,
 
     # Recompute IV from mid prices with the repo's own inverter (yfinance's
     # value is retained as yf_iv but takes no further part in the analysis).
-    df = add_own_iv(df, spot, T, r, otype)
+    df = add_own_iv(df, spot, T, r, otype, q=q)
 
     # Filter 4: IV sanity checks - on OUR IV. NaN here includes quotes whose
     # mid violated the no-arbitrage price bounds.
@@ -377,20 +424,30 @@ def fetch_option_chain(ticker: str, max_retries: int = 3) -> Tuple[str, Optional
                 return ticker, None, None, {}
 
             # Apply data quality filters and recompute IVs from mid prices
-            # with the repo's own Brent inverter (see add_own_iv).
+            # with the repo's own Brent inverter (see add_own_iv). The
+            # dividend yield comes from the chain's own put-call parity -
+            # inverting a dividend payer at q=0 biases every delta-anchored
+            # strike (the old behaviour; 0.0 remains the fallback).
             _, dte = validate_expiry_date(best_expiry)
             T = max(dte, 1) / 365.0
             r = get_risk_free_rate()
-            validated_puts = validate_option_data(chain.puts, spot_price, T, r, "put")
-            validated_calls = validate_option_data(chain.calls, spot_price, T, r, "call")
+            q_hat = parity_implied_q(chain.calls, chain.puts, spot_price, T, r)
+            validated_puts = validate_option_data(chain.puts, spot_price, T, r,
+                                                  "put", q=q_hat)
+            validated_calls = validate_option_data(chain.calls, spot_price, T, r,
+                                                   "call", q=q_hat)
             
             # Check if we have enough data
             if len(validated_puts) < 3 or len(validated_calls) < 3:
                 return ticker, None, None, {}
             
-            # Create new chain with validated data
-            ValidatedChain = namedtuple('ValidatedChain', ['puts', 'calls'])
-            validated_chain = ValidatedChain(puts=validated_puts, calls=validated_calls)
+            # Create new chain with validated data; spot rides along so the
+            # consumer never has to re-fetch it (the second .info scrape used
+            # to disagree with the first on fast-moving names).
+            ValidatedChain = namedtuple('ValidatedChain', ['puts', 'calls', 'spot'])
+            validated_chain = ValidatedChain(puts=validated_puts,
+                                             calls=validated_calls,
+                                             spot=spot_price)
             
             # Calculate quality metrics
             quality_metrics = compute_data_quality_score(validated_puts, validated_calls, spot_price)
@@ -603,7 +660,11 @@ def compute_iv_skew_metric(ticker: str, expiry: str, chain: object, quality_metr
         calls_df = chain.calls
         puts_df = chain.puts
         
-        spot_price = get_current_spot_price(ticker)
+        # The fetcher's spot rides with the chain; refetch only for
+        # foreign/legacy chain objects that lack it.
+        spot_price = getattr(chain, "spot", np.nan)
+        if not np.isfinite(spot_price) or spot_price <= 0:
+            spot_price = get_current_spot_price(ticker)
         
         if np.isnan(spot_price):
             return ticker, expiry, np.nan, np.nan, np.nan, 0.0
@@ -675,6 +736,23 @@ def analyze_index(index_key: str, index_data: Dict, n_workers: int = 5) -> pd.Da
     return df
 
 
+def alert_inversion_rate(valid_df: pd.DataFrame) -> Tuple[float, str]:
+    """(inversion_pct, basis) that alert levels are computed on.
+
+    The reliable-only rate when at least MIN_RELIABLE_FOR_ALERT reliable
+    measurements exist (a low-quality row can no longer move an alert on
+    its own); the all-valid rate otherwise, since a handful of reliable
+    names is noisier than the full set. The basis travels with every alert
+    so the time series is self-describing.
+    """
+    if "is_reliable" not in valid_df.columns:
+        return ((valid_df["iv_skew"] < 0).sum() / len(valid_df)) * 100, "all"
+    rel = valid_df[valid_df["is_reliable"] == True]
+    if len(rel) >= MIN_RELIABLE_FOR_ALERT:
+        return ((rel["iv_skew"] < 0).sum() / len(rel)) * 100, "reliable"
+    return ((valid_df["iv_skew"] < 0).sum() / len(valid_df)) * 100, "all"
+
+
 def print_index_summary(index_key: str, index_name: str, df: pd.DataFrame) -> None:
     """Print formatted summary for an index."""
     valid_df = df.dropna(subset=["iv_skew"])
@@ -685,24 +763,34 @@ def print_index_summary(index_key: str, index_name: str, df: pd.DataFrame) -> No
     
     # Show data quality
     reliable_count = (valid_df["is_reliable"] == True).sum()
-    
+
     inverted_count = (valid_df["iv_skew"] < 0).sum()
     inversion_pct = (inverted_count / len(valid_df)) * 100
     mean_skew = valid_df["iv_skew"].mean()
     median_skew = valid_df["iv_skew"].median()
+
+    # Quality-gated companion stat: the same inversion rate over reliable
+    # measurements only, and the basis the alert below actually used.
+    rel_df = valid_df[valid_df["is_reliable"] == True]
+    if len(rel_df) > 0:
+        rel_pct = ((rel_df["iv_skew"] < 0).sum() / len(rel_df)) * 100
+        reliable_str = f" | Reliable-only inverted: {rel_pct:.1f}% ({len(rel_df)}n)"
+    else:
+        reliable_str = ""
+    alert_pct, alert_basis = alert_inversion_rate(valid_df)
     
-    if inversion_pct > 70:
+    if alert_pct > 70:
         status = "🔴🚨" 
-    elif inversion_pct > CRITICAL_INVERSION_THRESHOLD:
+    elif alert_pct > CRITICAL_INVERSION_THRESHOLD:
         status = "🚨" 
-    elif inversion_pct > WARNING_INVERSION_THRESHOLD:
+    elif alert_pct > WARNING_INVERSION_THRESHOLD:
         status = "🟡" 
-    elif inversion_pct > 25:
+    elif alert_pct > 25:
         status = "🟠"
     else:
         status = "🟢"
-    
-    print(f"  {status} Inverted: {inverted_count}/{len(valid_df)} ({inversion_pct:.1f}%) | Mean: {mean_skew:.4f} | Median: {median_skew:.4f} | Quality: {reliable_count}/{len(valid_df)}")
+
+    print(f"  {status} Inverted: {inverted_count}/{len(valid_df)} ({inversion_pct:.1f}%) | Mean: {mean_skew:.4f} | Median: {median_skew:.4f} | Quality: {reliable_count}/{len(valid_df)}{reliable_str} | Alert on: {alert_basis}")
 
 
 def print_detailed_skews(df: pd.DataFrame) -> None:
@@ -795,23 +883,35 @@ def run_global_iv_skew_analysis(n_workers: int = 5, show_plot: bool = False) -> 
         print(f"Total Valid Measurements: {len(valid_df)}")
         print(f"Global Inverted Count: {total_inverted}")
         print(f"Global Inversion Rate: {global_inversion_pct:.1f}%")
+        rel_global = valid_df[valid_df["is_reliable"] == True]
+        if len(rel_global) > 0:
+            rel_global_pct = ((rel_global["iv_skew"] < 0).sum()
+                              / len(rel_global)) * 100
+            print(f"Reliable-only Inversion Rate: {rel_global_pct:.1f}% "
+                  f"({len(rel_global)} names)  <- compare with the headline: "
+                  f"a material gap means low-quality rows are moving it")
         print(f"Global Mean IV Skew: {global_mean_skew:.4f}")
         print(f"Global Median IV Skew: {global_median_skew:.4f}")
+
+        # Alert levels fire on the reliable-only rate when there is enough
+        # reliable data to trust it (see alert_inversion_rate).
+        alert_pct, alert_basis = alert_inversion_rate(valid_df)
+        print(f"Alert basis: {alert_basis}")
         
-        if global_inversion_pct > 70:
+        if alert_pct > 70:
             print("\n🔴🚨 EXTREME BUBBLE ALERT!")
             print("   CRITICAL: Over 70% of stocks show inverted skew!")
             print("   This represents extreme speculative mania across markets.")
             print("   Historical precedent suggests significant correction risk.")
-        elif global_inversion_pct > CRITICAL_INVERSION_THRESHOLD:
+        elif alert_pct > CRITICAL_INVERSION_THRESHOLD:
             print("\n🚨 CRITICAL GLOBAL BUBBLE WARNING!")
             print("   Excessive call demand detected across multiple markets!")
             print("   IV skew heavily inverted - extreme speculative mania.")
-        elif global_inversion_pct > WARNING_INVERSION_THRESHOLD:
+        elif alert_pct > WARNING_INVERSION_THRESHOLD:
             print("\n🟡 ELEVATED GLOBAL RISK")
             print("   Above-normal speculative activity detected.")
             print("   Monitor for further deterioration in skew patterns.")
-        elif global_inversion_pct > 25:
+        elif alert_pct > 25:
             print("\n🟠 CAUTION: Elevated Inversion Levels")
             print("   Inversion above historical norms but not yet critical.")
     else:
@@ -828,22 +928,33 @@ def run_global_iv_skew_analysis(n_workers: int = 5, show_plot: bool = False) -> 
 
 
 def save_iv_skew_snapshot(df: pd.DataFrame) -> None:
-    """Append current IV skew snapshot to historical CSV file."""
+    """Append current IV skew snapshot to historical CSV file.
+
+    Idempotent per day, like the bubble summary and the chain capture: a
+    same-day re-run REPLACES that day's rows instead of appending a second
+    copy of the same delayed session (the old behaviour silently doubled
+    days in every downstream average).
+    """
     df_with_timestamp = df.copy()
-    df_with_timestamp["timestamp"] = datetime.now()
-    
+    now = datetime.now()
+    df_with_timestamp["timestamp"] = now
+
     csv_path = Path(DAILY_SNAPSHOT_CSV)
-    
+
     try:
         if csv_path.exists():
             historical_df = pd.read_csv(csv_path)
-            combined_df = pd.concat([historical_df, df_with_timestamp], ignore_index=True)
+            day = pd.to_datetime(historical_df["timestamp"],
+                                 errors="coerce").dt.date
+            historical_df = historical_df[day != now.date()]
+            combined_df = pd.concat([historical_df, df_with_timestamp],
+                                    ignore_index=True)
         else:
             combined_df = df_with_timestamp
-        
+
         combined_df.to_csv(csv_path, index=False)
         print(f"\nDetailed snapshot saved to {DAILY_SNAPSHOT_CSV}")
-        
+
     except Exception as e:
         print(f"\nFailed to save snapshot: {e}")
 
@@ -866,10 +977,20 @@ def save_bubble_summary_by_index(df: pd.DataFrame) -> None:
         inverted_count = (valid_df["iv_skew"] < 0).sum()
         total_valid = len(valid_df)
         inversion_pct = (inverted_count / total_valid) * 100
+
+        # Quality-gated companion columns: the same statistics over reliable
+        # measurements only. The headline inversion_pct stays all-valid (the
+        # time series keeps one continuous definition); the ALERT level
+        # fires on the reliable-only rate when there is enough reliable
+        # data, with the basis it used recorded on the row.
+        rel_df = valid_df[valid_df["is_reliable"] == True]
+        rel_inverted = int((rel_df["iv_skew"] < 0).sum())
+        rel_pct = (rel_inverted / len(rel_df)) * 100 if len(rel_df) > 0 else float("nan")
+        alert_pct, alert_basis = alert_inversion_rate(valid_df)
         
-        if inversion_pct > CRITICAL_INVERSION_THRESHOLD:
+        if alert_pct > CRITICAL_INVERSION_THRESHOLD:
             alert_level = "CRITICAL"
-        elif inversion_pct > WARNING_INVERSION_THRESHOLD:
+        elif alert_pct > WARNING_INVERSION_THRESHOLD:
             alert_level = "WARNING"
         else:
             alert_level = "NORMAL"
@@ -883,6 +1004,10 @@ def save_bubble_summary_by_index(df: pd.DataFrame) -> None:
             "valid_measurements": total_valid,
             "inverted_count": inverted_count,
             "inversion_pct": round(inversion_pct, 2),
+            "reliable_measurements": len(rel_df),
+            "inverted_reliable": rel_inverted,
+            "inversion_pct_reliable": round(rel_pct, 2) if rel_pct == rel_pct else None,
+            "alert_basis": alert_basis,
             "mean_iv_skew": round(valid_df["iv_skew"].mean(), 4),
             "median_iv_skew": round(valid_df["iv_skew"].median(), 4),
             "std_iv_skew": round(valid_df["iv_skew"].std(), 4),
@@ -896,10 +1021,16 @@ def save_bubble_summary_by_index(df: pd.DataFrame) -> None:
         inverted_count_global = (valid_df_global["iv_skew"] < 0).sum()
         total_valid_global = len(valid_df_global)
         inversion_pct_global = (inverted_count_global / total_valid_global) * 100
+
+        rel_global = valid_df_global[valid_df_global["is_reliable"] == True]
+        rel_inverted_global = int((rel_global["iv_skew"] < 0).sum())
+        rel_pct_global = ((rel_inverted_global / len(rel_global)) * 100
+                          if len(rel_global) > 0 else float("nan"))
+        alert_pct_g, alert_basis_g = alert_inversion_rate(valid_df_global)
         
-        if inversion_pct_global > CRITICAL_INVERSION_THRESHOLD:
+        if alert_pct_g > CRITICAL_INVERSION_THRESHOLD:
             alert_level_global = "CRITICAL"
-        elif inversion_pct_global > WARNING_INVERSION_THRESHOLD:
+        elif alert_pct_g > WARNING_INVERSION_THRESHOLD:
             alert_level_global = "WARNING"
         else:
             alert_level_global = "NORMAL"
@@ -913,6 +1044,10 @@ def save_bubble_summary_by_index(df: pd.DataFrame) -> None:
             "valid_measurements": total_valid_global,
             "inverted_count": inverted_count_global,
             "inversion_pct": round(inversion_pct_global, 2),
+            "reliable_measurements": len(rel_global),
+            "inverted_reliable": rel_inverted_global,
+            "inversion_pct_reliable": round(rel_pct_global, 2) if rel_pct_global == rel_pct_global else None,
+            "alert_basis": alert_basis_g,
             "mean_iv_skew": round(valid_df_global["iv_skew"].mean(), 4),
             "median_iv_skew": round(valid_df_global["iv_skew"].median(), 4),
             "std_iv_skew": round(valid_df_global["iv_skew"].std(), 4),

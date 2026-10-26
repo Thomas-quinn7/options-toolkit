@@ -109,9 +109,23 @@ section as the history grows.
 
 ## Outputs and tests
 
-Snapshots append to `daily_IV_skew_snapshot.csv` / `bubble_summary.csv`; the
-study writes per-observation rows to `threshold_study.csv`. Everything is
+Snapshots append to `daily_IV_skew_snapshot.csv` / `bubble_summary.csv` -
+both idempotent per day (a same-day re-run replaces that day's rows instead
+of double-counting the same delayed session in every downstream average);
+the study writes per-observation rows to `threshold_study.csv`. The bubble
+summary carries quality-gated companion columns
+(`reliable_measurements`, `inversion_pct_reliable`) next to the headline
+ones, and the ALERT LEVEL fires on the reliable-only inversion rate
+whenever at least 5 reliable measurements exist (a low-quality row can no
+longer move an alert on its own); below that it falls back to the all-valid
+rate, and the basis each alert used is recorded on the row (`alert_basis`)
+so the time series is self-describing. The headline `inversion_pct` column
+keeps the all-valid definition for series continuity. Inversion prices the
+chain's own dividend yield (put-call parity on matched strikes, refused to
+0 when the implied carry is absurd) instead of assuming q=0, and the spot
+fetched with the chain is reused rather than re-scraped. Everything is
 unit-tested offline on synthetic chains priced from known smiles:
 `tests/test_iv_skew.py` (own-IV pipeline, delta anchoring, fallback, config
-plumbing) and `tests/test_threshold_study.py` (the study end-to-end on a
-fixture snapshot store, including stale-weekend dedupe).
+plumbing, idempotent snapshot save, summary companion columns, alert basis,
+parity-implied q) and `tests/test_threshold_study.py` (the study end-to-end
+on a fixture snapshot store, including stale-weekend dedupe).

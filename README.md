@@ -53,12 +53,11 @@ network.
 - **`black.py`** - Black-Scholes pricing (calls/puts, with dividend yield), the
   full closed-form Greeks (delta, gamma, theta, vega, rho), and a Newton-Raphson
   implied-vol solver, built on JAX (JIT-compiled; the solver's derivative comes
-  from autodiff). Pricing
-  and the IV solver take spot and rate as parameters; `stock_data()` and
-  `get_riskfree_rate()` are helpers for sourcing live inputs at the call site.
-  Also includes a `price_heatmap()` (price/profit vs spot and vol) and a
-  single-snapshot `skew_surface()` 3D plot. Importing the module has no side
-  effects; the `skew_surface` demo runs only under `__main__`.
+  from autodiff). A pure numerical module: importing it pulls in nothing
+  beyond JAX - the live-input helpers (`stock_data()`, `get_riskfree_rate()`,
+  chain scraping) and the plotting demos (`price_heatmap()`, the
+  single-snapshot `skew_surface()`) live in `black_data.py`, and pricing and
+  the IV solver take spot and rate as parameters.
 - **`american.py`** - a CRR binomial **American** pricer (calls/puts, dividend
   yield, European mode converging to Black-Scholes as the tested anchor), the
   early-exercise premium on a shared tree, and American implied vol (Brent for
@@ -291,11 +290,11 @@ only).
   teaching/diagnostic tool, not a live signal.
 
 ## Planned
-- Re-running `skew_bubble_indicator/threshold_study.py` as the snapshot
-  history grows past the current handful of days - the point where the
-  threshold table stops being range calibration and starts carrying
-  regime information. (Delta-anchored strike selection and the first
-  measured threshold context shipped 2026-07-28.)
+- Re-running `skew_bubble_indicator/threshold_study.py` periodically as the
+  snapshot history grows - refreshed 2026-10-26 at 35 sessions / 313
+  observations (thresholds have still never fired; highest daily inversion
+  33% vs the 40% WARNING line). The table becomes regime information only
+  once a froth episode actually lands in the history.
 
 ## Note
 Research and learning code - not investment advice. Data is pulled live from

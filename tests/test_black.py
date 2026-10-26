@@ -110,3 +110,20 @@ def test_implied_vol_impossible_price_is_nan():
     assert np.isnan(float(implied_volatility(100.0, 60.0, 0.3, 30.0, r=0.045, T=1.0, E=1e-5)))
     # negative price
     assert np.isnan(float(implied_volatility(100.0, 100.0, 0.2, -1.0, r=0.045, T=1.0, E=1e-5)))
+
+
+# --------------------------------------------------------------------------- #
+# Module split: the pure pricer imports nothing heavy                          #
+# --------------------------------------------------------------------------- #
+def test_import_is_light():
+    """Importing black.py must not drag in the scraping/plotting stack -
+    the whole point of the black.py / black_data.py split. Checked in a
+    fresh interpreter because this session has already loaded them."""
+    import subprocess
+    import sys
+
+    code = ("import sys; from pricing_and_vol_surface import black; "
+            "heavy = [m for m in ('yfinance', 'seaborn', 'matplotlib', "
+            "'pandas') if m in sys.modules]; "
+            "assert not heavy, heavy")
+    subprocess.run([sys.executable, "-c", code], check=True)

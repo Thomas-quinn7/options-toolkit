@@ -1,3 +1,14 @@
+"""Pure Black-Scholes pricer on JAX: prices, the full closed-form Greeks,
+and a Newton-Raphson implied-vol solver (derivative via autodiff).
+
+This module imports nothing beyond JAX - no network, no plotting - so any
+consumer can price without dragging in the scraping stack. Live-input
+helpers (spot, ^IRX rate, chain scraping) and the plotting demos
+(``price_heatmap``, ``skew_surface``) live in ``black_data.py``.
+
+Note: importing this module enables JAX float64 process-wide (see below) -
+a pricing library silently wrong in the wings would be worse.
+"""
 import jax
 
 # Full float64 precision: without this JAX defaults to float32, which caps
@@ -6,15 +17,8 @@ import jax
 jax.config.update("jax_enable_x64", True)
 
 from jax.scipy.stats import norm as jnorm  # noqa: E402
-import yfinance as yf  # noqa: E402
 import jax.numpy as jnp  # noqa: E402
-from jax import grad, jit, vmap  # noqa: E402
-import seaborn as sn
-from matplotlib import pyplot as plt
-from datetime import datetime, date
-import pandas as pd
-from mpl_toolkits import mplot3d
-from scipy.interpolate import griddata
+from jax import grad, jit  # noqa: E402
 
 
 # S = Stock Price; K = Strike Price; T = Time Period; r = Risk-free Return;
@@ -47,24 +51,6 @@ def black_scholes(S, K, T, r, sigma, q=0, otype="call"):
         raise ValueError("otype must be 'call' or 'put'")
 
 
-def stock_data(stock):
-    stock_data = yf.Ticker(stock).history(period="max")
-    S = stock_data["Close"].iloc[-1]
-    return S
-
-
-def get_riskfree_rate():
-    r_df = yf.Ticker("^IRX").history(period="5d")
-    if r_df.empty:
-        raise ValueError(
-            "No data returned for ^IRX. Check internet connection or ticker."
-        )
-    y = r_df["Close"].iloc[-1] / 100
-    T = 13 / 52
-    r = -jnp.log(1 - T * y) / T
-    return float(r)
-
-
 def diff_function(S, K, T, r, sigma_est, price, q=0, otype="call"):
     """Difference function for implied volatility (not JIT due to string argument)."""
     theoretical = black_scholes(S, K, T, r, sigma_est, q, otype)
@@ -76,15 +62,15 @@ def implied_volatility(
 ):
     """Newton-Raphson implied vol solver.
 
-    Spot (S) and the risk-free rate (r) are passed in as parameters rather than
-    fetched over the network, so this stays a pure numerical routine. Use
-    stock_data() / get_riskfree_rate() at the call site to source live inputs.
-
     E is an *absolute* price tolerance: tighten it (e.g. 1e-6) for low-premium
     OTM options, otherwise sigma_est may be accepted unchanged. If Newton stalls
     from the caller's guess (vega ~ 0 far from the money) it is retried from a
     few standard starts; returns nan when no start converges (e.g. price
     outside no-arb bounds) rather than a stale or diverged guess.
+
+    Spot (S) and the risk-free rate (r) are parameters, not fetches: use
+    black_data.stock_data() / black_data.get_riskfree_rate() at the call
+    site for live inputs.
     """
     loss_grad = grad(diff_function, argnums=4)
 
@@ -188,104 +174,3 @@ def greeks(S, K, T, r, sigma, q=0, otype="call"):
     vega = _vega(S, K, T, r, sigma, q)
 
     return delta, gamma, theta, vega, rho
-
-
-def price_heatmap(
-    S, K, T=1, r=0.03, sigma=0.1, q=0, otype="call", Pur_Price=0, grid=9, diff=0.2
-):
-    """Optimized price heatmap using vectorized operations."""
-    interval = (2 * diff) / (grid - 1)
-    step_p = interval * S
-    step_vol = interval * sigma
-
-    min_p = (1 - diff) * S
-    min_vol = (1 - diff) * sigma
-    diff_prices = jnp.linspace(min_p, min_p + (grid - 1) * step_p, grid)
-    diff_vols = jnp.linspace(min_vol, min_vol + (grid - 1) * step_vol, grid)
-
-    P_grid, V_grid = jnp.meshgrid(diff_prices, diff_vols)
-
-    @jit
-    def compute_price_matrix(prices, vols):
-        return vmap(vmap(lambda p, v: black_scholes(p, K, T, r, v, q, otype)))(
-            prices, vols
-        )
-
-    price_matrix = compute_price_matrix(P_grid, V_grid) - Pur_Price
-
-    plt.figure(figsize=(8, 6), dpi=200)
-    sn.heatmap(
-        jnp.array(price_matrix),
-        xticklabels=[round(float(p), 2) for p in diff_prices],
-        yticklabels=[round(float(v), 3) for v in diff_vols],
-        cmap="RdYlGn",
-        annot=True,
-        fmt=".2f",
-    )
-    plt.xlabel("Stock Price")
-    plt.ylabel("Implied Volatility (σ)")
-    if Pur_Price == 0:
-        plt.title(f"Option Price Heatmap (K={K}, T={T}, {otype.capitalize()})")
-    else:
-        plt.title(
-            f"Option Profit Heatmap (K={K}, T={T}, {otype.capitalize()}, Purchase Price={Pur_Price})"
-        )
-    plt.show()
-
-
-def options(ticker):
-    stock = yf.Ticker(ticker)
-    Today = date.today()
-    all_options = []
-    for expiration in stock.options:
-        expiry_date = datetime.strptime(expiration, "%Y-%m-%d").date()
-        T = (expiry_date - Today).days / 365
-        chain = stock.option_chain(expiration)
-
-        calls_df = chain.calls.copy()
-        calls_df["T"] = T
-        calls_df["Expiration"] = expiration
-        calls_df["otype"] = "call"
-        all_options.append(calls_df)
-
-        puts_df = chain.puts.copy()
-        puts_df["T"] = T
-        puts_df["Expiration"] = expiration
-        puts_df["otype"] = "put"
-        all_options.append(puts_df)
-
-    options_df = pd.concat(all_options, ignore_index=False)
-    return options_df
-
-
-def skew_surface(ticker, otype="call"):
-    options_df = options(ticker)
-    stock_price = stock_data(ticker)
-    filtered = options_df[options_df["otype"] == otype].copy()
-    filtered = filtered.dropna(subset=["impliedVolatility"])
-    K = jnp.asarray(filtered["strike"] / stock_price)
-    T = jnp.asarray(filtered["T"])
-    IV = jnp.asarray(filtered["impliedVolatility"])
-    T_grid, K_grid = jnp.meshgrid(
-        jnp.linspace(min(T), max(T), 50), jnp.linspace(min(K), max(K), 50)
-    )
-    IV_grid = griddata(points=(T, K), values=IV, xi=(T_grid, K_grid), method="linear")
-    fig = plt.figure(figsize=(10, 6))
-    ax = fig.add_subplot(111, projection="3d")
-    surf = ax.plot_surface(
-        T_grid, K_grid, IV_grid, cmap="viridis", edgecolor="none", alpha=0.9
-    )
-    ax.set_xlabel("Time to expiry (Years)")
-    ax.set_ylabel("Moneyness (K/S)")
-    ax.set_zlabel("Implied Volatility")
-    ax.set_title(f"{ticker.upper()} {otype.capitalize()} Volatility Skew Surface")
-    ax.view_init(elev=15,azim=27,roll=0)
-    fig.colorbar(surf, ax=ax, shrink=0.5, aspect=10)
-    plt.show()
-    return T, K
-
-
-if __name__ == "__main__":
-    # Demonstration only - fires a live download and a matplotlib window.
-    # Kept behind the guard so importing this module has no side effects.
-    skew_surface("AAPL")

@@ -106,13 +106,21 @@ def pair_metrics(sig_t: Callable, sig_t1: Callable, d: float,
 
 def regime_summary(pairs: List[Dict[str, float]]) -> Dict[str, float]:
     """Aggregate one ticker's day-pairs: mean RMS per prediction and the OLS
-    beta (with standard error) of observed on sticky-delta-predicted changes."""
+    beta (intercept included, exactly ``skew_dynamics.ols``) of observed on
+    sticky-delta-predicted changes. The two studies must share one estimator
+    - an earlier no-intercept version sat one GitHub search away from being
+    read as the same statistic."""
     x = np.array([p["beta_pred"] for p in pairs])
     y = np.array([p["beta_obs"] for p in pairs])
-    beta = float(np.sum(x * y) / np.sum(x * x))
-    resid = y - beta * x
-    dof = max(len(x) - 1, 1)
-    se = float(np.sqrt(np.sum(resid**2) / dof / np.sum(x * x)))
+    xc, yc = x - x.mean(), y - y.mean()
+    sxx = float(np.sum(xc * xc))
+    if sxx <= 0.0:
+        beta = se = float("nan")
+    else:
+        beta = float(np.sum(xc * yc) / sxx)
+        resid = yc - beta * xc
+        dof = max(len(x) - 2, 1)
+        se = float(np.sqrt(np.sum(resid**2) / dof / sxx))
     return {
         "n_pairs": len(pairs),
         "rms_strike": float(np.mean([p["rms_strike"] for p in pairs])),

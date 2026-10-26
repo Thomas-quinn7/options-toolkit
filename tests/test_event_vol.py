@@ -79,6 +79,34 @@ def test_small_dips_are_not_events():
     assert EV.run_study(pd.DataFrame(rows, columns=HISTORY_COLUMNS)) == []
 
 
+def test_continued_decay_is_one_event_not_two():
+    """A crush followed by continued settling (0.45 -> 0.26 -> 0.20; the
+    second drop 0.06 clears both thresholds) is ONE event - the one-pair
+    refractory must stop the same crush firing twice."""
+    rows = event_history()
+    extra = _row(10, "SYN", 100.6, 0.20, slope=BASE_VOL - 0.20)
+    hist = pd.concat(
+        [rows, pd.DataFrame([extra], columns=HISTORY_COLUMNS)],
+        ignore_index=True)
+    events = EV.run_study(hist)
+    assert len(events) == 1
+    assert events[0].pre_vol_30d == 0.45      # the real crush, not the echo
+
+
+def test_two_separate_crushes_are_two_events():
+    """The refractory must not over-suppress: a recovery and a genuinely new
+    crush later still fire."""
+    vols = [0.25, 0.25, 0.25, 0.15, 0.25, 0.25, 0.25, 0.25, 0.15, 0.25]
+    rows = [_row(i, "SYN", 100.0 * np.exp(0.001 * i), v)
+            for i, v in enumerate(vols)]
+    events = EV.run_study(pd.DataFrame(rows, columns=HISTORY_COLUMNS))
+    assert len(events) == 2
+    assert [e.event_date for e in events] == [
+        (pd.Timestamp("2026-08-03") + pd.Timedelta(days=3)).date().isoformat(),
+        (pd.Timestamp("2026-08-03") + pd.Timedelta(days=8)).date().isoformat(),
+    ]
+
+
 def test_implied_event_move_floors_at_zero():
     # upward-sloping term structure: no excess short-dated variance
     assert EV.implied_event_move(0.18, 0.22) == 0.0

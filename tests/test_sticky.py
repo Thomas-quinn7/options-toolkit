@@ -55,6 +55,19 @@ def test_sticky_strike_world_is_recovered():
     assert -0.3 < m["beta"] < 0.3
 
 
+def test_regime_summary_beta_is_intercept_included_ols():
+    """The beta must be the demeaned (intercept-included) OLS slope, the
+    same estimator as skew_dynamics.ols - with a nonzero mean in the pairs
+    the through-origin slope is a different (wrong-to-call-OLS) number."""
+    x = np.array([1.0, 2.0, 3.0, 4.0, 5.0])
+    y = 10.0 + 0.5 * x                     # large intercept, slope exactly 0.5
+    pairs = [{"beta_pred": xi, "beta_obs": yi,
+              "rms_strike": 0.0, "rms_delta": 0.0} for xi, yi in zip(x, y)]
+    m = ST.regime_summary(pairs)
+    assert abs(m["beta"] - 0.5) < 1e-12    # through-origin would give ~3.2
+    assert np.isfinite(m["beta_se"])
+
+
 def _history_rows(n_days, atm=0.15, rho=-0.55, eta=1.0, gamma=0.4, seed=2):
     """surface_history rows for one ticker: constant SSVI shape (an exactly
     sticky-delta world up to ATM level noise), spot moving 0.5% a day."""

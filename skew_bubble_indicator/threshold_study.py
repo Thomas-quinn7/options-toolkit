@@ -109,12 +109,10 @@ def to_scanner_frame(side_df: pd.DataFrame) -> pd.DataFrame:
 
 def _skew_at(puts: pd.DataFrame, calls: pd.DataFrame, put_k: float,
              call_k: float, spot: float) -> Dict[str, float]:
-    """The scanner's metric at given anchor strikes, volume-weighted fallback
-    included (mirrors compute_iv_skew_metric)."""
-    put_iv = X.find_mean_iv_at_strike(puts, put_k)
-    call_iv = X.find_mean_iv_at_strike(calls, call_k)
-    if np.isnan(put_iv) or np.isnan(call_iv):
-        put_iv, call_iv = X.compute_volume_weighted_iv_skew(puts, calls, spot)
+    """The scanner's metric at given anchor strikes - the shared core in
+    IV_skew.skew_at_anchors, so the study's "exact pipeline" replay cannot
+    drift from the live scanner's own implementation."""
+    put_iv, call_iv = X.skew_at_anchors(puts, calls, put_k, call_k, spot)
     return {"put_iv": put_iv, "call_iv": call_iv, "skew": put_iv - call_iv}
 
 

@@ -654,6 +654,24 @@ def compute_volume_weighted_iv_skew(
         return np.nan, np.nan
 
 
+def skew_at_anchors(puts_df: pd.DataFrame, calls_df: pd.DataFrame,
+                    put_strike: float, call_strike: float,
+                    spot_price: float) -> Tuple[float, float]:
+    """Mean OTM put/call IV at the anchor strikes, with the volume-weighted
+    fallback when either anchor finds no windowed quotes.
+
+    This is the metric core ``compute_iv_skew_metric`` runs per live name
+    and ``threshold_study`` replays per history day - one implementation,
+    so the study's "exact pipeline" claim cannot drift.
+    """
+    put_iv = find_mean_iv_at_strike(puts_df, put_strike)
+    call_iv = find_mean_iv_at_strike(calls_df, call_strike)
+    if np.isnan(put_iv) or np.isnan(call_iv):
+        put_iv, call_iv = compute_volume_weighted_iv_skew(
+            puts_df, calls_df, spot_price)
+    return put_iv, call_iv
+
+
 def compute_iv_skew_metric(ticker: str, expiry: str, chain: object, quality_metrics: Dict) -> Tuple[str, str, float, float, float, float]:
     """Calculate IV skew metric with quality score."""
     try:
@@ -682,14 +700,8 @@ def compute_iv_skew_metric(ticker: str, expiry: str, chain: object, quality_metr
             targets = get_otm_strike_targets(spot_price, chain)
         otm_put_strike, otm_call_strike = targets
         
-        mean_otm_put_iv = find_mean_iv_at_strike(puts_df, otm_put_strike)
-        mean_otm_call_iv = find_mean_iv_at_strike(calls_df, otm_call_strike)
-        
-        if np.isnan(mean_otm_put_iv) or np.isnan(mean_otm_call_iv):
-            mean_otm_put_iv, mean_otm_call_iv = compute_volume_weighted_iv_skew(
-                puts_df, calls_df, spot_price
-            )
-        
+        mean_otm_put_iv, mean_otm_call_iv = skew_at_anchors(
+            puts_df, calls_df, otm_put_strike, otm_call_strike, spot_price)
         iv_skew = mean_otm_put_iv - mean_otm_call_iv
         quality_score = quality_metrics.get("quality_score", 0.0)
         

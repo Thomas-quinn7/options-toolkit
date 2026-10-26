@@ -65,7 +65,7 @@ modes — over every captured (day, name):
 python skew_bubble_indicator/threshold_study.py     # regenerates the table below
 ```
 
-### Threshold study — run 2026-07-28, 2 distinct session close(s), 16 (day, name) observations
+### Threshold study — run 2026-10-26, 35 distinct session close(s), 313 (day, name) observations
 
 Per-day cross-section (the inversion rate is what the 40%/60% thresholds gate on):
 
@@ -73,39 +73,70 @@ Per-day cross-section (the inversion rate is what the 40%/60% thresholds gate on
 |---|---|---|---|---|---|---|
 | 2026-07-25 | 7 | 14% | 14% | +0.0816 | +0.1357 | 0 |
 | 2026-07-27 | 9 | 0% | 0% | +0.0342 | +0.0584 | 0 |
+| 2026-07-28 | 9 | 0% | 0% | +0.0274 | +0.0553 | 0 |
+| 2026-07-29 | 9 | 12% | 11% | +0.0452 | +0.0687 | 1 |
+| 2026-07-30 | 9 | 0% | 0% | +0.0402 | +0.0474 | 1 |
+| 2026-07-31 | 9 | 0% | 0% | +0.0364 | +0.0459 | 0 |
+| 2026-08-03 | 9 | 11% | 0% | +0.0320 | +0.0362 | 0 |
+| 2026-08-04 | 9 | 25% | 22% | +0.0196 | +0.0297 | 1 |
+| 2026-08-05 | 9 | 22% | 11% | +0.0137 | +0.0327 | 0 |
+| 2026-08-06 | 2 | 0% | 0% | +0.0260 | +0.0604 | 0 |
+| 2026-08-07 | 9 | 22% | 22% | +0.0217 | +0.0443 | 0 |
+| 2026-08-10 | 9 | 22% | 22% | +0.0281 | +0.0402 | 0 |
+| 2026-08-11 | 9 | 22% | 22% | +0.0301 | +0.0360 | 0 |
+| 2026-08-12 | 9 | 22% | 22% | +0.0181 | +0.0350 | 0 |
+| 2026-08-13 | 9 | 22% | 22% | +0.0264 | +0.0447 | 0 |
+| 2026-08-14 | 9 | 11% | 22% | +0.0269 | +0.0503 | 0 |
+| 2026-08-17 | 12 | 22% | 25% | +0.0237 | +0.0249 | 3 |
+| 2026-08-18 | 11 | 22% | 18% | +0.0284 | +0.0407 | 2 |
+| 2026-08-19 | 12 | 22% | 33% | +0.0289 | +0.0317 | 3 |
+| 2026-08-20 | 12 | 30% | 33% | +0.0202 | +0.0304 | 2 |
+| 2026-08-21 | 11 | 30% | 27% | +0.0190 | +0.0286 | 1 |
+| 2026-08-24 | 9 | 22% | 11% | +0.0171 | +0.0323 | 0 |
+| 2026-08-25 | 9 | 22% | 11% | +0.0217 | +0.0331 | 0 |
+| 2026-08-26 | 9 | 33% | 11% | +0.0109 | +0.0288 | 0 |
+| 2026-08-27 | 9 | 22% | 0% | +0.0168 | +0.0285 | 0 |
+| 2026-08-28 | 9 | 11% | 11% | +0.0160 | +0.0321 | 0 |
+| 2026-08-31 | 9 | 25% | 11% | +0.0266 | +0.0319 | 1 |
+| 2026-09-01 | 9 | 22% | 11% | +0.0186 | +0.0507 | 0 |
+| 2026-09-02 | 9 | 22% | 11% | +0.0163 | +0.0428 | 0 |
+| 2026-09-03 | 9 | 22% | 22% | +0.0170 | +0.0345 | 0 |
+| 2026-09-04 | 9 | 22% | 22% | +0.0211 | +0.0382 | 0 |
+| 2026-09-11 | 9 | 22% | 0% | +0.0269 | +0.0400 | 0 |
+| 2026-09-25 | 9 | 22% | 0% | +0.0234 | +0.0441 | 0 |
+| 2026-10-02 | 3 | 0% | 0% | +0.0356 | +0.1001 | 0 |
+| 2026-10-09 | 9 | 22% | 0% | +0.0250 | +0.0454 | 0 |
 
 Pooled per-name skew distribution (vol points, put minus call):
 
 | metric | n | min | p10 | p25 | p50 | p75 | p90 | max | share inverted |
 |---|---|---|---|---|---|---|---|---|---|
-| delta-anchored | 16 | -0.1588 | +0.0011 | +0.0246 | +0.0541 | +0.0729 | +0.1221 | +0.1377 | 6% |
-| moneyness-band | 16 | -0.0798 | +0.0022 | +0.0296 | +0.0894 | +0.1357 | +0.1414 | +0.1800 | 6% |
+| delta-anchored | 298 | -0.2861 | -0.0096 | +0.0085 | +0.0251 | +0.0416 | +0.0554 | +0.1377 | 19% |
+| moneyness-band | 313 | -0.1861 | -0.0085 | +0.0118 | +0.0400 | +0.0984 | +0.1184 | +0.1800 | 14% |
 
 Threshold context: the WARNING (>40%) / CRITICAL (>60%) inversion thresholds
-would have fired on 0/2 and 0/2 day(s) (delta-anchored; 0/2 and 0/2 with
-moneyness bands). Highest observed daily inversion rate: 14% (delta), 14%
+would have fired on 0/35 and 0/35 day(s) (delta-anchored; 0/35 and 0/35 with
+moneyness bands). Highest observed daily inversion rate: 33% (delta), 33%
 (band).
 
-Anchor agreement: on 16 observations where both anchors produced a skew,
-signs agree on 100%; median |band − delta| = 0.0210; correlation 0.90. Delta
-anchoring fell back to moneyness bands on 0% of observations.
+Anchor agreement: on 298 observations where both anchors produced a skew,
+signs agree on 92%; median |band − delta| = 0.0204; correlation 0.85. Delta
+anchoring fell back to moneyness bands on 5% of observations.
 
-The single inverted observation is itself instructive: AAPL on 2026-07-25
-(pre-earnings call demand; the stock then gapped +4.7% on the next session).
-The delta anchors read it at −0.16 vs the band's −0.08 — the call bid
-concentrated nearer the money, exactly where delta anchoring looks.
+The inverted tail is shallow: 19% of observations sit below zero, but the
+10th percentile is only −0.01 vol points — most "inverted" names are
+marginally so, not calls-rich manias (the original 2026-07-25 AAPL
+pre-earnings observation at −0.16 remains the instructive deep one).
 
-**Honest interpretation.** 2 market days of history calibrates the metric's
-*range* in one calm regime — where "normal" sits (median per-name skew ~+0.03
-to +0.09, daily inversion rates 0–14%) and how far below the thresholds that
-is. It **cannot validate bubble-prediction power**: that requires the
-thresholds to fire ahead of a drawdown at least once, i.e. years of daily
-history spanning at least one froth episode. Until then the 40%/60%
-thresholds remain heuristics — now with measured context instead of none.
-The study is stateless and recomputes from the full data store, so the same
-command strengthens the table as the nightly capture
-(`vol_snapshots/daily_capture.ps1`) accrues; re-run it and refresh this
-section as the history grows.
+**Honest interpretation.** 35 market days of history calibrates the metric's
+*range* in the captured (calm) regime — it shows where "normal" sits and how
+far the thresholds are above it. It cannot validate bubble-prediction power:
+that requires the thresholds to fire ahead of a drawdown at least once, i.e.
+years of daily history spanning at least one froth episode. Until then the
+40%/60% thresholds remain judgment calls — now with measured context. This
+table strengthens automatically: the capture runs nightly and this script
+recomputes from the full store; re-run it and refresh this section as the
+history grows.
 
 ## Outputs and tests
 

@@ -99,11 +99,20 @@ class VolEvent:
 
 
 def detect_events(hist_t: pd.DataFrame) -> List[VolEvent]:
-    """All crush events in one ticker's history rows."""
+    """All crush events in one ticker's history rows.
+
+    A one-pair refractory: the pair STARTING at a fired event's post-row is
+    skipped, because a crush followed by continued decay (0.45 -> 0.26 ->
+    0.20) is one event wearing two qualifying drops, not two events - the
+    second drop is the same crush still settling.
+    """
     hist_t = hist_t.sort_values("snapshot_date").reset_index(drop=True)
     dates = pd.to_datetime(hist_t["snapshot_date"])
     events = []
+    skip_from = -1
     for i in range(len(hist_t) - 1):
+        if i <= skip_from:
+            continue
         gap = (dates.iloc[i + 1] - dates.iloc[i]).days
         if not (1 <= gap <= MAX_GAP_DAYS):
             continue
@@ -134,6 +143,7 @@ def detect_events(hist_t: pd.DataFrame) -> List[VolEvent]:
             window_vol_30d=[round(float(x), 6) for x in win["atm_vol_30d"]],
             window_term_slope=[round(float(x), 6) for x in win["term_slope"]],
         ))
+        skip_from = i + 1
     return events
 
 

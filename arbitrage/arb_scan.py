@@ -20,7 +20,7 @@ Parity is checked as the AMERICAN no-arbitrage band on EXECUTABLE prices
 
 so a flag means the edge survives the bid/ask, early-exercise ambiguity and
 dividends. Remaining caveats (stale yfinance quotes, borrow cost on the
-reversal leg) are in README "Known limitations".
+reversal leg) are in the repo README's "Known limitations" section.
 """
 
 import argparse
@@ -29,7 +29,39 @@ from datetime import datetime, timedelta
 from typing import List, Dict, Optional
 
 import numpy as np
+import pytz
 import yfinance as yf
+
+# Liquidity gate: yfinance serves delayed quotes, and a stale mark on a dead
+# strike (nothing traded all session, no open interest) routinely shows a
+# crossed or absurd "edge" - measured 2026-10-26: AAPL+MSFT returned 23,836
+# "opportunities", most with $80+ phantom box profits on deep wings, before
+# any gate. A quote enters the scan only if it is two-sided AND the contract
+# has some life in it: traded today OR real open interest.
+MIN_TRADE_VOLUME = 1
+MIN_TRADE_OPEN_INTEREST = 100
+
+# Moneyness window: the wings are where stale marks live even past the
+# liquidity gate - open interest REMEMBERS quotes that stopped trading weeks
+# ago, so far-OTM/ITM legs keep manufacturing phantom box edges (measured on
+# MSFT 2026-10-26: 0 flags within +-10% of spot, 18 at +-15%, 1,538 at
+# +-25%, 15,462 on the full chain). Static no-arb relationships are only
+# quoted where the market is live, so the scan stops at the window edge.
+MAX_MONEYNESS = 0.15
+
+
+def within_moneyness(strike: float, spot: float,
+                     max_moneyness: float = MAX_MONEYNESS) -> bool:
+    """Is the strike inside the scanned window around spot?"""
+    return abs(strike / spot - 1.0) <= max_moneyness
+
+
+def quote_is_tradeable(bid: float, ask: float, volume: float,
+                       open_interest: float) -> bool:
+    """Two-sided quote on a live contract (see the gate constants above)."""
+    return (bid > 0 and ask > bid
+            and (volume >= MIN_TRADE_VOLUME
+                 or open_interest >= MIN_TRADE_OPEN_INTEREST))
 
 
 @dataclass
@@ -40,10 +72,8 @@ class Option:
     type: str  # 'call' or 'put'
     bid: float
     ask: float
-
-    @property
-    def mid(self):
-        return (self.bid + self.ask) / 2
+    volume: float = 0.0
+    open_interest: float = 0.0
 
 
 class OptionsDataFetcher:
@@ -71,8 +101,12 @@ class OptionsDataFetcher:
         except Exception:
             return 0.0
 
-    def fetch_options(self) -> "tuple[Optional[float], List[Option]]":
+    def fetch_options(self, max_moneyness: float = MAX_MONEYNESS
+                      ) -> "tuple[Optional[float], List[Option]]":
         """Fetch all available options for the ticker.
+
+        Quotes outside the moneyness window and dead strikes (see the
+        gate constants above) are dropped before the scan sees them.
 
         Returns:
             (spot_price, list of Option objects). On failure returns (None, []).
@@ -106,39 +140,64 @@ class OptionsDataFetcher:
 
             all_options = []
 
+            def _num(x) -> float:
+                """NaN/missing chain fields -> 0.0 (NaN is truthy, so
+                `x or 0.0` would keep NaN and poison the gate)."""
+                try:
+                    x = float(x)
+                except (TypeError, ValueError):
+                    return 0.0
+                return x if np.isfinite(x) else 0.0
             for expiry_str in expirations:
                 try:
                     opt_chain = self.stock.option_chain(expiry_str)
                     expiry_date = datetime.strptime(expiry_str, "%Y-%m-%d")
 
                     for _, row in opt_chain.calls.iterrows():
-                        if row["bid"] > 0 and row["ask"] > 0 and row["ask"] > row["bid"]:
+                        vol, oi = _num(row.get("volume")), _num(row.get("openInterest"))
+                        if (quote_is_tradeable(row["bid"], row["ask"], vol, oi)
+                                and within_moneyness(float(row["strike"]),
+                                                     self.spot_price,
+                                                     max_moneyness)):
                             all_options.append(Option(
                                 strike=float(row["strike"]),
                                 expiry=expiry_date,
                                 type="call",
                                 bid=float(row["bid"]),
                                 ask=float(row["ask"]),
+                                volume=vol,
+                                open_interest=oi,
                             ))
 
                     for _, row in opt_chain.puts.iterrows():
-                        if row["bid"] > 0 and row["ask"] > 0 and row["ask"] > row["bid"]:
+                        vol, oi = _num(row.get("volume")), _num(row.get("openInterest"))
+                        if (quote_is_tradeable(row["bid"], row["ask"], vol, oi)
+                                and within_moneyness(float(row["strike"]),
+                                                     self.spot_price,
+                                                     max_moneyness)):
                             all_options.append(Option(
                                 strike=float(row["strike"]),
                                 expiry=expiry_date,
                                 type="put",
                                 bid=float(row["bid"]),
                                 ask=float(row["ask"]),
+                                volume=vol,
+                                open_interest=oi,
                             ))
 
                 except (KeyError, ValueError) as e:
                     print(f"  Warning: Could not parse options for {expiry_str}: {e}")
                     continue
 
-            print(f"Successfully fetched {len(all_options)} option contracts")
+            print(f"Successfully fetched {len(all_options)} option contracts "
+                  f"(two-sided, liquid, within {max_moneyness:.0%} of spot)")
             return self.spot_price, all_options
 
-        except (ValueError, KeyError, ConnectionError) as e:
+        except Exception as e:
+            # yfinance/requests failures surface as requests.exceptions.*,
+            # JSONDecodeError, RemoteDataError... - none of which are the
+            # builtin ConnectionError the old narrow tuple caught. One dead
+            # ticker must skip itself, not crash the whole scan.
             print(f"Error fetching options for {self.ticker}: {e}")
             return None, []
 
@@ -157,17 +216,30 @@ class ArbitrageDetector:
     EXPIRY_HOUR = 16
 
     def __init__(self, spot_price: float, risk_free_rate: float = 0.05,
-                 div_yield: float = 0.0, min_edge: float = 0.01):
+                 div_yield: float = 0.0, min_edge: float = 0.05):
         self.spot = spot_price
         self.r = risk_free_rate
         self.q = div_yield
+        # A nickel, not a penny: on delayed quotes a 1-2 cent "edge" is
+        # stale-mark noise, not arbitrage (the executable-price checks
+        # already killed the mid-price false positives; this floor kills
+        # the delayed-quote ones). Override with an explicit min_edge when
+        # you genuinely want to hunt that small.
         self.min_edge = min_edge
         self.opportunities = []
 
     def time_to_expiry(self, expiry: datetime) -> float:
-        """Time to expiry in years, fractional-day precision (floored > 0)."""
-        expiry_close = expiry.replace(hour=self.EXPIRY_HOUR, minute=0, second=0)
-        seconds = (expiry_close - datetime.now()).total_seconds()
+        """Time to expiry in years, fractional-day precision (floored > 0).
+
+        Anchored to the 16:00 America/New_York close in true ET time: the
+        old naive local-clock comparison was off by the local-vs-ET offset
+        (5-6 hours on a European box), material at 0-3 DTE.
+        """
+        et = pytz.timezone("America/New_York")
+        expiry_close = et.localize(expiry.replace(hour=self.EXPIRY_HOUR,
+                                                  minute=0, second=0,
+                                                  microsecond=0))
+        seconds = (expiry_close - datetime.now(et)).total_seconds()
         return max(seconds / (365.0 * 24 * 3600), 1e-4)
 
     # ---------- institutional checks (assume short selling) ----------
@@ -529,7 +601,9 @@ class ArbitrageDetector:
 
 
 def scan_tickers(tickers: List[str], risk_free_rate: float = 0.05,
-                 allow_short: bool = True) -> Dict[str, List[Dict]]:
+                 allow_short: bool = True,
+                 min_edge: float = 0.05,
+                 max_moneyness: float = MAX_MONEYNESS) -> Dict[str, List[Dict]]:
     """Scan multiple tickers for arbitrage opportunities."""
     all_results = {}
 
@@ -545,7 +619,7 @@ def scan_tickers(tickers: List[str], risk_free_rate: float = 0.05,
 
         try:
             fetcher = OptionsDataFetcher(ticker)
-            spot_price, options = fetcher.fetch_options()
+            spot_price, options = fetcher.fetch_options(max_moneyness)
 
             if not options:
                 print(f"No valid options data for {ticker}")
@@ -554,7 +628,8 @@ def scan_tickers(tickers: List[str], risk_free_rate: float = 0.05,
 
             detector = ArbitrageDetector(spot_price=spot_price,
                                          risk_free_rate=risk_free_rate,
-                                         div_yield=fetcher.div_yield)
+                                         div_yield=fetcher.div_yield,
+                                         min_edge=min_edge)
             opportunities = detector.find_all_arbitrage(options, allow_short=allow_short)
 
             if opportunities:
@@ -574,7 +649,9 @@ def scan_tickers(tickers: List[str], risk_free_rate: float = 0.05,
                 print(f"\nNo arbitrage opportunities found for {ticker}")
                 all_results[ticker] = []
 
-        except (ValueError, KeyError, ConnectionError) as e:
+        except Exception as e:
+            # Broad on purpose: any per-ticker failure (network, parse,
+            # yfinance internals) skips the ticker instead of killing the scan.
             print(f"\nError processing {ticker}: {e}")
             all_results[ticker] = []
             continue
@@ -599,13 +676,24 @@ if __name__ == "__main__":
     parser.add_argument("tickers", nargs="*",
                         default=["AAPL", "MSFT", "GOOGL", "TSLA", "SPY"],
                         help="Ticker symbols to scan")
-    parser.add_argument("--rate", type=float, default=0.045,
-                        help="Annual risk-free rate")
+    parser.add_argument("--rate", type=float, default=0.05,
+                        help="Annual risk-free rate (default 0.05, matching "
+                             "the ArbitrageDetector default)")
+    parser.add_argument("--min-edge", type=float, default=0.05,
+                        help="Minimum edge in dollars before a flag counts "
+                             "(default 0.05: on delayed quotes, penny edges "
+                             "are stale-mark noise)")
+    parser.add_argument("--moneyness", type=float, default=MAX_MONEYNESS,
+                        help="Scan strikes within this fraction of spot "
+                             "(default 0.15: beyond it, stale wing quotes "
+                             "manufacture phantom box edges)")
     parser.add_argument("--retail", action="store_true",
                         help="Retail mode: no short selling (default assumes shorting is allowed)")
     args = parser.parse_args()
 
-    scan_tickers(args.tickers, risk_free_rate=args.rate, allow_short=not args.retail)
+    scan_tickers(args.tickers, risk_free_rate=args.rate,
+                 allow_short=not args.retail, min_edge=args.min_edge,
+                 max_moneyness=args.moneyness)
 
     print("\n" + "=" * 80)
     print("Scan complete.")

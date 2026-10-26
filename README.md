@@ -127,6 +127,13 @@ scanner, two modes:
   monotonicity, buy-side underpriced boxes, negative-cost butterflies, and
   retail calendar mispricings.
 
+Quotes must survive a liquidity gate (two-sided, and the contract traded or
+carries real open interest) and sit within 15% of spot, and edges below a
+nickel do not count - all three gates measured into place (before any of
+them, AAPL+MSFT returned 23,836 "opportunities" with $80+ phantom box
+profits on dead wing strikes; after, 43 flags with sub-dollar edges).
+Widen with `--moneyness`, tighten with `--min-edge`.
+
 ```bash
 python arbitrage/arb_scan.py AAPL MSFT            # institutional mode
 python arbitrage/arb_scan.py AAPL --retail        # no short selling
@@ -274,10 +281,14 @@ only).
 - **The arbitrage scanner runs on delayed yfinance quotes.** Parity is now the
   American no-arbitrage band on executable (bid/ask-crossed) prices with a
   trailing-dividend term, so mid-price and dividend false positives are gone  - 
-  but quotes can still be stale between the spot snapshot and each chain fetch,
-  the reversal leg ignores stock-borrow cost, and the box/butterfly checks keep
-  their European settlement logic. The scanner's live false-positive rate has
-  never been measured. This is a teaching/diagnostic tool, not a live signal.
+  and the measured false-positive fire hose is gated (liquidity gate +
+  15% moneyness window + nickel edge floor: 23,836 flags on AAPL+MSFT before,
+  43 after) - but quotes can still be stale between the spot snapshot and
+  each chain fetch, open interest remembers quotes that stopped trading, the
+  reversal leg ignores stock-borrow cost, and the box/butterfly checks keep
+  their European settlement logic (on dividend payers the American premium
+  can still look like a box edge inside the window). This is a
+  teaching/diagnostic tool, not a live signal.
 
 ## Planned
 - Re-running `skew_bubble_indicator/threshold_study.py` as the snapshot

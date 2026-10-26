@@ -13,8 +13,14 @@ from datetime import datetime, timedelta
 
 import numpy as np
 import pytest
+import pytz
 
-from arbitrage.arb_scan import ArbitrageDetector, Option
+from arbitrage.arb_scan import (
+    ArbitrageDetector,
+    Option,
+    quote_is_tradeable,
+    within_moneyness,
+)
 
 
 EXPIRY = datetime.now() + timedelta(days=30)
@@ -94,6 +100,19 @@ def test_time_to_expiry_fractional_and_monotonic():
     # Two calendar days out, expiring at the 16:00 close: between ~1.5 and
     # ~2.7 days of year-time regardless of the wall-clock hour the test runs.
     assert 1.5 / 365 < t2 < 2.7 / 365
+
+
+def test_time_to_expiry_is_anchored_to_the_16_et_close():
+    """ET, not the local wall clock: on a European box the naive comparison
+    was off by 5-6 hours - material at 0-3 DTE. The result must equal the
+    true America/New_York distance to within a second."""
+    d = detector()
+    expiry = datetime.now() + timedelta(days=2)
+    et = pytz.timezone("America/New_York")
+    expect = (et.localize(expiry.replace(hour=16, minute=0, second=0,
+                                         microsecond=0))
+              - datetime.now(et)).total_seconds() / (365.0 * 24 * 3600)
+    assert abs(d.time_to_expiry(expiry) - expect) < 1.0 / (365.0 * 24 * 3600)
 
 
 def test_time_to_expiry_never_zero():
@@ -176,3 +195,129 @@ def test_negative_cost_butterfly_still_flagged():
     # Cost = 7.00 - 2*5.00 + 2.50 = -0.50.
     assert len(result) == 1
     assert result[0]["estimated_profit"] == pytest.approx(0.50)
+
+
+# --------------------------------------------------------------------------- #
+# Liquidity gate: stale marks on dead strikes are the false-positive source    #
+# --------------------------------------------------------------------------- #
+def test_liquidity_gate_blocks_dead_strikes():
+    """A stale mark on a dead strike (nothing traded all session, no open
+    interest) is the scanner's historical false-positive fire hose -
+    measured 2026-10-26: 23,836 'opportunities' with $80+ phantom box
+    profits on AAPL+MSFT before this gate. Two-sided quotes with any real
+    life behind them still pass."""
+    assert quote_is_tradeable(1.0, 1.1, volume=0, open_interest=500)
+    assert quote_is_tradeable(1.0, 1.1, volume=3, open_interest=0)
+    assert not quote_is_tradeable(1.0, 1.1, volume=0, open_interest=0)
+    assert not quote_is_tradeable(1.0, 1.1, volume=0, open_interest=50)
+    assert not quote_is_tradeable(0.0, 1.1, volume=5, open_interest=500)   # one-sided
+    assert not quote_is_tradeable(1.2, 1.1, volume=5, open_interest=500)   # crossed
+
+
+def test_moneyness_window_drops_the_wings():
+    """The wings are where stale marks live even past the liquidity gate
+    (open interest remembers quotes that stopped trading weeks ago) -
+    measured on MSFT: 0 flags within +-10% of spot, 15,462 on the full
+    chain. The scan stops at the window edge."""
+    assert within_moneyness(100.0, 100.0)
+    assert within_moneyness(114.0, 100.0)
+    assert within_moneyness(86.0, 100.0)
+    assert not within_moneyness(116.0, 100.0)
+    assert not within_moneyness(84.0, 100.0)
+    assert within_moneyness(129.0, 100.0, max_moneyness=0.30)   # override widens
+
+
+def test_default_min_edge_is_a_nickel():
+    """On delayed quotes a penny edge is stale-mark noise: the default floor
+    is a nickel (an explicit min_edge can still hunt smaller)."""
+    assert ArbitrageDetector(spot_price=100.0).min_edge == 0.05
+
+
+def test_subnickel_parity_edge_not_flagged_by_default():
+    d = detector()
+    call = opt(100, "call", 1.90, 2.00)
+    put = opt(100, "put", 2.01, 2.11)          # reversal edge = 0.01
+    assert d.check_put_call_parity(call, put) is None
+    tight = ArbitrageDetector(spot_price=100.0, risk_free_rate=0.05,
+                              min_edge=0.005)
+    assert tight.check_put_call_parity(call, put) is not None
+
+
+# --------------------------------------------------------------------------- #
+# Vertical / retail box / calendar checks (previously untested)               #
+# --------------------------------------------------------------------------- #
+def test_vertical_call_monotonicity_flagged():
+    """A lower-strike call whose ASK is under the higher strike's BID is a
+    free vertical - buy the cheap rich leg, sell the expensive poor one."""
+    d = detector()
+    found = d.check_vertical_spread_arbitrage([
+        opt(95, "call", 5.00, 5.10),
+        opt(100, "call", 5.30, 5.40),
+    ])
+    assert len(found) == 1
+    assert "Call" in found[0]["type"]
+    assert found[0]["estimated_profit"] == pytest.approx(5.30 - 5.10)
+
+
+def test_vertical_put_monotonicity_flagged():
+    d = detector()
+    found = d.check_vertical_spread_arbitrage([
+        opt(95, "put", 5.30, 5.40),            # lower strike, bid rich
+        opt(100, "put", 5.00, 5.10),           # higher strike, ask cheap
+    ])
+    assert len(found) == 1
+    assert "Put" in found[0]["type"]
+    assert found[0]["estimated_profit"] == pytest.approx(5.30 - 5.10)
+
+
+def test_vertical_monotone_chain_not_flagged():
+    d = detector()
+    assert d.check_vertical_spread_arbitrage([
+        opt(95, "call", 5.90, 6.10),
+        opt(100, "call", 2.45, 2.65),
+        opt(105, "call", 0.70, 0.90),
+    ]) == []
+
+
+def test_retail_box_buy_side_underpriced_flagged():
+    """The retail box only flags the BUY side (no shorting): a box bought
+    below its discounted width locks in value at expiry."""
+    d = detector()
+    result = d.check_box_spread_retail(
+        opt(95, "call", 5.00, 5.10), opt(95, "put", 0.50, 0.60),
+        opt(105, "call", 0.80, 0.90), opt(105, "put", 5.00, 5.10),
+    )
+    assert result is not None
+    assert "Retail Buy" in result["type"]
+    T = d.time_to_expiry(EXPIRY)
+    assert result["estimated_profit"] == pytest.approx(
+        10 * np.exp(-0.05 * T) - 8.90)          # buy cost (5.10-0.80)+(5.10-0.50)
+
+
+def test_institutional_calendar_monotonicity_flagged():
+    """A longer-dated option is worth at least as much as a shorter one at
+    the same strike; near bid above far ask is a locked-in credit (the check
+    is model-free even for American options)."""
+    d = detector()
+    near = opt(100, "call", 3.20, 3.30, expiry=EXPIRY)
+    far = opt(100, "call", 2.90, 3.00, expiry=FAR_EXPIRY)
+    result = d.check_calendar_spread(near, far)
+    assert result is not None
+    assert result["estimated_profit"] == pytest.approx(3.20 - 3.00)
+    assert d.check_calendar_spread(far, near) is None          # order matters
+    assert d.check_calendar_spread(
+        opt(100, "call", 3.00, 3.10, expiry=EXPIRY), far) is None
+
+
+def test_retail_calendar_flagged():
+    """Retail variant: buy the far-dated below the near-dated bid - a
+    long-biased edge a no-short account can still enter."""
+    d = detector()
+    near = opt(100, "put", 3.20, 3.30, expiry=EXPIRY)
+    far = opt(100, "put", 2.80, 2.90, expiry=FAR_EXPIRY)
+    result = d.check_calendar_spread_retail(near, far)
+    assert result is not None
+    assert result["estimated_profit"] == pytest.approx(3.20 - 2.90)
+    borderline = opt(100, "put", 3.16, 3.20, expiry=FAR_EXPIRY)
+    assert d.check_calendar_spread_retail(
+        near, borderline) is None                # inside the 5c retail tolerance

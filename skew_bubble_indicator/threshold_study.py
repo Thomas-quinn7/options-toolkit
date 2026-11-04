@@ -50,7 +50,8 @@ if _REPO not in sys.path:
     sys.path.insert(0, _REPO)
 
 from skew_bubble_indicator import IV_skew as X  # noqa: E402
-from vol_snapshots.capture import DATA_ROOT, load_snapshots  # noqa: E402
+from vol_snapshots.capture import (  # noqa: E402
+    DATA_ROOT, load_capture_phases, load_snapshots)
 
 OUT_CSV = os.path.join(_HERE, "threshold_study.csv")
 
@@ -184,7 +185,15 @@ def run_study(root: str = DATA_ROOT) -> pd.DataFrame:
         row = ticker_day_row(df)
         if row is not None:
             rows.append(row)
-    return pd.DataFrame(rows)
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return out
+    # Which observations are intraday (auto_capture.py) rather than closes.
+    phases = load_capture_phases(root)
+    out["snapshot_date"] = out["snapshot_date"].astype(str)
+    out = out.merge(phases, on=["snapshot_date", "ticker"], how="left")
+    out["phase"] = out["phase"].fillna("close")
+    return out
 
 
 # --------------------------------------------------------------------------- #
@@ -390,6 +399,14 @@ def format_markdown(rows: pd.DataFrame, run_date: Optional[str] = None) -> str:
             f"delta-anchored inversion rate is "
             f"{conc['inv_pct_ex_persistent']:.0f}%.")
         lines.append("")
+    if "phase" in rows.columns:
+        n_intra = int((rows["phase"] == "intraday").sum())
+        if n_intra:
+            lines.append(
+                f"Capture timing: {n_intra} of {len(rows)} observations are "
+                "intraday snapshots (the machine was on during the session "
+                "but not after the close), not closing quotes.")
+            lines.append("")
     last_day = str(rows["snapshot_date"].max())[:10]
     lines.append(
         f"**Honest interpretation.** {ctx['n_days']} market day(s) of history "

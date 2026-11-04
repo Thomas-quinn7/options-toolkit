@@ -17,3 +17,4 @@ vol_snapshots/capture.log
 
 # raw snapshot data lives in its own repo (options-toolkit-data), nested here
 vol_snapshots/data/
+vol_snapshots/.auto_capture.lock

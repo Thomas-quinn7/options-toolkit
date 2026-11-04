@@ -180,6 +180,39 @@ the capture stays valid all evening since yfinance serves the session's
 closing quotes until the next open. Check `capture.log` if a day looks
 missing.
 
+## Opportunistic capture (laptop, since 2026-11-04)
+
+A fixed 22:00 task loses every day the machine is off at that time, and the
+desktop capture stopped after 2026-10-09. `auto_capture.py` is fired every
+30 minutes and 3 minutes after logon instead, and decides for itself:
+
+| New York time, weekday | what it does |
+|---|---|
+| before 10:00 | nothing (exits before importing pandas) |
+| 10:00 to 16:15 | **intraday** snapshot if the day has none yet |
+| 16:15 to midnight | **close** snapshot; replaces an intraday one from the same session |
+
+Session dates are New York dates, so 00:00 to 05:00 Irish time files under
+the previous US session. Holidays are skipped by the same SPY-daily-bar
+check as `capture.py`. Each day's `_capture_meta.json` records the phase and
+UTC time of every file, `load_capture_phases` reads it (days with no meta
+are legacy closes), and `threshold_study.py` reports how many observations
+are intraday rather than closes.
+
+It commits and pushes only the nested data repo, never the toolkit repo,
+and leaves the surface fits and studies to run on demand. Output goes to
+`capture.log`. Register (no admin needed, runs only while logged on, no
+console window):
+
+```
+powershell -ExecutionPolicy Bypass -File vol_snapshots\register_auto_capture.ps1
+python vol_snapshots/auto_capture.py --dry-run     # say what it would do now
+Unregister-ScheduledTask -TaskName options-auto-capture -Confirm:$false
+```
+
+Do not run this and `daily_capture.ps1` on two machines at once: both would
+write the same day's files and the second push would conflict.
+
 ## Schema
 
 One row per (ticker, expiry, type, strike):

@@ -181,12 +181,65 @@ def last_session_date(reference: str = "SPY") -> Optional[_dt.date]:
         return None
 
 
+META_FILE = "_capture_meta.json"
+
+
+def read_capture_meta(root: str, snapshot_date: str) -> dict:
+    """{TICKER: {"phase": "intraday"|"close", "captured_at_utc": iso}} for one
+    day, or {} (days captured before the meta file existed have none: those
+    were all single after-close-style runs, so readers treat missing as
+    "close")."""
+    import json
+    path = os.path.join(root, snapshot_date, META_FILE)
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def write_capture_meta(root: str, snapshot_date: str, ticker: str,
+                       phase: str, captured_at_utc: str) -> None:
+    """Record when and in which phase one ticker's day file was captured
+    (atomic rewrite of the day's meta file)."""
+    import json
+    meta = read_capture_meta(root, snapshot_date)
+    meta[ticker.upper()] = {"phase": phase, "captured_at_utc": captured_at_utc}
+    day_dir = os.path.join(root, snapshot_date)
+    os.makedirs(day_dir, exist_ok=True)
+    path = os.path.join(day_dir, META_FILE)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(meta, f, indent=1, sort_keys=True)
+    os.replace(tmp, path)
+
+
+def load_capture_phases(root: str = DATA_ROOT) -> pd.DataFrame:
+    """(snapshot_date, ticker, phase) for every captured file; phase is
+    "close" where no meta exists (legacy days)."""
+    rows = []
+    if os.path.isdir(root):
+        for day in sorted(os.listdir(root)):
+            day_dir = os.path.join(root, day)
+            if not os.path.isdir(day_dir):
+                continue
+            meta = read_capture_meta(root, day)
+            for fn in os.listdir(day_dir):
+                if fn.endswith(".csv.gz"):
+                    t = fn[:-len(".csv.gz")].upper()
+                    rows.append({"snapshot_date": day, "ticker": t,
+                                 "phase": meta.get(t, {}).get("phase", "close")})
+    return pd.DataFrame(rows, columns=["snapshot_date", "ticker", "phase"])
+
+
 def capture_ticker(ticker: str, snapshot_date: str, riskfree: float,
-                   root: str = DATA_ROOT) -> Optional[str]:
+                   root: str = DATA_ROOT, replace: bool = False) -> Optional[str]:
     """Fetch and store all expiries for one ticker; returns the path written,
-    or None if today's file already exists or the fetch failed entirely."""
+    or None if today's file already exists (and ``replace`` is False) or the
+    fetch failed entirely. ``replace`` lets an after-close capture supersede
+    an intraday one for the same session (see auto_capture.py)."""
     path = _snapshot_path(root, snapshot_date, ticker)
-    if os.path.exists(path):
+    if os.path.exists(path) and not replace:
         print(f"  {ticker}: already captured today - skipped")
         return None
     import yfinance as yf

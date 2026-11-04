@@ -200,3 +200,16 @@ def test_markdown_reports_names_units_and_last_session(rows):
     assert "last captured session is 2026-01-06" in md
     assert "runs nightly" not in md          # no claim the store can't back
     assert "does not calibrate the scanner's 20-name segment" in md
+
+
+def test_study_flags_intraday_observations(tmp_path):
+    from vol_snapshots.capture import write_capture_meta
+    root = str(tmp_path)
+    save_snapshot(snapshot_frame(DAYS[0], "AAA", put_skewed), root)
+    save_snapshot(snapshot_frame(DAYS[0], "BBB", call_skewed), root)
+    write_capture_meta(root, DAYS[0], "BBB", "intraday", "2026-01-05T16:00:00+00:00")
+    rows = TS.run_study(root)
+    assert rows.set_index("ticker")["phase"].to_dict() == {
+        "AAA": "close", "BBB": "intraday"}
+    md = TS.format_markdown(rows, run_date="2026-07-28")
+    assert "1 of 2 observations are intraday snapshots" in md

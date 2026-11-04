@@ -42,12 +42,15 @@ Mechanics and fallback:
 * Unavailability on **either** side makes the name fall back to the explicit
   moneyness-band path (90%/110% of spot), never a mixed anchor;
   `--anchor moneyness` forces the band path everywhere.
-* Delta defaults to on because the snapshot-history study below found it
-  available on 100% of observations with no material disagreement in sign
-  versus the bands (and it is the convention the rest of the vol world
-  quotes skew in).
+* Delta defaults to on because it is the convention the rest of the vol
+  world quotes skew in. On the snapshot history below it was available on
+  95% of observations and agreed in sign with the bands on about 90%. It is
+  NOT available everywhere: the sector ETFs (XLE, XLF, XLK) never produced a
+  delta anchor after the quality gates and always fell back to the bands.
+  Each scanner row records which path produced its number (`anchor`).
 
-Deltas are Black-Scholes deltas from European-inverted IVs by default; with
+Deltas are computed at the same parity-implied dividend yield the IVs were
+inverted at. They are Black-Scholes deltas from European-inverted IVs by default; with
 `--american` the IVs are CRR-inverted but the anchor delta is still the BS
 delta at that IV — for the ~25-delta strikes consumed here the difference is
 well inside one strike spacing.
@@ -65,78 +68,88 @@ modes — over every captured (day, name):
 python skew_bubble_indicator/threshold_study.py     # regenerates the table below
 ```
 
-### Threshold study — run 2026-10-26, 35 distinct session close(s), 313 (day, name) observations
+The study inverts at each chain's parity-implied dividend yield, as the live
+scanner does (until 2026-11-04 it inverted at q=0, which flipped the sign of
+11 of 292 delta-anchored observations on a 32-session subset).
+
+### Threshold study — run 2026-11-04, 35 distinct session close(s), 313 (day, name) observations
 
 Per-day cross-section (the inversion rate is what the 40%/60% thresholds gate on):
 
 | day | names | inverted % (delta) | inverted % (band) | median skew (delta) | median skew (band) | delta fallbacks |
 |---|---|---|---|---|---|---|
-| 2026-07-25 | 7 | 14% | 14% | +0.0816 | +0.1357 | 0 |
-| 2026-07-27 | 9 | 0% | 0% | +0.0342 | +0.0584 | 0 |
-| 2026-07-28 | 9 | 0% | 0% | +0.0274 | +0.0553 | 0 |
-| 2026-07-29 | 9 | 12% | 11% | +0.0452 | +0.0687 | 1 |
-| 2026-07-30 | 9 | 0% | 0% | +0.0402 | +0.0474 | 1 |
-| 2026-07-31 | 9 | 0% | 0% | +0.0364 | +0.0459 | 0 |
-| 2026-08-03 | 9 | 11% | 0% | +0.0320 | +0.0362 | 0 |
-| 2026-08-04 | 9 | 25% | 22% | +0.0196 | +0.0297 | 1 |
-| 2026-08-05 | 9 | 22% | 11% | +0.0137 | +0.0327 | 0 |
-| 2026-08-06 | 2 | 0% | 0% | +0.0260 | +0.0604 | 0 |
-| 2026-08-07 | 9 | 22% | 22% | +0.0217 | +0.0443 | 0 |
-| 2026-08-10 | 9 | 22% | 22% | +0.0281 | +0.0402 | 0 |
-| 2026-08-11 | 9 | 22% | 22% | +0.0301 | +0.0360 | 0 |
-| 2026-08-12 | 9 | 22% | 22% | +0.0181 | +0.0350 | 0 |
-| 2026-08-13 | 9 | 22% | 22% | +0.0264 | +0.0447 | 0 |
-| 2026-08-14 | 9 | 11% | 22% | +0.0269 | +0.0503 | 0 |
-| 2026-08-17 | 12 | 22% | 25% | +0.0237 | +0.0249 | 3 |
-| 2026-08-18 | 11 | 22% | 18% | +0.0284 | +0.0407 | 2 |
-| 2026-08-19 | 12 | 22% | 33% | +0.0289 | +0.0317 | 3 |
-| 2026-08-20 | 12 | 30% | 33% | +0.0202 | +0.0304 | 2 |
-| 2026-08-21 | 11 | 30% | 27% | +0.0190 | +0.0286 | 1 |
-| 2026-08-24 | 9 | 22% | 11% | +0.0171 | +0.0323 | 0 |
-| 2026-08-25 | 9 | 22% | 11% | +0.0217 | +0.0331 | 0 |
-| 2026-08-26 | 9 | 33% | 11% | +0.0109 | +0.0288 | 0 |
-| 2026-08-27 | 9 | 22% | 0% | +0.0168 | +0.0285 | 0 |
-| 2026-08-28 | 9 | 11% | 11% | +0.0160 | +0.0321 | 0 |
-| 2026-08-31 | 9 | 25% | 11% | +0.0266 | +0.0319 | 1 |
-| 2026-09-01 | 9 | 22% | 11% | +0.0186 | +0.0507 | 0 |
-| 2026-09-02 | 9 | 22% | 11% | +0.0163 | +0.0428 | 0 |
-| 2026-09-03 | 9 | 22% | 22% | +0.0170 | +0.0345 | 0 |
-| 2026-09-04 | 9 | 22% | 22% | +0.0211 | +0.0382 | 0 |
-| 2026-09-11 | 9 | 22% | 0% | +0.0269 | +0.0400 | 0 |
-| 2026-09-25 | 9 | 22% | 0% | +0.0234 | +0.0441 | 0 |
-| 2026-10-02 | 3 | 0% | 0% | +0.0356 | +0.1001 | 0 |
-| 2026-10-09 | 9 | 22% | 0% | +0.0250 | +0.0454 | 0 |
+| 2026-07-25 | 7 | 29% | 14% | +0.0617 | +0.1220 | 0 |
+| 2026-07-27 | 9 | 11% | 11% | +0.0294 | +0.0545 | 0 |
+| 2026-07-28 | 9 | 11% | 22% | +0.0250 | +0.0578 | 0 |
+| 2026-07-29 | 9 | 0% | 11% | +0.0437 | +0.0644 | 1 |
+| 2026-07-30 | 9 | 0% | 0% | +0.0415 | +0.0428 | 1 |
+| 2026-07-31 | 9 | 0% | 0% | +0.0255 | +0.0502 | 0 |
+| 2026-08-03 | 9 | 11% | 0% | +0.0216 | +0.0323 | 0 |
+| 2026-08-04 | 9 | 25% | 22% | +0.0140 | +0.0304 | 1 |
+| 2026-08-05 | 9 | 22% | 11% | +0.0134 | +0.0308 | 0 |
+| 2026-08-06 | 2 | 0% | 0% | +0.0286 | +0.0622 | 0 |
+| 2026-08-07 | 9 | 22% | 22% | +0.0134 | +0.0350 | 0 |
+| 2026-08-10 | 9 | 22% | 22% | +0.0146 | +0.0334 | 0 |
+| 2026-08-11 | 9 | 22% | 22% | +0.0211 | +0.0319 | 0 |
+| 2026-08-12 | 9 | 22% | 22% | +0.0139 | +0.0318 | 0 |
+| 2026-08-13 | 9 | 22% | 22% | +0.0170 | +0.0336 | 0 |
+| 2026-08-14 | 9 | 22% | 22% | +0.0156 | +0.0408 | 0 |
+| 2026-08-17 | 12 | 22% | 25% | +0.0168 | +0.0256 | 3 |
+| 2026-08-18 | 11 | 22% | 18% | +0.0205 | +0.0353 | 2 |
+| 2026-08-19 | 12 | 22% | 33% | +0.0159 | +0.0301 | 3 |
+| 2026-08-20 | 12 | 30% | 33% | +0.0166 | +0.0213 | 2 |
+| 2026-08-21 | 11 | 30% | 27% | +0.0161 | +0.0239 | 1 |
+| 2026-08-24 | 9 | 11% | 22% | +0.0138 | +0.0348 | 0 |
+| 2026-08-25 | 9 | 22% | 22% | +0.0176 | +0.0362 | 0 |
+| 2026-08-26 | 9 | 22% | 22% | +0.0108 | +0.0310 | 0 |
+| 2026-08-27 | 9 | 33% | 11% | +0.0121 | +0.0294 | 0 |
+| 2026-08-28 | 9 | 11% | 22% | +0.0112 | +0.0308 | 0 |
+| 2026-08-31 | 9 | 25% | 22% | +0.0154 | +0.0352 | 1 |
+| 2026-09-01 | 9 | 22% | 11% | +0.0184 | +0.0499 | 0 |
+| 2026-09-02 | 9 | 22% | 22% | +0.0166 | +0.0435 | 0 |
+| 2026-09-03 | 9 | 22% | 22% | +0.0164 | +0.0356 | 0 |
+| 2026-09-04 | 9 | 22% | 22% | +0.0172 | +0.0391 | 0 |
+| 2026-09-11 | 9 | 22% | 0% | +0.0222 | +0.0404 | 0 |
+| 2026-09-25 | 9 | 22% | 0% | +0.0203 | +0.0443 | 0 |
+| 2026-10-02 | 3 | 0% | 0% | +0.0364 | +0.1009 | 0 |
+| 2026-10-09 | 9 | 11% | 0% | +0.0222 | +0.0449 | 0 |
 
-Pooled per-name skew distribution (vol points, put minus call):
+Pooled per-name skew distribution (IV as a decimal, put minus call; 0.01 = 1 vol point):
 
 | metric | n | min | p10 | p25 | p50 | p75 | p90 | max | share inverted |
 |---|---|---|---|---|---|---|---|---|---|
-| delta-anchored | 298 | -0.2861 | -0.0096 | +0.0085 | +0.0251 | +0.0416 | +0.0554 | +0.1377 | 19% |
-| moneyness-band | 313 | -0.1861 | -0.0085 | +0.0118 | +0.0400 | +0.0984 | +0.1184 | +0.1800 | 14% |
+| delta-anchored | 298 | -0.2681 | -0.0089 | +0.0054 | +0.0176 | +0.0371 | +0.0487 | +0.1377 | 19% |
+| moneyness-band | 313 | -0.1865 | -0.0080 | +0.0091 | +0.0365 | +0.0955 | +0.1160 | +0.1481 | 17% |
 
-Threshold context: the WARNING (>40%) / CRITICAL (>60%) inversion thresholds
-would have fired on 0/35 and 0/35 day(s) (delta-anchored; 0/35 and 0/35 with
-moneyness bands). Highest observed daily inversion rate: 33% (delta), 33%
-(band).
+Threshold context: the WARNING (>40%) / CRITICAL (>60%) inversion thresholds would have fired on 0/35 and 0/35 day(s) (delta-anchored; 0/35 and 0/35 with moneyness bands). Highest observed daily inversion rate: 33% (delta), 33% (band).
 
-Anchor agreement: on 298 observations where both anchors produced a skew,
-signs agree on 92%; median |band − delta| = 0.0204; correlation 0.85. Delta
-anchoring fell back to moneyness bands on 5% of observations.
+Anchor agreement: on 298 observations where both anchors produced a skew, signs agree on 91%; median |band − delta| = 0.0206; correlation 0.85. Delta anchoring fell back to moneyness bands on 5% of observations.
 
-The inverted tail is shallow: 19% of observations sit below zero, but the
-10th percentile is only −0.01 vol points — most "inverted" names are
-marginally so, not calls-rich manias (the original 2026-07-25 AAPL
-pre-earnings observation at −0.16 remains the instructive deep one).
+Per name (where the daily inversion rate comes from):
 
-**Honest interpretation.** 35 market days of history calibrates the metric's
-*range* in the captured (calm) regime — it shows where "normal" sits and how
-far the thresholds are above it. It cannot validate bubble-prediction power:
-that requires the thresholds to fire ahead of a drawdown at least once, i.e.
-years of daily history spanning at least one froth episode. Until then the
-40%/60% thresholds remain judgment calls — now with measured context. This
-table strengthens automatically: the capture runs nightly and this script
-recomputes from the full store; re-run it and refresh this section as the
-history grows.
+| name | days | inverted % (delta) | inverted % (band) | median skew (delta) | delta fallback % |
+|---|---|---|---|---|---|
+| VXX | 4 | 100% | 100% | -0.2273 | 50% |
+| GLD | 32 | 81% | 59% | -0.0095 | 0% |
+| TSLA | 33 | 73% | 42% | -0.0051 | 0% |
+| MSFT | 34 | 9% | 9% | +0.0156 | 3% |
+| AAPL | 33 | 3% | 3% | +0.0142 | 3% |
+| TLT | 32 | 3% | 22% | +0.0103 | 0% |
+| IWM | 34 | 0% | 0% | +0.0384 | 0% |
+| NVDA | 33 | 0% | 0% | +0.0223 | 3% |
+| QQQ | 35 | 0% | 0% | +0.0448 | 3% |
+| SPY | 34 | 0% | 0% | +0.0376 | 0% |
+| XLE | 1 | n/a | 100% | n/a | 100% |
+| XLF | 3 | n/a | 100% | n/a | 100% |
+| XLK | 5 | n/a | 40% | n/a | 100% |
+
+Concentration: GLD, TSLA, VXX are inverted on more than 50% of their days, so with ~9 names a day they set most of the daily rate on their own. Excluding them, the pooled delta-anchored inversion rate is 2%.
+
+**Honest interpretation.** 35 market day(s) of history on 13 names (the `vol_snapshots` capture list, mostly index and sector ETFs) calibrates the metric's *range* in the captured (calm) regime. It does not calibrate the scanner's 20-name segment thresholds directly: none of the segments' own universes is in the history, and the daily rate here is a count over a few names. It cannot validate bubble-prediction power: that requires the thresholds to fire ahead of a drawdown at least once, i.e. years of daily history spanning at least one froth episode. Until then the 40%/60% thresholds remain judgment calls. The script recomputes from the full store; the last captured session is 2026-10-09.
+
+Most inversions are shallow: the delta-anchored 10th percentile is under 1
+vol point below zero, so a name sitting near zero can flip sign on bid-ask
+noise. The inversion rate is a sign count and does not see this.
 
 ## Outputs and tests
 
@@ -154,9 +167,23 @@ so the time series is self-describing. The headline `inversion_pct` column
 keeps the all-valid definition for series continuity. Inversion prices the
 chain's own dividend yield (put-call parity on matched strikes, refused to
 0 when the implied carry is absurd) instead of assuming q=0, and the spot
-fetched with the chain is reused rather than re-scraped. Everything is
+fetched with the chain is reused rather than re-scraped.
+
+Each run fetches every distinct name once (the segments overlap: 220 slots,
+179 distinct names) and shares the chain across segments, so a name has one
+number per run. The GLOBAL row counts each distinct name once. Every row in
+the snapshot CSV carries `anchor` (`delta`, `band` or `volume_weighted`),
+the path that produced its skew. Results are only saved on a live trading
+session: weekends are refused, and weekdays are checked against SPY's last
+daily bar (same rule as `vol_snapshots/capture.py`). An off-session run still
+prints, and `--force` saves it anyway. The legacy rows in `bubble_summary.csv`
+(2025-10 to 2026-02) predate the own-IV inversion, the delta anchors and this
+guard, and several fell on weekends, so they are not comparable with rows
+written by the current code. Everything is
 unit-tested offline on synthetic chains priced from known smiles:
 `tests/test_iv_skew.py` (own-IV pipeline, delta anchoring, fallback, config
 plumbing, idempotent snapshot save, summary companion columns, alert basis,
-parity-implied q) and `tests/test_threshold_study.py` (the study end-to-end
-on a fixture snapshot store, including stale-weekend dedupe).
+parity-implied q, q in delta anchoring, skew-source column, one fetch per
+name, de-duplicated GLOBAL, session guard) and `tests/test_threshold_study.py`
+(the study end-to-end on a fixture snapshot store, including stale-weekend
+dedupe, parity-q replay and the per-name concentration table).

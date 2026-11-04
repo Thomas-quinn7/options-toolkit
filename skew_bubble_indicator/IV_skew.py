@@ -170,6 +170,42 @@ MIN_RELIABLE_FOR_ALERT = 5
 DEFAULT_RISK_FREE = 0.04
 _RISK_FREE_CACHE: Dict[str, float] = {}
 
+# A validated chain carries the spot it was fetched with and the
+# parity-implied dividend yield its IVs were inverted at, so every consumer
+# (delta anchoring in particular) uses the same carry as the inversion.
+ValidatedChain = namedtuple("ValidatedChain", ["puts", "calls", "spot", "q"])
+
+# How each name's skew number was produced (the ``anchor`` column): the
+# delta-anchored strikes, the fixed moneyness bands, or the band-wide
+# volume-weighted fallback when an anchor found no usable quotes. The three
+# give different numbers for the same chain, so the row records which one.
+ANCHOR_DELTA = "delta"
+ANCHOR_BAND = "band"
+ANCHOR_VOLUME_WEIGHTED = "volume_weighted"
+
+
+def market_session_status(today=None, last_session_fn=None) -> Tuple[bool, str]:
+    """(is_live_session, message) - may today's run be saved to the series?
+
+    yfinance serves the previous session's after-close quotes on weekends and
+    holidays; the old live series shows what that does (Fri 2025-10-24 5.6%
+    global inversion, Sat 2025-10-25 25.1% off the same close). Same rule as
+    ``vol_snapshots/capture.py``: weekends are refused outright, weekdays are
+    checked against SPY's last daily bar (covers holidays and unscheduled
+    closures). A failed bar fetch returns live - a network problem must not
+    silently drop a real session.
+    """
+    today = today or datetime.now().date()
+    if today.weekday() >= 5:
+        return False, f"{today} is a weekend - quotes are the last session's after-close"
+    if last_session_fn is None:
+        from vol_snapshots.capture import last_session_date as last_session_fn
+    last = last_session_fn()
+    if last is not None and last != today:
+        return False, (f"{today} is not a trading session (last was {last}) - "
+                       "quotes are stale after-close")
+    return True, "live session"
+
 
 def get_risk_free_rate() -> float:
     """13-week T-bill yield (^IRX) as a decimal, with an offline fallback."""
@@ -443,11 +479,12 @@ def fetch_option_chain(ticker: str, max_retries: int = 3) -> Tuple[str, Optional
             
             # Create new chain with validated data; spot rides along so the
             # consumer never has to re-fetch it (the second .info scrape used
-            # to disagree with the first on fast-moving names).
-            ValidatedChain = namedtuple('ValidatedChain', ['puts', 'calls', 'spot'])
+            # to disagree with the first on fast-moving names), and q rides
+            # along so delta anchoring uses the inversion's carry.
             validated_chain = ValidatedChain(puts=validated_puts,
                                              calls=validated_calls,
-                                             spot=spot_price)
+                                             spot=spot_price,
+                                             q=q_hat)
             
             # Calculate quality metrics
             quality_metrics = compute_data_quality_score(validated_puts, validated_calls, spot_price)
@@ -563,15 +600,18 @@ def get_delta_anchored_strike_targets(
     put_delta: Optional[float] = None,
     call_delta: Optional[float] = None,
     tolerance: Optional[float] = None,
+    q: float = 0.0,
 ) -> Optional[Tuple[float, float]]:
     """OTM strikes nearest the target Black-Scholes deltas, or None.
 
     Deltas come from the repo's own pricing machinery
     (``pricing_and_vol_surface.black.greeks``) evaluated at each quote's own
     price-inverted IV, so the anchor adapts to the name's vol level and the
-    scanned expiry. Defaults (None) read the module-level targets so the CLI
-    flags plumb through. A signed or unsigned put target is accepted
-    (0.25 == -0.25).
+    scanned expiry. ``q`` must be the dividend yield the IVs were inverted at
+    (the chain's parity-implied q); computing deltas at a different carry than
+    the inversion biases the anchor on exactly the dividend payers. Defaults
+    (None) read the module-level targets so the CLI flags plumb through. A
+    signed or unsigned put target is accepted (0.25 == -0.25).
 
     Returns None - the caller's cue to fall back to the fixed moneyness
     bands - when either side cannot produce an anchor: no finite IVs, T<=0,
@@ -601,7 +641,7 @@ def get_delta_anchored_strike_targets(
         if not good.any():
             return np.nan
         deltas = np.asarray(
-            greeks(spot, strikes[good], T, r, ivs[good], 0.0, otype=otype)[0],
+            greeks(spot, strikes[good], T, r, ivs[good], q, otype=otype)[0],
             dtype=float,
         )
         gaps = np.abs(deltas - target)
@@ -654,6 +694,20 @@ def compute_volume_weighted_iv_skew(
         return np.nan, np.nan
 
 
+def skew_at_anchors_sourced(puts_df: pd.DataFrame, calls_df: pd.DataFrame,
+                            put_strike: float, call_strike: float,
+                            spot_price: float) -> Tuple[float, float, bool]:
+    """``skew_at_anchors`` plus whether the volume-weighted fallback was used
+    (True = the number did NOT come from the anchor strikes)."""
+    put_iv = find_mean_iv_at_strike(puts_df, put_strike)
+    call_iv = find_mean_iv_at_strike(calls_df, call_strike)
+    if np.isnan(put_iv) or np.isnan(call_iv):
+        put_iv, call_iv = compute_volume_weighted_iv_skew(
+            puts_df, calls_df, spot_price)
+        return put_iv, call_iv, True
+    return put_iv, call_iv, False
+
+
 def skew_at_anchors(puts_df: pd.DataFrame, calls_df: pd.DataFrame,
                     put_strike: float, call_strike: float,
                     spot_price: float) -> Tuple[float, float]:
@@ -664,80 +718,112 @@ def skew_at_anchors(puts_df: pd.DataFrame, calls_df: pd.DataFrame,
     and ``threshold_study`` replays per history day - one implementation,
     so the study's "exact pipeline" claim cannot drift.
     """
-    put_iv = find_mean_iv_at_strike(puts_df, put_strike)
-    call_iv = find_mean_iv_at_strike(calls_df, call_strike)
-    if np.isnan(put_iv) or np.isnan(call_iv):
-        put_iv, call_iv = compute_volume_weighted_iv_skew(
-            puts_df, calls_df, spot_price)
+    put_iv, call_iv, _ = skew_at_anchors_sourced(
+        puts_df, calls_df, put_strike, call_strike, spot_price)
     return put_iv, call_iv
 
 
-def compute_iv_skew_metric(ticker: str, expiry: str, chain: object, quality_metrics: Dict) -> Tuple[str, str, float, float, float, float]:
-    """Calculate IV skew metric with quality score."""
+SKEW_COLUMNS = ["ticker", "expiry", "otm_put_iv", "otm_call_iv", "iv_skew",
+                "quality_score", "anchor"]
+
+
+def compute_iv_skew_metric(ticker: str, expiry: str, chain: object, quality_metrics: Dict) -> Tuple:
+    """Calculate IV skew metric with quality score.
+
+    Returns a tuple in ``SKEW_COLUMNS`` order; the last field records how the
+    number was produced (ANCHOR_DELTA / ANCHOR_BAND / ANCHOR_VOLUME_WEIGHTED,
+    None when there is no number).
+    """
     try:
         calls_df = chain.calls
         puts_df = chain.puts
-        
+
         # The fetcher's spot rides with the chain; refetch only for
         # foreign/legacy chain objects that lack it.
         spot_price = getattr(chain, "spot", np.nan)
         if not np.isfinite(spot_price) or spot_price <= 0:
             spot_price = get_current_spot_price(ticker)
-        
+
         if np.isnan(spot_price):
-            return ticker, expiry, np.nan, np.nan, np.nan, 0.0
+            return ticker, expiry, np.nan, np.nan, np.nan, 0.0, None
 
         # Delta anchoring first (when enabled), moneyness bands as the
         # explicit per-name fallback whenever a delta anchor is unavailable.
+        # Deltas use the same parity-implied q the IVs were inverted at.
+        q = getattr(chain, "q", 0.0)
+        q = float(q) if q is not None and np.isfinite(q) else 0.0
         targets = None
         if ANCHOR_MODE == "delta":
             _, dte = validate_expiry_date(expiry)
             T = max(dte, 1) / 365.0
             targets = get_delta_anchored_strike_targets(
-                puts_df, calls_df, spot_price, T, get_risk_free_rate()
+                puts_df, calls_df, spot_price, T, get_risk_free_rate(), q=q
             )
+        anchor = ANCHOR_DELTA if targets is not None else ANCHOR_BAND
         if targets is None:
             targets = get_otm_strike_targets(spot_price, chain)
         otm_put_strike, otm_call_strike = targets
-        
-        mean_otm_put_iv, mean_otm_call_iv = skew_at_anchors(
+
+        mean_otm_put_iv, mean_otm_call_iv, used_vw = skew_at_anchors_sourced(
             puts_df, calls_df, otm_put_strike, otm_call_strike, spot_price)
+        if used_vw:
+            anchor = ANCHOR_VOLUME_WEIGHTED
         iv_skew = mean_otm_put_iv - mean_otm_call_iv
+        if not np.isfinite(iv_skew):
+            anchor = None
         quality_score = quality_metrics.get("quality_score", 0.0)
-        
-        return ticker, expiry, mean_otm_put_iv, mean_otm_call_iv, iv_skew, quality_score
-        
+
+        return (ticker, expiry, mean_otm_put_iv, mean_otm_call_iv, iv_skew,
+                quality_score, anchor)
+
     except Exception:
-        return ticker, expiry, np.nan, np.nan, np.nan, 0.0
+        return ticker, expiry, np.nan, np.nan, np.nan, 0.0, None
 
 
 # ============== INDEX ANALYSIS ==============
 
-def analyze_index(index_key: str, index_data: Dict, n_workers: int = 5) -> pd.DataFrame:
-    """Analyze IV skew with quality tracking."""
-    tickers = index_data["tickers"]
-    results = []
-    
+def fetch_all_chains(tickers, n_workers: int = 5) -> Dict[str, Tuple]:
+    """Fetch every DISTINCT ticker once: {ticker: fetch_option_chain result}.
+
+    The segments overlap (220 slots, 179 distinct names; TSLA and AMZN sit in
+    three segments). Fetching per segment re-scraped the same name up to three
+    times, and a fast-moving name could get a different number in each segment
+    it belongs to. One fetch per name per run fixes both.
+    """
+    unique = list(dict.fromkeys(tickers))
+    out: Dict[str, Tuple] = {}
     with ThreadPoolExecutor(max_workers=n_workers) as executor:
-        future_to_ticker = {
-            executor.submit(fetch_option_chain, ticker): ticker 
-            for ticker in tickers
-        }
-        
-        for future in as_completed(future_to_ticker):
-            ticker, expiry, chain, quality_metrics = future.result()
-            
-            if chain is None:
-                results.append((ticker, expiry, np.nan, np.nan, np.nan, 0.0))
-                continue
-            
-            iv_skew_result = compute_iv_skew_metric(ticker, expiry, chain, quality_metrics)
-            results.append(iv_skew_result)
-    
-    df = pd.DataFrame(
-        results,
-        columns=["ticker", "expiry", "otm_put_iv", "otm_call_iv", "iv_skew", "quality_score"]
-    )
+        futures = {executor.submit(fetch_option_chain, t): t for t in unique}
+        for future in as_completed(futures):
+            res = future.result()
+            out[futures[future]] = res
+    return out
+
+
+def analyze_index(index_key: str, index_data: Dict, n_workers: int = 5,
+                  fetched: Optional[Dict[str, Tuple]] = None) -> pd.DataFrame:
+    """Analyze IV skew with quality tracking.
+
+    ``fetched`` is a ``fetch_all_chains`` result shared across segments; when
+    omitted the segment's own tickers are fetched here (standalone use).
+    """
+    tickers = index_data["tickers"]
+    if fetched is None:
+        fetched = fetch_all_chains(tickers, n_workers)
+    results = []
+
+    for ticker in dict.fromkeys(tickers):
+        ticker, expiry, chain, quality_metrics = fetched.get(
+            ticker, (ticker, None, None, {}))
+
+        if chain is None:
+            results.append((ticker, expiry, np.nan, np.nan, np.nan, 0.0, None))
+            continue
+
+        iv_skew_result = compute_iv_skew_metric(ticker, expiry, chain, quality_metrics)
+        results.append(iv_skew_result)
+
+    df = pd.DataFrame(results, columns=SKEW_COLUMNS)
     
     # Flag reliable data
     df["is_reliable"] = df["quality_score"] >= 0.5
@@ -847,8 +933,24 @@ def print_detailed_skews(df: pd.DataFrame) -> None:
 
 # ============== MAIN PIPELINE ==============
 
-def run_global_iv_skew_analysis(n_workers: int = 5, show_plot: bool = False) -> pd.DataFrame:
-    """Run IV skew analysis across all global indices."""
+def unique_names(df: pd.DataFrame) -> pd.DataFrame:
+    """One row per ticker - the GLOBAL statistics' population. A name listed
+    in several segments is still one name; counting it once per segment
+    over-weighted mega-cap tech in every global rate."""
+    return df.drop_duplicates(subset="ticker", keep="first")
+
+
+def run_global_iv_skew_analysis(n_workers: int = 5, show_plot: bool = False,
+                                force_save: bool = False,
+                                session_status_fn=None) -> pd.DataFrame:
+    """Run IV skew analysis across all global indices.
+
+    Results are always printed, but they are only SAVED to the snapshot and
+    summary CSVs on a live trading session (``market_session_status``) unless
+    ``force_save`` - a weekend/holiday run reads stale after-close quotes and
+    would otherwise enter the time series as if it were a new day.
+    """
+    session_ok, session_msg = (session_status_fn or market_session_status)()
     print("="*100)
     print("GLOBAL IMPLIED VOLATILITY SKEW BUBBLE DETECTOR (DATA VALIDATED)")
     print("="*100)
@@ -862,11 +964,19 @@ def run_global_iv_skew_analysis(n_workers: int = 5, show_plot: bool = False) -> 
         print(f"Strike anchors: fixed moneyness bands ({OTM_PUT_BAND:.0%} / {OTM_CALL_BAND:.0%} of spot)")
     print(f"Data Quality Filters: Vol≥{MIN_VOLUME}, OI≥{MIN_OPEN_INTEREST}, {MIN_DTE}≤DTE≤{MAX_DTE}, {MIN_IV*100}%≤IV≤{MAX_IV*100}%\n")
     
+    if not session_ok:
+        print(f"[stale] {session_msg}. Results will be printed but NOT saved"
+              f"{' (overridden by --force)' if force_save else ''}.\n")
+
+    all_tickers = [t for v in GLOBAL_INDICES.values() for t in v["tickers"]]
+    print(f"Fetching {len(set(all_tickers))} distinct names once each...")
+    fetched = fetch_all_chains(all_tickers, n_workers)
+
     all_results = []
-    
+
     for index_key, index_data in GLOBAL_INDICES.items():
         print(f"Analyzing {index_data['name']}...")
-        df_index = analyze_index(index_key, index_data, n_workers)
+        df_index = analyze_index(index_key, index_data, n_workers, fetched=fetched)
         all_results.append(df_index)
         print_index_summary(index_key, index_data["name"], df_index)
     
@@ -878,12 +988,16 @@ def run_global_iv_skew_analysis(n_workers: int = 5, show_plot: bool = False) -> 
     print("GLOBAL MARKET SUMMARY")
     print("="*100)
     
-    valid_df = df_combined.dropna(subset=["iv_skew"])
-    total_attempted = len(df_combined)
+    # Global statistics count each distinct name once (see unique_names).
+    valid_df = unique_names(df_combined.dropna(subset=["iv_skew"]))
+    total_attempted = df_combined["ticker"].nunique()
     data_success_rate = (len(valid_df) / total_attempted * 100) if total_attempted > 0 else 0
     reliable_count = (valid_df["is_reliable"] == True).sum()
-    
-    print(f"Data Retrieval: {len(valid_df)}/{total_attempted} successful ({data_success_rate:.1f}%)")
+
+    print(f"Data Retrieval: {len(valid_df)}/{total_attempted} distinct names successful ({data_success_rate:.1f}%)")
+    if len(valid_df) > 0:
+        src = valid_df["anchor"].value_counts().to_dict()
+        print("Skew source: " + ", ".join(f"{k} {v}" for k, v in src.items()))
     print(f"High Quality Data: {reliable_count}/{len(valid_df)} ({reliable_count/len(valid_df)*100:.1f}%)" if len(valid_df) > 0 else "High Quality Data: N/A")
     
     if len(valid_df) > 0:
@@ -930,8 +1044,12 @@ def run_global_iv_skew_analysis(n_workers: int = 5, show_plot: bool = False) -> 
         print("\n⚠️  Insufficient data to generate global summary.")
         print("   This may be due to market hours, API limitations, or data availability.")
     
-    save_iv_skew_snapshot(df_combined)
-    save_bubble_summary_by_index(df_combined)
+    if session_ok or force_save:
+        save_iv_skew_snapshot(df_combined)
+        save_bubble_summary_by_index(df_combined)
+    else:
+        print(f"\nNot saved: {session_msg}. Re-run on a trading day, or pass "
+              "--force to save anyway.")
     
     if show_plot and len(valid_df) > 0:
         plot_global_iv_skew(df_combined)
@@ -1028,7 +1146,8 @@ def save_bubble_summary_by_index(df: pd.DataFrame) -> None:
             "alert_level": alert_level
         })
     
-    valid_df_global = df.dropna(subset=["iv_skew"])
+    # GLOBAL counts each distinct name once, however many segments list it.
+    valid_df_global = unique_names(df.dropna(subset=["iv_skew"]))
     if len(valid_df_global) > 0:
         inverted_count_global = (valid_df_global["iv_skew"] < 0).sum()
         total_valid_global = len(valid_df_global)
@@ -1052,7 +1171,7 @@ def save_bubble_summary_by_index(df: pd.DataFrame) -> None:
             "timestamp": timestamp,
             "index": "GLOBAL",
             "index_name": "Global All Indices",
-            "total_tickers": len(df),
+            "total_tickers": df["ticker"].nunique(),
             "valid_measurements": total_valid_global,
             "inverted_count": inverted_count_global,
             "inversion_pct": round(inversion_pct_global, 2),
@@ -1169,6 +1288,13 @@ if __name__ == "__main__":
              "slower; the difference is ~1%% of price for the OTM quotes used)"
     )
 
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Save results to the CSV series even when today is not a live "
+             "trading session (weekend/holiday quotes are stale after-close)"
+    )
+
     args = parser.parse_args()
 
     if args.american:
@@ -1178,4 +1304,5 @@ if __name__ == "__main__":
     TARGET_PUT_DELTA = -abs(args.put_delta)
     TARGET_CALL_DELTA = abs(args.call_delta)  # sign-normalized like the put side
 
-    run_global_iv_skew_analysis(n_workers=args.workers, show_plot=args.plot)
+    run_global_iv_skew_analysis(n_workers=args.workers, show_plot=args.plot,
+                                force_save=args.force)

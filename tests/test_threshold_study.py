@@ -126,3 +126,77 @@ def test_markdown_block_is_dated_and_honest(rows):
     # empty history degrades gracefully rather than crashing
     md_empty = TS.format_markdown(pd.DataFrame(), run_date="2026-07-28")
     assert "No usable snapshot history yet" in md_empty
+
+
+# --------------------------------------------------------------------------- #
+# Review fixes 2026-11-04                                                      #
+# --------------------------------------------------------------------------- #
+def flat_dividend_frame(day: str, ticker: str, q: float,
+                        sigma: float = 0.25) -> pd.DataFrame:
+    """A FLAT-vol chain priced with dividend yield q: the true skew is zero,
+    so any skew the study reports is carry misspecification."""
+    spot = SPOTS[day]
+    expiry = (_dt.date.fromisoformat(day) + _dt.timedelta(days=30)).isoformat()
+    T = 30 / 365.0
+    rows = []
+    for K in np.arange(80.0, 121.0, 1.0):
+        call = bs_call(spot, K, T, R0, sigma, q)
+        put = call - spot * np.exp(-q * T) + K * np.exp(-R0 * T)
+        for otype, price in (("call", call), ("put", put)):
+            half = 0.01 * price
+            rows.append({
+                "snapshot_date": day, "ticker": ticker, "spot": spot,
+                "riskfree": R0, "expiry": expiry, "otype": otype, "strike": K,
+                "bid": price - half, "ask": price + half, "last": price,
+                "volume": 500, "open_interest": 1000, "iv_yf": 9.99,
+            })
+    return pd.DataFrame(rows)[COLUMNS]
+
+
+def test_study_inverts_at_the_parity_implied_dividend_yield(tmp_path):
+    """The live scanner inverts at the chain's parity q; the replay must too.
+    A flat-vol dividend payer must come back with q recovered and ~zero skew,
+    where a q=0 inversion would manufacture a put skew."""
+    root = str(tmp_path)
+    q_true = 0.06
+    save_snapshot(flat_dividend_frame(DAYS[0], "DIV", q_true), root)
+    rows = TS.run_study(root)
+    assert len(rows) == 1
+    row = rows.iloc[0]
+    assert abs(row["q"] - q_true) < 1e-3
+    assert row["delta_available"]
+    assert abs(row["skew_delta"]) < 0.003
+    assert abs(row["skew_band"]) < 0.003
+
+    # the q=0 inversion this replaces really is biased on this chain
+    from skew_bubble_indicator import IV_skew as X
+    day_df = flat_dividend_frame(DAYS[0], "DIV", q_true)
+    T = 30 / 365.0
+    p0 = X.validate_option_data(TS.to_scanner_frame(day_df[day_df.otype == "put"]),
+                                SPOTS[DAYS[0]], T, R0, "put")
+    c0 = X.validate_option_data(TS.to_scanner_frame(day_df[day_df.otype == "call"]),
+                                SPOTS[DAYS[0]], T, R0, "call")
+    biased = (X.find_mean_iv_at_strike(p0, 90.0)
+              - X.find_mean_iv_at_strike(c0, 110.0))
+    assert biased > 0.005
+
+
+def test_per_ticker_summary_and_concentration(rows):
+    tick = TS.per_ticker_summary(rows)
+    assert list(tick["ticker"]) == ["BBB", "AAA"]     # most-inverted first
+    assert tick.set_index("ticker").loc["BBB", "inv_pct_delta"] == 100.0
+    assert tick.set_index("ticker").loc["AAA", "inv_pct_delta"] == 0.0
+    conc = TS.concentration_summary(rows)
+    assert conc["persistent"] == ["BBB"]
+    assert conc["n_names"] == 2
+    assert conc["inv_pct_ex_persistent"] == 0.0
+
+
+def test_markdown_reports_names_units_and_last_session(rows):
+    md = TS.format_markdown(rows, run_date="2026-07-28")
+    assert "| BBB | 2 | 100% |" in md
+    assert "Concentration: BBB is inverted" in md
+    assert "0.01 = 1 vol point" in md
+    assert "last captured session is 2026-01-06" in md
+    assert "runs nightly" not in md          # no claim the store can't back
+    assert "does not calibrate the scanner's 20-name segment" in md

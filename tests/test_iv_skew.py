@@ -297,3 +297,177 @@ def test_parity_implied_q_recovers_a_known_dividend():
     # fewer than two matched pairs -> 0.0
     one = pd.DataFrame([calls[4]])
     assert X.parity_implied_q(one, pd.DataFrame([puts[4]]), S, T, R) == 0.0
+
+
+# --------------------------------------------------------------------------- #
+# Review fixes 2026-11-04: q in delta anchoring, skew source, one fetch per    #
+# name, de-duplicated GLOBAL, session guard on saving                          #
+# --------------------------------------------------------------------------- #
+def test_delta_anchor_uses_the_inversion_dividend_yield():
+    """Deltas must be computed at the q the IVs were inverted at. On a fine
+    strike grid with a large q the anchor strike moves, and it matches an
+    independent q-aware Black-Scholes delta."""
+    from scipy.stats import norm
+    sigma, q = 0.20, 0.10
+    strikes = np.arange(85.0, 115.01, 0.25)
+    puts, calls = flat_iv_chain(sigma, strikes), flat_iv_chain(sigma, strikes)
+
+    def expected(target, otype, qq):
+        ks = strikes[strikes <= S] if otype == "put" else strikes[strikes >= S]
+        d1 = (np.log(S / ks) + (R - qq + 0.5 * sigma**2) * T) / (sigma * np.sqrt(T))
+        disc = np.exp(-qq * T)
+        delta = disc * norm.cdf(d1) if otype == "call" else disc * (norm.cdf(d1) - 1.0)
+        return float(ks[np.argmin(np.abs(delta - target))])
+
+    k_q0 = X.get_delta_anchored_strike_targets(puts, calls, S, T, R)
+    k_q = X.get_delta_anchored_strike_targets(puts, calls, S, T, R, q=q)
+    assert k_q == (expected(-0.25, "put", q), expected(0.25, "call", q))
+    assert k_q != k_q0                       # q actually moves the anchor
+
+
+def _chain(puts, calls, q=0.0):
+    return X.ValidatedChain(puts=puts, calls=calls, spot=S, q=q)
+
+
+def _expiry_30d():
+    return (datetime.now() + timedelta(days=30, hours=12)).strftime("%Y-%m-%d")
+
+
+def _validated():
+    puts = X.validate_option_data(make_chain("put"), S, T, R, "put")
+    calls = X.validate_option_data(make_chain("call"), S, T, R, "call")
+    return puts, calls
+
+
+def test_skew_metric_records_which_anchor_produced_the_number(monkeypatch):
+    monkeypatch.setattr(X, "get_risk_free_rate", lambda: R)
+    puts, calls = _validated()
+    exp = _expiry_30d()
+
+    row = X.compute_iv_skew_metric("AAA", exp, _chain(puts, calls), {})
+    assert len(row) == len(X.SKEW_COLUMNS)
+    assert row[-1] == X.ANCHOR_DELTA and np.isfinite(row[4])
+
+    # ATM-only chain: delta anchor unavailable -> band path, recorded as such
+    atm = np.array([99.0, 100.0, 101.0])
+    p_atm = X.validate_option_data(make_chain("put", atm), S, T, R, "put")
+    c_atm = X.validate_option_data(make_chain("call", atm), S, T, R, "call")
+    row = X.compute_iv_skew_metric("BBB", exp, _chain(p_atm, c_atm), {})
+    assert row[-1] == X.ANCHOR_BAND
+
+    # forced moneyness mode -> band everywhere
+    monkeypatch.setattr(X, "ANCHOR_MODE", "moneyness")
+    row = X.compute_iv_skew_metric("AAA", exp, _chain(puts, calls), {})
+    assert row[-1] == X.ANCHOR_BAND
+
+    # no finite IV anywhere -> no number, no source
+    nan_p = puts.assign(impliedVolatility=np.nan)
+    nan_c = calls.assign(impliedVolatility=np.nan)
+    row = X.compute_iv_skew_metric("CCC", exp, _chain(nan_p, nan_c), {})
+    assert np.isnan(row[4]) and row[-1] is None
+
+
+def test_volume_weighted_fallback_is_recorded(monkeypatch):
+    """When the windowed anchor mean is NaN but the band-wide quotes are not,
+    the number comes from the volume-weighted fallback and says so."""
+    monkeypatch.setattr(X, "get_risk_free_rate", lambda: R)
+    monkeypatch.setattr(X, "ANCHOR_MODE", "moneyness")
+    puts, calls = _validated()
+    _, _, used = X.skew_at_anchors_sourced(puts, calls, 90.0, 110.0, S)
+    assert used is False
+    # make the 3 strikes nearest the put anchor NaN: the windowed mean is NaN
+    # while the 80-98% band still has finite IVs for the fallback
+    p = puts.copy()
+    near = p["strike"].sub(90.0).abs().nsmallest(3).index
+    p.loc[near, "impliedVolatility"] = np.nan
+    put_iv, call_iv, used = X.skew_at_anchors_sourced(p, calls, 90.0, 110.0, S)
+    assert used is True and np.isfinite(put_iv - call_iv)
+    row = X.compute_iv_skew_metric("AAA", _expiry_30d(), _chain(p, calls), {})
+    assert row[-1] == X.ANCHOR_VOLUME_WEIGHTED
+
+
+def test_each_ticker_is_fetched_once_and_shared_across_segments(monkeypatch):
+    calls_made = []
+    puts, calls = _validated()
+    monkeypatch.setattr(X, "get_risk_free_rate", lambda: R)
+
+    def fake_fetch(ticker, max_retries=3):
+        calls_made.append(ticker)
+        return ticker, _expiry_30d(), _chain(puts, calls), {"quality_score": 1.0}
+
+    monkeypatch.setattr(X, "fetch_option_chain", fake_fetch)
+    fetched = X.fetch_all_chains(["AAA", "BBB", "AAA", "CCC", "BBB"])
+    assert sorted(calls_made) == ["AAA", "BBB", "CCC"]
+    seg1 = X.analyze_index("S1", {"name": "one", "tickers": ["AAA", "BBB"]},
+                           fetched=fetched)
+    seg2 = X.analyze_index("S2", {"name": "two", "tickers": ["AAA", "CCC"]},
+                           fetched=fetched)
+    assert len(calls_made) == 3              # no re-fetch per segment
+    a1 = seg1.loc[seg1["ticker"] == "AAA", "iv_skew"].iloc[0]
+    a2 = seg2.loc[seg2["ticker"] == "AAA", "iv_skew"].iloc[0]
+    assert a1 == a2                          # same name, same number
+    assert "anchor" in seg1.columns
+
+
+def test_global_summary_counts_each_name_once(tmp_path, monkeypatch):
+    """AAA sits in two segments; GLOBAL must count it once."""
+    csv = str(tmp_path / "bubble.csv")
+    monkeypatch.setattr(X, "BUBBLE_SUMMARY_CSV", csv)
+    df = pd.DataFrame({
+        "ticker": ["AAA", "BBB", "AAA", "CCC"],
+        "index": ["s1", "s1", "s2", "s2"],
+        "index_name": ["One", "One", "Two", "Two"],
+        "iv_skew": [-0.05, 0.10, -0.05, 0.10],
+        "is_reliable": [True] * 4,
+    })
+    X.save_bubble_summary_by_index(df)
+    g = pd.read_csv(csv).query("index == 'GLOBAL'").iloc[0]
+    assert g["total_tickers"] == 3
+    assert g["valid_measurements"] == 3
+    assert g["inverted_count"] == 1          # AAA once, not twice
+    assert abs(g["inversion_pct"] - 100 / 3) < 0.01
+
+
+def test_market_session_status_refuses_weekends_and_holidays():
+    from datetime import date
+    fri, sat = date(2026, 10, 23), date(2026, 10, 24)
+
+    def no_network():
+        raise AssertionError("weekends must not need a network call")
+
+    ok, msg = X.market_session_status(today=sat, last_session_fn=no_network)
+    assert not ok and "weekend" in msg
+    assert X.market_session_status(today=fri, last_session_fn=lambda: fri)[0]
+    # weekday holiday: the last daily bar is an earlier day
+    thanksgiving = date(2026, 11, 26)
+    ok, msg = X.market_session_status(
+        today=thanksgiving, last_session_fn=lambda: date(2026, 11, 25))
+    assert not ok and "not a trading session" in msg
+    # bar fetch failed -> proceed, so a network blip cannot drop a real session
+    assert X.market_session_status(today=fri, last_session_fn=lambda: None)[0]
+
+
+def test_stale_session_run_prints_but_does_not_save(tmp_path, monkeypatch, capsys):
+    puts, calls = _validated()
+    monkeypatch.setattr(X, "get_risk_free_rate", lambda: R)
+    monkeypatch.setattr(X, "fetch_option_chain", lambda t, max_retries=3: (
+        t, _expiry_30d(), _chain(puts, calls), {"quality_score": 1.0}))
+    monkeypatch.setattr(X, "GLOBAL_INDICES",
+                        {"S1": {"name": "One", "tickers": ["AAA", "BBB"]}})
+    snap, summ = tmp_path / "snap.csv", tmp_path / "summ.csv"
+    monkeypatch.setattr(X, "DAILY_SNAPSHOT_CSV", str(snap))
+    monkeypatch.setattr(X, "BUBBLE_SUMMARY_CSV", str(summ))
+
+    def stale():
+        return False, "2026-10-24 is a weekend"
+
+    df = X.run_global_iv_skew_analysis(session_status_fn=stale)
+    assert len(df) == 2 and not snap.exists() and not summ.exists()
+    assert "Not saved" in capsys.readouterr().out
+
+    X.run_global_iv_skew_analysis(session_status_fn=stale, force_save=True)
+    assert snap.exists() and summ.exists()
+    snap.unlink()
+    summ.unlink()
+    X.run_global_iv_skew_analysis(session_status_fn=lambda: (True, "live"))
+    assert snap.exists() and summ.exists()

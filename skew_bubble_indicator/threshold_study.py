@@ -110,10 +110,12 @@ def to_scanner_frame(side_df: pd.DataFrame) -> pd.DataFrame:
 def _skew_at(puts: pd.DataFrame, calls: pd.DataFrame, put_k: float,
              call_k: float, spot: float) -> Dict[str, float]:
     """The scanner's metric at given anchor strikes - the shared core in
-    IV_skew.skew_at_anchors, so the study's "exact pipeline" replay cannot
-    drift from the live scanner's own implementation."""
-    put_iv, call_iv = X.skew_at_anchors(puts, calls, put_k, call_k, spot)
-    return {"put_iv": put_iv, "call_iv": call_iv, "skew": put_iv - call_iv}
+    IV_skew.skew_at_anchors_sourced, so the study's "exact pipeline" replay
+    cannot drift from the live scanner's own implementation."""
+    put_iv, call_iv, used_vw = X.skew_at_anchors_sourced(
+        puts, calls, put_k, call_k, spot)
+    return {"put_iv": put_iv, "call_iv": call_iv, "skew": put_iv - call_iv,
+            "vw_fallback": bool(used_vw)}
 
 
 def ticker_day_row(day_df: pd.DataFrame) -> Optional[Dict]:
@@ -134,10 +136,15 @@ def ticker_day_row(day_df: pd.DataFrame) -> Optional[Dict]:
            - _dt.date.fromisoformat(day[:10])).days
     T = max(dte, 1) / 365.0
 
-    puts = X.validate_option_data(
-        to_scanner_frame(sl[sl["otype"] == "put"]), spot, T, r, "put")
-    calls = X.validate_option_data(
-        to_scanner_frame(sl[sl["otype"] == "call"]), spot, T, r, "call")
+    raw_puts = to_scanner_frame(sl[sl["otype"] == "put"])
+    raw_calls = to_scanner_frame(sl[sl["otype"] == "call"])
+    # The live scanner inverts at the chain's parity-implied dividend yield
+    # (IV_skew.fetch_option_chain); replaying at q=0 flipped the sign of
+    # 11 of 292 delta-anchored observations (laptop store, 32 sessions,
+    # checked 2026-11-04).
+    q = X.parity_implied_q(raw_calls, raw_puts, spot, T, r)
+    puts = X.validate_option_data(raw_puts, spot, T, r, "put", q=q)
+    calls = X.validate_option_data(raw_calls, spot, T, r, "call", q=q)
     if len(puts) < 3 or len(calls) < 3:      # the scanner's minimum-data gate
         return None
 
@@ -145,23 +152,24 @@ def ticker_day_row(day_df: pd.DataFrame) -> Optional[Dict]:
     band_put_k, band_call_k = X.get_otm_strike_targets(spot, chain)
     band = _skew_at(puts, calls, band_put_k, band_call_k, spot)
 
-    targets = X.get_delta_anchored_strike_targets(puts, calls, spot, T, r)
+    targets = X.get_delta_anchored_strike_targets(puts, calls, spot, T, r, q=q)
     if targets is not None:
         delta = _skew_at(puts, calls, targets[0], targets[1], spot)
         delta_put_k, delta_call_k = targets
     else:
-        delta = {"put_iv": np.nan, "call_iv": np.nan, "skew": np.nan}
+        delta = {"put_iv": np.nan, "call_iv": np.nan, "skew": np.nan,
+                 "vw_fallback": False}
         delta_put_k = delta_call_k = np.nan
 
     return {
         "snapshot_date": day, "ticker": ticker, "spot": spot,
-        "expiry": str(expiry), "dte": dte,
+        "expiry": str(expiry), "dte": dte, "q": q,
         "n_puts": len(puts), "n_calls": len(calls),
         "band_put_strike": band_put_k, "band_call_strike": band_call_k,
-        "skew_band": band["skew"],
+        "skew_band": band["skew"], "band_vw_fallback": band["vw_fallback"],
         "delta_available": targets is not None,
         "delta_put_strike": delta_put_k, "delta_call_strike": delta_call_k,
-        "skew_delta": delta["skew"],
+        "skew_delta": delta["skew"], "delta_vw_fallback": delta["vw_fallback"],
     }
 
 
@@ -236,6 +244,49 @@ def agreement_summary(rows: pd.DataFrame) -> Dict[str, float]:
     }
 
 
+PERSISTENT_INVERSION_SHARE = 50.0   # % of a name's days inverted
+
+
+def per_ticker_summary(rows: pd.DataFrame) -> pd.DataFrame:
+    """Per name: how often its delta-anchored skew is inverted, its median
+    skew, and how often the delta anchor was unavailable.
+
+    The daily inversion rate is a count over a handful of names, so a
+    name that is structurally call-skewed (a commodity ETF in a rally, a
+    retail-favourite single name) adds a fixed 1/n to every day's rate. This
+    table shows which names the rate actually comes from."""
+    out = []
+    for ticker, tdf in rows.groupby("ticker"):
+        d = tdf["skew_delta"].dropna()
+        b = tdf["skew_band"].dropna()
+        out.append({
+            "ticker": ticker,
+            "n_days": len(tdf),
+            "inv_pct_delta": 100.0 * (d < 0).mean() if len(d) else np.nan,
+            "inv_pct_band": 100.0 * (b < 0).mean() if len(b) else np.nan,
+            "median_skew_delta": d.median() if len(d) else np.nan,
+            "delta_fallback_pct": 100.0 * (~tdf["delta_available"]).mean(),
+        })
+    return (pd.DataFrame(out)
+            .sort_values(["inv_pct_delta", "ticker"], ascending=[False, True],
+                         na_position="last")
+            .reset_index(drop=True))
+
+
+def concentration_summary(rows: pd.DataFrame) -> Dict[str, object]:
+    """Names inverted on more than PERSISTENT_INVERSION_SHARE of their days,
+    and the pooled delta-anchored inversion rate with them excluded."""
+    tick = per_ticker_summary(rows)
+    persistent = sorted(tick.loc[tick["inv_pct_delta"]
+                                 > PERSISTENT_INVERSION_SHARE, "ticker"])
+    rest = rows[~rows["ticker"].isin(persistent)]["skew_delta"].dropna()
+    return {
+        "persistent": persistent,
+        "n_names": int(rows["ticker"].nunique()),
+        "inv_pct_ex_persistent": 100.0 * (rest < 0).mean() if len(rest) else np.nan,
+    }
+
+
 def threshold_context(day_summary: pd.DataFrame) -> Dict[str, object]:
     """Where the current thresholds sit against the observed history."""
     out: Dict[str, object] = {"n_days": len(day_summary)}
@@ -281,7 +332,8 @@ def format_markdown(rows: pd.DataFrame, run_date: Optional[str] = None) -> str:
             f"| {_fmt(r.median_skew_delta)} | {_fmt(r.median_skew_band)} "
             f"| {r.delta_fallbacks} |")
     lines.append("")
-    lines.append("Pooled per-name skew distribution (vol points, put minus call):")
+    lines.append("Pooled per-name skew distribution (IV as a decimal, put minus "
+                 "call; 0.01 = 1 vol point):")
     lines.append("")
     lines.append("| metric | n | min | p10 | p25 | p50 | p75 | p90 | max | share inverted |")
     lines.append("|---|---|---|---|---|---|---|---|---|---|")
@@ -314,16 +366,43 @@ def format_markdown(rows: pd.DataFrame, run_date: Optional[str] = None) -> str:
         + f". Delta anchoring fell back to moneyness bands on "
           f"{agree['fallback_pct']:.0f}% of observations.")
     lines.append("")
+
+    tick = per_ticker_summary(rows)
+    conc = concentration_summary(rows)
+    lines.append("Per name (where the daily inversion rate comes from):")
+    lines.append("")
+    lines.append("| name | days | inverted % (delta) | inverted % (band) | "
+                 "median skew (delta) | delta fallback % |")
+    lines.append("|---|---|---|---|---|---|")
+    for r in tick.itertuples(index=False):
+        inv_d = "n/a" if not np.isfinite(r.inv_pct_delta) else f"{r.inv_pct_delta:.0f}%"
+        inv_b = "n/a" if not np.isfinite(r.inv_pct_band) else f"{r.inv_pct_band:.0f}%"
+        lines.append(f"| {r.ticker} | {r.n_days} | {inv_d} | {inv_b} "
+                     f"| {_fmt(r.median_skew_delta)} | {r.delta_fallback_pct:.0f}% |")
+    lines.append("")
+    if conc["persistent"]:
+        lines.append(
+            f"Concentration: {', '.join(conc['persistent'])} "
+            f"{'is' if len(conc['persistent']) == 1 else 'are'} inverted on more "
+            f"than {PERSISTENT_INVERSION_SHARE:.0f}% of {'its' if len(conc['persistent']) == 1 else 'their'} days, "
+            f"so with ~{days['n_names'].median():.0f} names a day they set most "
+            f"of the daily rate on their own. Excluding them, the pooled "
+            f"delta-anchored inversion rate is "
+            f"{conc['inv_pct_ex_persistent']:.0f}%.")
+        lines.append("")
+    last_day = str(rows["snapshot_date"].max())[:10]
     lines.append(
         f"**Honest interpretation.** {ctx['n_days']} market day(s) of history "
-        "calibrates the metric's *range* in the captured (calm) regime — it "
-        "shows where \"normal\" sits and how far the thresholds are above it. "
-        "It cannot validate bubble-prediction power: that requires the "
+        f"on {conc['n_names']} names (the `vol_snapshots` capture list, mostly "
+        "index and sector ETFs) calibrates the metric's *range* in the captured "
+        "(calm) regime. It does not calibrate the scanner's 20-name segment "
+        "thresholds directly: none of the segments' own universes is in the "
+        "history, and the daily rate here is a count over a few names. It "
+        "cannot validate bubble-prediction power: that requires the "
         "thresholds to fire ahead of a drawdown at least once, i.e. years of "
         "daily history spanning at least one froth episode. Until then the "
-        "40%/60% thresholds remain judgment calls — now with measured "
-        "context. This table strengthens automatically: the capture runs "
-        "nightly and this script recomputes from the full store.")
+        "40%/60% thresholds remain judgment calls. The script recomputes "
+        f"from the full store; the last captured session is {last_day}.")
     return "\n".join(lines)
 
 

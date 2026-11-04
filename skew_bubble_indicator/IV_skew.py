@@ -69,7 +69,7 @@ GLOBAL_INDICES = {
     "US_FINANCE": {
         "name": "US Financials",
         "tickers": ["JPM", "V", "MA", "BAC", "WFC", "GS", "MS", "BX", "C",
-                   "SPGI", "AXP", "BLK", "CB", "PGR", "MMC", "CME", "USB",
+                   "SPGI", "AXP", "BLK", "CB", "PGR", "MRSH", "CME", "USB",
                    "PNC", "TFC", "COF"]
     },
     "US_HEALTH": {
@@ -86,9 +86,9 @@ GLOBAL_INDICES = {
     },
     "US_ENERGY": {
         "name": "US Energy & Materials",
-        "tickers": ["XOM", "CVX", "COP", "SLB", "EOG", "MPC", "PXD", "PSX",
-                   "VLO", "OXY", "HAL", "WMB", "KMI", "LNG", "HES", "FANG",
-                   "DVN", "BKR", "TRGP", "MRO"]
+        "tickers": ["XOM", "CVX", "COP", "SLB", "EOG", "MPC", "EQT", "PSX",
+                   "VLO", "OXY", "HAL", "WMB", "KMI", "LNG", "OKE", "FANG",
+                   "DVN", "BKR", "TRGP", "APA"]
     },
     "US_INDUSTRIAL": {
         "name": "US Industrials",
@@ -100,13 +100,13 @@ GLOBAL_INDICES = {
         "name": "US Small/Mid Caps",
         "tickers": ["MRVL", "PANW", "PLTR", "CRWD", "SNOW", "FTNT", "DDOG",
                    "NET", "TEAM", "ZS", "UBER", "LYFT", "DASH", "COIN",
-                   "RBLX", "U", "AFRM", "SQ", "RIVN", "LCID"]
+                   "RBLX", "U", "AFRM", "XYZ", "RIVN", "LCID"]
     },
     "US_MEME": {
         "name": "US Retail Favorites",
-        "tickers": ["GME", "AMC", "BBBY", "BB", "NOK", "WISH", "CLOV", "SPCE",
+        "tickers": ["GME", "AMC", "MSTR", "BB", "NOK", "RDDT", "CLOV", "SPCE",
                    "SOFI", "HOOD", "PLTR", "NIO", "RIVN", "LCID", "AFRM",
-                   "COIN", "RBLX", "DKNG", "SKLZ", "OPEN"]
+                   "COIN", "RBLX", "DKNG", "HIMS", "OPEN"]
     },
     "ETF_MAJOR": {
         "name": "Major ETFs",
@@ -115,6 +115,28 @@ GLOBAL_INDICES = {
                    "XLY", "XLU", "XLRE", "XLC"]
     }
 }
+
+# Universe refreshed 2026-11-04: eight names no longer listed options on
+# yfinance (delisted, acquired or renamed) and were silently scanned as NO
+# DATA. Renames keep the company (SQ -> XYZ, MMC -> MRSH); acquired or
+# delisted names were replaced from the same segment (PXD/HES/MRO ->
+# EQT/OKE/APA; BBBY/WISH/SKLZ -> MSTR/RDDT/HIMS). Every name listed options
+# on that date; re-check with `--check-universe`.
+
+
+def check_universe(n_workers: int = 8) -> list:
+    """Names in GLOBAL_INDICES with no listed option expiries (network)."""
+    names = sorted({t for v in GLOBAL_INDICES.values() for t in v["tickers"]})
+
+    def n_expiries(t):
+        try:
+            return t, len(yf.Ticker(t).options)
+        except Exception:
+            return t, 0
+
+    with ThreadPoolExecutor(max_workers=n_workers) as ex:
+        return [t for t, n in ex.map(n_expiries, names) if n == 0]
+
 
 STRIKE_NEIGHBOR_COUNT = 3
 MAX_STRIKE_WINDOW_PCT = 15.0
@@ -141,8 +163,15 @@ TARGET_CALL_DELTA = 0.25
 # anchoring somewhere else on the smile.
 DELTA_ANCHOR_TOLERANCE = 0.10
 
+# Alert bands on the % of a segment's names with inverted skew. All four are
+# JUDGMENT CALLS: no history exists of this rate firing ahead of a drawdown
+# (see threshold_study.py / README). On the snapshot history, two or three
+# structurally call-skewed names (GLD, TSLA, VXX) alone put a ~9-name
+# cross-section at ~22%, so the CAUTION band is not "above normal" by itself.
+EXTREME_INVERSION_THRESHOLD = 70
 CRITICAL_INVERSION_THRESHOLD = 60
 WARNING_INVERSION_THRESHOLD = 40
+CAUTION_INVERSION_THRESHOLD = 25
 
 DAILY_SNAPSHOT_CSV = "daily_IV_skew_snapshot.csv"
 BUBBLE_SUMMARY_CSV = "bubble_summary.csv"
@@ -877,13 +906,13 @@ def print_index_summary(index_key: str, index_name: str, df: pd.DataFrame) -> No
         reliable_str = ""
     alert_pct, alert_basis = alert_inversion_rate(valid_df)
     
-    if alert_pct > 70:
-        status = "🔴🚨" 
+    if alert_pct > EXTREME_INVERSION_THRESHOLD:
+        status = "🔴🚨"
     elif alert_pct > CRITICAL_INVERSION_THRESHOLD:
         status = "🚨" 
     elif alert_pct > WARNING_INVERSION_THRESHOLD:
         status = "🟡" 
-    elif alert_pct > 25:
+    elif alert_pct > CAUTION_INVERSION_THRESHOLD:
         status = "🟠"
     else:
         status = "🟢"
@@ -1024,22 +1053,28 @@ def run_global_iv_skew_analysis(n_workers: int = 5, show_plot: bool = False,
         alert_pct, alert_basis = alert_inversion_rate(valid_df)
         print(f"Alert basis: {alert_basis}")
         
-        if alert_pct > 70:
-            print("\n🔴🚨 EXTREME BUBBLE ALERT!")
-            print("   CRITICAL: Over 70% of stocks show inverted skew!")
-            print("   This represents extreme speculative mania across markets.")
-            print("   Historical precedent suggests significant correction risk.")
+        # What the bands mean, stated no stronger than the evidence: the
+        # rate is measured, its link to future drawdowns is not.
+        caveat = ("   Thresholds are unvalidated judgment calls; this rate has "
+                  "no tested link to future drawdowns.")
+        if alert_pct > EXTREME_INVERSION_THRESHOLD:
+            print(f"\n🔴🚨 EXTREME: over {EXTREME_INVERSION_THRESHOLD}% of names show inverted skew")
+            print("   Calls are priced above puts at the anchors on most names: broad")
+            print("   upside demand, far outside anything in the captured history.")
+            print(caveat)
         elif alert_pct > CRITICAL_INVERSION_THRESHOLD:
-            print("\n🚨 CRITICAL GLOBAL BUBBLE WARNING!")
-            print("   Excessive call demand detected across multiple markets!")
-            print("   IV skew heavily inverted - extreme speculative mania.")
+            print(f"\n🚨 CRITICAL: over {CRITICAL_INVERSION_THRESHOLD}% of names show inverted skew")
+            print("   Upside demand on most names; check whether a few sectors or an")
+            print("   earnings cluster are driving it (see the per-name table above).")
+            print(caveat)
         elif alert_pct > WARNING_INVERSION_THRESHOLD:
-            print("\n🟡 ELEVATED GLOBAL RISK")
-            print("   Above-normal speculative activity detected.")
-            print("   Monitor for further deterioration in skew patterns.")
-        elif alert_pct > 25:
-            print("\n🟠 CAUTION: Elevated Inversion Levels")
-            print("   Inversion above historical norms but not yet critical.")
+            print(f"\n🟡 WARNING: over {WARNING_INVERSION_THRESHOLD}% of names show inverted skew")
+            print("   Above the highest daily rate in the captured history (33%).")
+            print(caveat)
+        elif alert_pct > CAUTION_INVERSION_THRESHOLD:
+            print(f"\n🟠 CAUTION: over {CAUTION_INVERSION_THRESHOLD}% of names show inverted skew")
+            print("   Within the captured range: a few structurally call-skewed names")
+            print("   (GLD, TSLA, VXX) can produce this on their own.")
     else:
         print("\n⚠️  Insufficient data to generate global summary.")
         print("   This may be due to market hours, API limitations, or data availability.")
@@ -1295,7 +1330,19 @@ if __name__ == "__main__":
              "trading session (weekend/holiday quotes are stale after-close)"
     )
 
+    parser.add_argument(
+        "--check-universe",
+        action="store_true",
+        help="List scanner names that no longer list options, then exit"
+    )
+
     args = parser.parse_args()
+
+    if args.check_universe:
+        dead = check_universe()
+        print("All names list options." if not dead
+              else "No listed options: " + ", ".join(dead))
+        sys.exit(1 if dead else 0)
 
     if args.american:
         IV_STYLE = "american"

@@ -471,3 +471,47 @@ def test_stale_session_run_prints_but_does_not_save(tmp_path, monkeypatch, capsy
     summ.unlink()
     X.run_global_iv_skew_analysis(session_status_fn=lambda: (True, "live"))
     assert snap.exists() and summ.exists()
+
+
+def _call_skewed_chain(otype):
+    """Inverted smile (calls richer than puts), priced like make_chain."""
+    rows = []
+    for K in np.arange(80.0, 121.0, 2.5):
+        sigma = 0.20 + 0.8 * max(0.0, (K - 1.05 * S) / S)
+        call = bs_call(S, K, T, R, sigma)
+        price = call if otype == "call" else call - S + K * np.exp(-R * T)
+        half = 0.03 * price
+        rows.append({"strike": K, "bid": price - half, "ask": price + half,
+                     "volume": 500, "openInterest": 1000, "lastPrice": price,
+                     "impliedVolatility": 9.99})
+    return pd.DataFrame(rows)
+
+
+def test_extreme_alert_states_its_limits(tmp_path, monkeypatch, capsys):
+    """Every name inverted -> the EXTREME band fires, and the printed text
+    carries the unvalidated caveat instead of a correction-risk claim."""
+    puts = X.validate_option_data(_call_skewed_chain("put"), S, T, R, "put")
+    calls = X.validate_option_data(_call_skewed_chain("call"), S, T, R, "call")
+    monkeypatch.setattr(X, "get_risk_free_rate", lambda: R)
+    monkeypatch.setattr(X, "ANCHOR_MODE", "moneyness")   # 110% call sits in the rich wing
+    monkeypatch.setattr(X, "fetch_option_chain", lambda t, max_retries=3: (
+        t, _expiry_30d(), _chain(puts, calls), {"quality_score": 1.0}))
+    monkeypatch.setattr(X, "GLOBAL_INDICES",
+                        {"S1": {"name": "One", "tickers": ["A", "B", "C"]}})
+    monkeypatch.setattr(X, "DAILY_SNAPSHOT_CSV", str(tmp_path / "s.csv"))
+    monkeypatch.setattr(X, "BUBBLE_SUMMARY_CSV", str(tmp_path / "b.csv"))
+    df = X.run_global_iv_skew_analysis(session_status_fn=lambda: (True, "live"))
+    assert (df["iv_skew"] < 0).all()
+    out = capsys.readouterr().out
+    assert "EXTREME: over 70% of names show inverted skew" in out
+    assert "unvalidated judgment calls" in out
+    for banned in ("Historical precedent", "correction risk", "mania"):
+        assert banned not in out
+
+
+def test_universe_has_no_known_dead_names():
+    """Names found without listed options on 2026-11-04 stay out."""
+    names = {t for v in X.GLOBAL_INDICES.values() for t in v["tickers"]}
+    dead = {"BBBY", "HES", "MMC", "MRO", "PXD", "SKLZ", "SQ", "WISH"}
+    assert not names & dead
+    assert all(len(v["tickers"]) == 20 for v in X.GLOBAL_INDICES.values())

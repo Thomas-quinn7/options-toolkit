@@ -72,7 +72,7 @@ The study inverts at each chain's parity-implied dividend yield, as the live
 scanner does (until 2026-11-04 it inverted at q=0, which flipped the sign of
 11 of 292 delta-anchored observations on a 32-session subset).
 
-### Threshold study — run 2026-11-04, 35 distinct session close(s), 313 (day, name) observations
+### Threshold study — run 2026-11-12, 42 distinct session close(s), 376 (day, name) observations
 
 Per-day cross-section (the inversion rate is what the 40%/60% thresholds gate on):
 
@@ -113,39 +113,48 @@ Per-day cross-section (the inversion rate is what the 40%/60% thresholds gate on
 | 2026-09-25 | 9 | 22% | 0% | +0.0203 | +0.0443 | 0 |
 | 2026-10-02 | 3 | 0% | 0% | +0.0364 | +0.1009 | 0 |
 | 2026-10-09 | 9 | 11% | 0% | +0.0222 | +0.0449 | 0 |
+| 2026-11-04 | 9 | 11% | 11% | +0.0363 | +0.0528 | 0 |
+| 2026-11-05 | 9 | 11% | 0% | +0.0382 | +0.0509 | 0 |
+| 2026-11-06 | 9 | 11% | 0% | +0.0673 | +0.1114 | 0 |
+| 2026-11-09 | 9 | 11% | 11% | +0.0539 | +0.0751 | 0 |
+| 2026-11-10 | 9 | 0% | 0% | +0.0534 | +0.0743 | 1 |
+| 2026-11-11 | 9 | 0% | 0% | +0.0367 | +0.0660 | 0 |
+| 2026-11-12 | 9 | 0% | 0% | +0.0434 | +0.0691 | 0 |
 
 Pooled per-name skew distribution (IV as a decimal, put minus call; 0.01 = 1 vol point):
 
 | metric | n | min | p10 | p25 | p50 | p75 | p90 | max | share inverted |
 |---|---|---|---|---|---|---|---|---|---|
-| delta-anchored | 298 | -0.2681 | -0.0089 | +0.0054 | +0.0176 | +0.0371 | +0.0487 | +0.1377 | 19% |
-| moneyness-band | 313 | -0.1865 | -0.0080 | +0.0091 | +0.0365 | +0.0955 | +0.1160 | +0.1481 | 17% |
+| delta-anchored | 360 | -0.2681 | -0.0069 | +0.0076 | +0.0221 | +0.0411 | +0.0561 | +0.1575 | 17% |
+| moneyness-band | 376 | -0.1865 | -0.0069 | +0.0131 | +0.0428 | +0.0996 | +0.1189 | +0.1836 | 15% |
 
-Threshold context: the WARNING (>40%) / CRITICAL (>60%) inversion thresholds would have fired on 0/35 and 0/35 day(s) (delta-anchored; 0/35 and 0/35 with moneyness bands). Highest observed daily inversion rate: 33% (delta), 33% (band).
+Threshold context: the WARNING (>40%) / CRITICAL (>60%) inversion thresholds would have fired on 0/42 and 0/42 day(s) (delta-anchored; 0/42 and 0/42 with moneyness bands). Highest observed daily inversion rate: 33% (delta), 33% (band).
 
-Anchor agreement: on 298 observations where both anchors produced a skew, signs agree on 91%; median |band − delta| = 0.0206; correlation 0.85. Delta anchoring fell back to moneyness bands on 5% of observations.
+Anchor agreement: on 360 observations where both anchors produced a skew, signs agree on 92%; median |band − delta| = 0.0208; correlation 0.85. Delta anchoring fell back to moneyness bands on 4% of observations.
 
 Per name (where the daily inversion rate comes from):
 
 | name | days | inverted % (delta) | inverted % (band) | median skew (delta) | delta fallback % |
 |---|---|---|---|---|---|
 | VXX | 4 | 100% | 100% | -0.2273 | 50% |
-| GLD | 32 | 81% | 59% | -0.0095 | 0% |
-| TSLA | 33 | 73% | 42% | -0.0051 | 0% |
-| MSFT | 34 | 9% | 9% | +0.0156 | 3% |
-| AAPL | 33 | 3% | 3% | +0.0142 | 3% |
-| TLT | 32 | 3% | 22% | +0.0103 | 0% |
-| IWM | 34 | 0% | 0% | +0.0384 | 0% |
-| NVDA | 33 | 0% | 0% | +0.0223 | 3% |
-| QQQ | 35 | 0% | 0% | +0.0448 | 3% |
-| SPY | 34 | 0% | 0% | +0.0376 | 0% |
+| GLD | 39 | 67% | 49% | -0.0048 | 0% |
+| TSLA | 40 | 60% | 35% | -0.0030 | 0% |
+| TLT | 39 | 13% | 23% | +0.0079 | 0% |
+| MSFT | 41 | 8% | 7% | +0.0168 | 5% |
+| AAPL | 40 | 3% | 2% | +0.0164 | 2% |
+| IWM | 41 | 0% | 0% | +0.0406 | 0% |
+| NVDA | 40 | 0% | 0% | +0.0237 | 2% |
+| QQQ | 42 | 0% | 0% | +0.0461 | 2% |
+| SPY | 41 | 0% | 0% | +0.0387 | 0% |
 | XLE | 1 | n/a | 100% | n/a | 100% |
 | XLF | 3 | n/a | 100% | n/a | 100% |
 | XLK | 5 | n/a | 40% | n/a | 100% |
 
-Concentration: GLD, TSLA, VXX are inverted on more than 50% of their days, so with ~9 names a day they set most of the daily rate on their own. Excluding them, the pooled delta-anchored inversion rate is 2%.
+Concentration: GLD, TSLA, VXX are inverted on more than 50% of their days, so with ~9 names a day they set most of the daily rate on their own. Excluding them, the pooled delta-anchored inversion rate is 3%.
 
-**Honest interpretation.** 35 market day(s) of history on 13 names (the `vol_snapshots` capture list, mostly index and sector ETFs) calibrates the metric's *range* in the captured (calm) regime. It does not calibrate the scanner's 20-name segment thresholds directly: none of the segments' own universes is in the history, and the daily rate here is a count over a few names. It cannot validate bubble-prediction power: that requires the thresholds to fire ahead of a drawdown at least once, i.e. years of daily history spanning at least one froth episode. Until then the 40%/60% thresholds remain judgment calls. The script recomputes from the full store; the last captured session is 2026-10-09.
+Capture timing: 18 of 376 observations are intraday snapshots (the machine was on during the session but not after the close), not closing quotes.
+
+**Honest interpretation.** 42 market day(s) of history on 13 names (the `vol_snapshots` capture list, mostly index and sector ETFs) calibrates the metric's *range* in the captured (calm) regime. It does not calibrate the scanner's 20-name segment thresholds directly: none of the segments' own universes is in the history, and the daily rate here is a count over a few names. It cannot validate bubble-prediction power: that requires the thresholds to fire ahead of a drawdown at least once, i.e. years of daily history spanning at least one froth episode. Until then the 40%/60% thresholds remain judgment calls. The script recomputes from the full store; the last captured session is 2026-11-12.
 
 Most inversions are shallow: the delta-anchored 10th percentile is under 1
 vol point below zero, so a name sitting near zero can flip sign on bid-ask

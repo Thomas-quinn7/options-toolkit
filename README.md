@@ -291,7 +291,7 @@ only).
 
 ## Planned
 - Re-running `skew_bubble_indicator/threshold_study.py` periodically as the
-  snapshot history grows - refreshed 2026-10-26 at 35 sessions / 313
+  snapshot history grows - refreshed 2026-11-12 at 42 sessions / 376
   observations (thresholds have still never fired; highest daily inversion
   33% vs the 40% WARNING line). The table becomes regime information only
   once a froth episode actually lands in the history.

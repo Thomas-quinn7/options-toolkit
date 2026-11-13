@@ -1,5 +1,7 @@
 # IV-skew bubble indicator
 
+For a file-by-file walk through the code and the logic, see [`CODE_GUIDE.md`](CODE_GUIDE.md).
+
 `IV_skew.py` scans a large set of US names across market segments, applies
 data-quality gates (volume, open interest, bid-ask spread, IV sanity, DTE
 window), inverts implied vols **from bid-ask mid prices with the repo's own
